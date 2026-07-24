@@ -2,10 +2,10 @@
 and on the atlas template, for registration_eval.py's landmark TRE (target
 registration error) metric.
 
-Two roles, used as a pair:
-  --role sample: place landmarks on the sample (e.g. <name>_fine_25um.nii.gz,
+Two roles, used as a pair (picked from the "Role" dropdown in the form):
+  sample: place landmarks on the sample (e.g. <name>_fine_25um.nii.gz,
     the same isotropic grid the registration was run on).
-  --role atlas: place the SAME landmarks, in the SAME order, on the atlas
+  atlas: place the SAME landmarks, in the SAME order, on the atlas
     template (e.g. the DeMBA P5 reference .tif).
 
 Row i in the sample CSV and row i in the atlas CSV must be the same
@@ -19,11 +19,16 @@ for a QC check on that).
 Usage (needs a display; the antsreg env has napari+PyQt5+SimpleITK alongside
 antspyx -- one env for the whole pipeline):
     conda activate antsreg
-    python scripts/place_landmarks.py --role sample <sample.nii.gz> <out_sample_landmarks.csv>
-    python scripts/place_landmarks.py --role atlas  <atlas_template.tif>  <out_atlas_landmarks.csv>
+    python scripts/place_landmarks.py
+    # no CLI args -- a form window opens for role/image/output-csv (and an
+    # optional points CSV to preload), pre-filled with whatever you used
+    # last time (kept in scripts/.dialog_state/, gitignored). Run it once
+    # for role=sample and once for role=atlas; since both roles share the
+    # same remembered image/output-csv fields, use Browse to point each
+    # run at its own file instead of accepting the pre-filled path as-is.
 
-    --points-csv <existing.csv>: preload points from a previous export, to
-    resume/add to a session instead of starting from an empty Points layer.
+    Preload points from a previous export to resume/add to a session
+    instead of starting from an empty Points layer.
 
 Workflow:
     1. A napari window opens with the image and an (empty, or preloaded)
@@ -42,16 +47,30 @@ Workflow:
        CSV writer produces, and the format registration_eval.py's
        load_points() parses.
 """
-import argparse
 import csv
-import sys
-from pathlib import Path
+from types import SimpleNamespace
 
 import napari
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
 from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+
+from _form_dialog import run_form  # sibling module in scripts/
+
+
+_FORM_FIELDS = [
+    {"key": "role", "label": "Role", "type": "choice", "options": ["sample", "atlas"], "default": "sample"},
+    {"key": "image_path", "label": "Image to place landmarks on",
+     "type": "open_file", "filter": "Images (*.nii *.nii.gz *.tif *.tiff);;All files (*)"},
+    {"key": "output_csv", "label": "Output landmarks CSV",
+     "type": "save_file", "filter": "CSV files (*.csv);;All files (*)"},
+    {"key": "preload_points", "label": "Preload points from an existing CSV",
+     "type": "checkbox", "default": False},
+    {"key": "points_csv", "label": "Existing points CSV to preload",
+     "type": "open_file", "filter": "CSV files (*.csv);;All files (*)",
+     "enabled_when": ("preload_points", True)},
+]
 
 
 def _load_preloaded_points(points_csv):
@@ -60,13 +79,13 @@ def _load_preloaded_points(points_csv):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--role", required=True, choices=["sample", "atlas"])
-    parser.add_argument("image_path")
-    parser.add_argument("output_csv")
-    parser.add_argument("--points-csv", default=None,
-                         help="preload points from a previous export, to resume/extend a session")
-    args = parser.parse_args()
+    form = run_form("place_landmarks", "Place Landmarks", _FORM_FIELDS)
+    args = SimpleNamespace(
+        role=form["role"],
+        image_path=form["image_path"],
+        output_csv=form["output_csv"],
+        points_csv=form["points_csv"] if form["preload_points"] else None,
+    )
 
     # Same axis-order reasoning as mask_tools/paint_mask.py/edit_sample_labels.py:
     # SimpleITK's Array<->Image round trip gives natural (z,y,x), axis 0 = the

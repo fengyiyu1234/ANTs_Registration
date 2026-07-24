@@ -17,15 +17,14 @@ assignments in cell_registration.csv.
 Usage (needs a display; the antsreg env has napari+PyQt5+SimpleITK alongside
 antspyx -- one env for the whole pipeline):
     conda activate antsreg
-    python scripts/edit_sample_labels.py \\
-        <sample_fine.nii.gz> <labels_in_sample.nii.gz> <out_corrected.nii.gz> \\
-        --ontology-json <ontology.json>
-    # or, for a BrainGlobe-sourced atlas instead of a custom one:
-    #     --atlas-source brainglobe --atlas-res-um 25
+    python scripts/edit_sample_labels.py
+    # no CLI args -- a form window opens for the sample/labels/output paths
+    # and the ontology/region-level options, pre-filled with whatever you
+    # used last time (kept in scripts/.dialog_state/, gitignored).
 
-    --level-min / --level-max (default 4 / 6): restrict the region picker to
-    structures at that CCF ontology tree depth (root = level 1), so you're
-    choosing from major structures instead of scrolling every fine leaf area.
+    Region picker level min/max: restricts the region picker to structures
+    at that CCF ontology tree depth (root = level 1), so you're choosing
+    from major structures instead of scrolling every fine leaf area.
 
 Workflow:
     1. A napari window opens with the sample image and a Labels layer
@@ -34,8 +33,8 @@ Workflow:
        scratch. Sliced along axis 0, the actual imaging z-planes (same
        SimpleITK convention as the other two paint scripts -- see their
        docstrings for why this matters).
-    2. Pick a region from the dock's region list (filtered to
-       --level-min/--level-max) -- this sets the paint brush to that
+    2. Pick a region from the dock's region list (filtered to the form's
+       region-picker level min/max) -- this sets the paint brush to that
        region's real CCF id. Moving the mouse over the image shows which
        region is currently under the cursor, so you can tell what you're
        about to overwrite.
@@ -51,9 +50,9 @@ Workflow:
        corrected label volume on the exact same grid as the input --
        ready for scripts/relabel_cells.py.
 """
-import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import napari
 import numpy as np
@@ -62,6 +61,29 @@ from PyQt5.QtWidgets import QLabel, QLineEdit, QListWidget, QPushButton, QVBoxLa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from registration_ants import atlas_utils, mask_utils  # noqa: E402
+from _form_dialog import run_form  # noqa: E402  (sibling module in scripts/)
+
+
+_FORM_FIELDS = [
+    {"key": "sample_path", "label": "Sample image (e.g. *_fine_25um.nii.gz)",
+     "type": "open_file", "filter": "Images (*.nii *.nii.gz *.tif *.tiff);;All files (*)"},
+    {"key": "labels_path", "label": "labels_in_sample.nii.gz",
+     "type": "open_file", "filter": "Images (*.nii *.nii.gz);;All files (*)"},
+    {"key": "output_path", "label": "Output corrected labels path",
+     "type": "save_file", "filter": "NIfTI (*.nii.gz);;All files (*)"},
+    {"key": "use_brainglobe", "label": "Use BrainGlobe atlas (instead of an ontology JSON)",
+     "type": "checkbox", "default": False},
+    {"key": "ontology_json", "label": "Ontology JSON",
+     "type": "open_file", "filter": "JSON files (*.json);;All files (*)",
+     "enabled_when": ("use_brainglobe", False)},
+    {"key": "atlas_res_um", "label": "Atlas resolution, um (BrainGlobe only)",
+     "type": "float", "default": 25.0, "minimum": 1.0, "maximum": 1000.0,
+     "enabled_when": ("use_brainglobe", True)},
+    {"key": "level_min", "label": "Region picker level min",
+     "type": "int", "default": 4, "minimum": 1, "maximum": 20},
+    {"key": "level_max", "label": "Region picker level max",
+     "type": "int", "default": 6, "minimum": 1, "maximum": 20},
+]
 
 
 def _load_structures(args):
@@ -74,16 +96,17 @@ def _load_structures(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("sample_path")
-    parser.add_argument("labels_path")
-    parser.add_argument("output_path")
-    parser.add_argument("--ontology-json", default=None)
-    parser.add_argument("--atlas-source", choices=["brainglobe"], default=None)
-    parser.add_argument("--atlas-res-um", type=float, default=25)
-    parser.add_argument("--level-min", type=int, default=4)
-    parser.add_argument("--level-max", type=int, default=6)
-    args = parser.parse_args()
+    form = run_form("edit_sample_labels", "Edit Sample Labels", _FORM_FIELDS)
+    args = SimpleNamespace(
+        sample_path=form["sample_path"],
+        labels_path=form["labels_path"],
+        output_path=form["output_path"],
+        ontology_json=form["ontology_json"],
+        atlas_source="brainglobe" if form["use_brainglobe"] else None,
+        atlas_res_um=form["atlas_res_um"] or 25.0,
+        level_min=form["level_min"],
+        level_max=form["level_max"],
+    )
 
     structures = _load_structures(args)
     pickable = atlas_utils.structures_at_levels(structures, args.level_min, args.level_max)
