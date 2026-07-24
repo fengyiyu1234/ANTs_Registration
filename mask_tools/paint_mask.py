@@ -38,8 +38,10 @@ kinds, one shared napari GUI, two different export semantics:
     single plane.
 
 Usage (needs a display; the antsreg conda env has napari+PyQt5+SimpleITK
-alongside antspyx -- one env for the whole pipeline): edit the KIND/paths
-below, then just run the file -- no command-line arguments.
+alongside antspyx -- one env for the whole pipeline): edit
+mask_tools/paint_mask_local.yaml (gitignored -- copy it from
+paint_mask_local.example.yaml the first time), then just run the file --
+no command-line arguments.
 
     conda activate antsreg
     python mask_tools/paint_mask.py
@@ -59,28 +61,32 @@ from types import SimpleNamespace
 import napari
 import numpy as np
 import SimpleITK as sitk
+import yaml
 from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from registration_ants import mask_utils  # noqa: E402  (pure numpy/scipy/skimage, no ants needed)
 
 
-# ============================================================================
-# EDIT THESE, then just run: python mask_tools/paint_mask.py
-# ============================================================================
-KIND = "mask"                   # "mask" | "guide"
+_LOCAL_CONFIG_PATH = Path(__file__).resolve().parent / "paint_mask_local.yaml"
 
-IMAGE_PATH = "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_fine_25um.nii.gz"   # mask: the sample.
-                                                    # guide: the sample (ROLE="sample") or the atlas template (ROLE="atlas").
-OUTPUT_PATH = "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/modified_mask.nii.gz"
 
-EXISTING_MASK_PATH = "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_brain_mask.nii.gz"       # mask: optional -- start from an existing mask to touch up (e.g. the
-                                #       auto-generated <name>_brain_mask.nii.gz). None = blank canvas
-                                #       (everything included by default; paint 0 to mark exclusions).
-                                # guide: optional prefill (e.g. scripts/project_outline.py's guess, atlas role only).
-
-ROLE = "sample"                 # only used when KIND == "guide": "sample" | "atlas"
-# ============================================================================
+def _load_local_config():
+    """Paths live in a gitignored sibling YAML file instead of constants
+    here, so editing them for a new sample never shows up as a git diff."""
+    if not _LOCAL_CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"{_LOCAL_CONFIG_PATH} not found -- copy it from "
+            f"paint_mask_local.example.yaml (same folder) and edit the paths.")
+    with open(_LOCAL_CONFIG_PATH) as f:
+        cfg = yaml.safe_load(f)
+    return SimpleNamespace(
+        kind=cfg["kind"],
+        image_path=cfg["image_path"],
+        output_path=cfg["output_path"],
+        existing_mask_path=cfg.get("existing_mask_path") or None,
+        role=cfg.get("role", "sample"),
+    )
 
 
 def _read_sitk_array(path):
@@ -194,16 +200,17 @@ def _run_guide(args):
 
 
 def main():
-    if KIND == "mask":
-        args = SimpleNamespace(sample_path=IMAGE_PATH, output_path=OUTPUT_PATH,
-                                existing_mask=EXISTING_MASK_PATH)
+    cfg = _load_local_config()
+    if cfg.kind == "mask":
+        args = SimpleNamespace(sample_path=cfg.image_path, output_path=cfg.output_path,
+                                existing_mask=cfg.existing_mask_path)
         _run_mask(args)
-    elif KIND == "guide":
-        args = SimpleNamespace(image_path=IMAGE_PATH, output_path=OUTPUT_PATH,
-                                existing_mask=EXISTING_MASK_PATH, role=ROLE)
+    elif cfg.kind == "guide":
+        args = SimpleNamespace(image_path=cfg.image_path, output_path=cfg.output_path,
+                                existing_mask=cfg.existing_mask_path, role=cfg.role)
         _run_guide(args)
     else:
-        raise ValueError(f"Unknown KIND: {KIND!r} (expected 'mask' or 'guide')")
+        raise ValueError(f"Unknown kind: {cfg.kind!r} (expected 'mask' or 'guide')")
 
     napari.run()
 

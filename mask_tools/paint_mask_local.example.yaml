@@ -1,0 +1,22 @@
+# Local config for paint_mask.py -- copy this file to paint_mask_local.yaml
+# (same folder) and edit the paths there. paint_mask_local.yaml is
+# gitignored, so you can change paths freely without ever showing up as a
+# git diff.
+#
+#   cp mask_tools/paint_mask_local.example.yaml mask_tools/paint_mask_local.yaml
+
+kind: mask                      # "mask" | "guide"
+
+image_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_fine_25um.nii.gz
+                                 # mask: the sample.
+                                 # guide: the sample (role: sample) or the atlas template (role: atlas).
+output_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/modified_mask.nii.gz
+
+existing_mask_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_brain_mask.nii.gz
+                                 # mask: optional -- start from an existing mask to touch up (e.g. the
+                                 #       auto-generated <name>_brain_mask.nii.gz). Leave unset/null for a
+                                 #       blank canvas (everything included by default; paint 0 to mark
+                                 #       exclusions).
+                                 # guide: optional prefill (e.g. scripts/project_outline.py's guess, atlas role only).
+
+role: sample                    # only used when kind == "guide": "sample" | "atlas"
