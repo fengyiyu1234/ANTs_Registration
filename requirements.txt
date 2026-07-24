@@ -1,0 +1,15 @@
+antspyx
+brainglobe-atlasapi
+tifffile
+zarr
+dask
+SimpleITK
+scikit-image
+nibabel
+pystripe
+pandas
+pyyaml
+
+# Interactive napari tools (mask_tools/, scripts/*.py that open a viewer) --
+# consolidated into this same antsreg env, no separate env needed anymore.
+napari[pyqt5]

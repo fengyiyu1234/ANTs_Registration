@@ -1,0 +1,497 @@
+"""
+Registration evaluation metrics for P5 whole-brain LSFM -> synthetic P5 atlas.
+
+Computes, per sample, and separately for each coarse region + whole-brain
+outline + per group (TSC / normal):
+    M1  TRE   - target registration error from hand-placed landmarks (um)
+    M2  Dice  - overlap of warped-atlas structure vs sample structure
+    M3  HD95  - 95th-percentile surface distance (um)
+    M5  neg-Jacobian fraction - folding / invertibility check (%)
+    M6  inverse-consistency error (um)
+    M7  region Jacobian determinant stats - volume compression check per
+        region (the TSC-cortex-expansion confound this eval exists to catch)
+
+Wired to the real ants pipeline in src/registration_ants/ (see PROGRESS_LOG.md
+for its design history). Two key simplifications vs. a generic skeleton:
+
+  * No anisotropic-voxel handling needed here. This pipeline resamples every
+    sample to an ISOTROPIC grid before registering (io_utils.resample_to_isotropic,
+    matched to the atlas's own isotropic resolution) -- so every grid a metric
+    here touches (sample_fine, labels_in_sample, the atlas) is isotropic, and
+    physical distance = voxel distance * one scalar per grid. The raw LSFM
+    data's anisotropy (~0.65x0.65x8um) never reaches this file.
+  * M5/M7 (Jacobian) are computed in ATLAS space, not sample space. ANTs'
+    forward warp field (<prefix>1Warp.nii.gz) is defined on the FIXED/atlas
+    grid (see ants.create_jacobian_determinant_image's own docstring example,
+    which passes the fixed image as domain_image) -- so these metrics use the
+    atlas's own region masks (same ROI for every sample) rather than a
+    per-sample sample-space mask. Standard practice for deformation-based
+    morphometry (compare Jacobians in a common template space).
+
+Ground truth for M2/M3 comes from a semi-manual workflow already built in
+this repo (not new tooling): run the ants pipeline once, then hand-correct
+whichever regions came out wrong --
+  scripts/edit_sample_labels.py        -> labels_in_sample_corrected.nii.gz
+  mask_tools/paint_mask.py (KIND="mask")   -> sample_brain_mask_corrected.nii.gz
+Landmarks for M1 come from scripts/place_landmarks.py (new tool, this
+session) -- place matching points on the sample and on the atlas in napari.
+
+------------------------------------------------------------------------------------
+CRITICAL AXIS-ORDER NOTE -- this file mixes TWO conventions on purpose, matching
+how the rest of this codebase already reads each kind of file:
+  * SAMPLE-space label volumes (labels_in_sample.nii.gz, the hand-corrected
+    labels/brain-mask files) are read via SimpleITK here, giving array axis
+    order (z,y,x) -- the same convention scripts/edit_sample_labels.py and
+    mask_tools/paint_mask.py already read/write with. z_axis=0 always
+    for these arrays.
+  * ATLAS-space arrays (the annotation used for Jacobian/region masks) come
+    from an ants image (atlas_utils.load_custom_atlas), giving array axis
+    order (x,y,z) -- the same convention the rest of src/registration_ants/
+    uses, and the convention that lines up index-for-index with
+    ants.create_jacobian_determinant_image's output (same grid, same library).
+  * Landmark points loaded via load_points() come from napari (SimpleITK-style
+    (z,y,x) voxel order) and are reversed to (x,y,z) before being turned into
+    physical microns -- matching cell_points.py's established
+    "physical = voxel_index(x,y,z) * spacing(x,y,z)" convention (every ants
+    image in this codebase has origin=(0,0,0)/identity direction).
+Mixing these up silently produces meaningless numbers with no error -- see
+cell_points.py / io_utils.py / the four existing napari tools' docstrings for
+the same warning repeated at each place this matters.
+------------------------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import SimpleITK as sitk
+import yaml
+from scipy.ndimage import binary_erosion
+from scipy.spatial import cKDTree
+
+from registration_ants import atlas_utils, transforms
+
+
+# =====================================================================================
+# CONFIG
+# =====================================================================================
+@dataclass
+class Config:
+    # Coarse (high-level) regions to score Dice/HD95 on, matched by name
+    # against the atlas ontology via atlas_utils.build_region_exclusion_mask
+    # (fuzzy substring match, includes all descendants). Add/remove freely.
+    dice_regions: list[str] = field(
+        default_factory=lambda: ["Isocortex", "Hippocampal formation", "Cerebellum"]
+    )
+
+    # Which z-slices (sample-space axis 0) are annotated, for sparse-slice
+    # Dice/HD95. None = full volume (typical once you have a full hand
+    # correction; set this if your ground truth is only a few representative
+    # planes).
+    annotated_slices: list[int] | None = None
+
+    # sample_id -> group name (e.g. "Control"/"Experimental"), loaded from
+    # configs/eval_config.yaml's groups_manifest.
+    groups: dict[str, str] = field(default_factory=dict)
+
+
+def _load_groups_from_manifest(groups_manifest_path):
+    """Flatten stats_config.yaml's groups.<a|b>.{name,samples} into a plain
+    {sample_id: group_name} dict -- reusing the existing TSC/normal manifest
+    instead of duplicating it here."""
+    with open(groups_manifest_path) as f:
+        manifest = yaml.safe_load(f)
+    groups = {}
+    for group in manifest["groups"].values():
+        for sample_id in group["samples"]:
+            groups[sample_id] = group["name"]
+    return groups
+
+
+def load_eval_config(path):
+    """Parse configs/eval_config.yaml into (Config, per_sample_paths, atlas_cfg).
+
+    per_sample_paths[sample_id] carries both the standard pipeline output
+    paths (derived from output_dir/name using the exact naming pipeline.py
+    writes) and the eval-only annotation paths given explicitly in the YAML
+    (landmarks, hand-corrected labels/mask) -- the latter are optional, so a
+    sample can be listed (and partially evaluated) before every annotation
+    exists.
+    """
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    groups = _load_groups_from_manifest(raw["groups_manifest"]) if raw.get("groups_manifest") else {}
+    cfg = Config(
+        dice_regions=raw.get("dice_regions", Config().dice_regions),
+        annotated_slices=raw.get("annotated_slices"),
+        groups=groups,
+    )
+
+    per_sample_paths = {}
+    for sample_id, s in raw.get("samples", {}).items():
+        output_dir = Path(s["output_dir"])
+        name = s["name"]
+        sample_res = float(s["sample_resolution_um"])
+        labels_in_sample = output_dir / f"{name}_labels_in_sample.nii.gz"
+        transforms_prefix = str(output_dir / "transforms" / f"{name}_")
+
+        if not labels_in_sample.exists():
+            raise FileNotFoundError(
+                f"sample '{sample_id}': expected pipeline output not found: {labels_in_sample} "
+                "-- has this sample been run through registration_ants.pipeline yet?"
+            )
+
+        per_sample_paths[sample_id] = {
+            "sample_resolution_um": sample_res,
+            "atlas_resolution_um": float(s["atlas_resolution_um"]),
+            "labels_in_sample": labels_in_sample,
+            "transforms_prefix": transforms_prefix,
+            "sample_landmarks_csv": s.get("sample_landmarks_csv"),
+            "atlas_landmarks_csv": s.get("atlas_landmarks_csv"),
+            "cortex_landmark_idx": s.get("cortex_landmark_idx") or None,
+            "labels_in_sample_corrected": s.get("labels_in_sample_corrected"),
+            "sample_brain_mask_corrected": s.get("sample_brain_mask_corrected"),
+        }
+
+    atlas_cfg = raw["atlas"]
+    return cfg, per_sample_paths, atlas_cfg
+
+
+# =====================================================================================
+# M1 -- Landmark TRE
+# =====================================================================================
+def load_points(csv_path):
+    """Parse a napari Points-layer CSV export (index,axis-0,axis-1,axis-2 --
+    see scripts/place_landmarks.py) into an (N,3) array of voxel coordinates
+    in (x,y,z) order.
+
+    napari/SimpleITK's array order for these tools is (z,y,x) (axis-0 = the
+    actual imaging/atlas planes) -- reversed here to (x,y,z) to match this
+    codebase's established physical-space convention (see module docstring).
+    """
+    df = pd.read_csv(csv_path)
+    zyx = df[["axis-0", "axis-1", "axis-2"]].to_numpy(dtype=float)
+    return zyx[:, ::-1]
+
+
+def apply_transform_to_points(sample_pts_xyz_um, transforms_prefix):
+    """Warp sample-space landmark points (physical microns, (x,y,z) columns)
+    into atlas physical space.
+
+    Reuses registration_ants.transforms.transform_cell_points, which already
+    handles ANTs' point-vs-image transform-direction convention correctly --
+    it's the same function cell_points.assign_cell_regions uses for cell
+    centroids, already validated end-to-end there. transforms.load_saved_transforms
+    reconstructs the fwd/inv transform lists from the files a previous
+    registration run wrote to disk (this script never holds the live `reg`
+    dict from ants.registration() itself).
+    """
+    reg = transforms.load_saved_transforms(transforms_prefix)
+    df = pd.DataFrame({
+        "x": sample_pts_xyz_um[:, 0], "y": sample_pts_xyz_um[:, 1], "z": sample_pts_xyz_um[:, 2],
+    })
+    warped = transforms.transform_cell_points(df, reg, direction="sample_to_atlas")
+    return warped[["x", "y", "z"]].to_numpy()
+
+
+def compute_tre(warped_sample_pts_um: np.ndarray, atlas_pts_um: np.ndarray) -> np.ndarray:
+    """M1: per-landmark target registration error in um. Returns (N,) distances.
+
+    Both point sets are in ATLAS physical microns here (warped_sample_pts_um
+    came out of apply_transform_to_points already in that space) -- so this
+    is a plain isotropic Euclidean distance, no per-axis spacing needed.
+    """
+    assert warped_sample_pts_um.shape == atlas_pts_um.shape
+    return np.linalg.norm(warped_sample_pts_um - atlas_pts_um, axis=1)
+
+
+def summarize_tre(tre_um: np.ndarray, cortex_idx: list[int] | None = None) -> dict:
+    """Report mean +/- std overall and (optionally) for the cortex subset."""
+    out = {"tre_mean_um": float(tre_um.mean()),
+           "tre_std_um": float(tre_um.std()),
+           "tre_median_um": float(np.median(tre_um)),
+           "n": int(tre_um.size)}
+    if cortex_idx:
+        c = tre_um[cortex_idx]
+        out.update({"cortex_tre_mean_um": float(c.mean()),
+                    "cortex_tre_std_um": float(c.std()),
+                    "cortex_tre_median_um": float(np.median(c)),
+                    "cortex_n": int(c.size)})
+    return out
+
+
+def annotator_reproducibility(pts_a_um: np.ndarray, pts_b_um: np.ndarray) -> float:
+    """QC: RMS distance between two placements of the SAME landmark set (um).
+    This is your localization noise floor. TRE cannot be better than this, so run it
+    once (re-place points on another day, or a labmate re-places) before trusting
+    small between-group TRE differences."""
+    d = np.linalg.norm(pts_a_um - pts_b_um, axis=1)
+    return float(np.sqrt((d ** 2).mean()))
+
+
+# =====================================================================================
+# M2 / M3 -- Dice and HD95 (overlap of warped-atlas structure vs sample structure)
+# =====================================================================================
+def load_region_mask(labels_path, region_name, structures):
+    """Boolean mask for one coarse region (+ all its ontology descendants)
+    inside a SAMPLE-space label volume (read via SimpleITK, (z,y,x) order).
+
+    Reuses atlas_utils.build_region_exclusion_mask (True = kept, i.e. NOT in
+    `[region_name]`'s descendants) inverted -- an inclusion mask for one named
+    region is just "not kept by an exclusion mask built from that one name."
+    """
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path)))
+    return ~atlas_utils.build_region_exclusion_mask(arr, structures, [region_name])
+
+
+def load_binary_mask(path):
+    """Load an already-binary 0/1 mask (e.g. a hand-corrected brain outline
+    from mask_tools/paint_mask.py's `mask` kind) as a bool array, SAMPLE-space
+    (z,y,x) order."""
+    return sitk.GetArrayFromImage(sitk.ReadImage(str(path))) > 0
+
+
+def load_brain_mask_from_labels(labels_path):
+    """Whole-brain outline implied by a SAMPLE-space label volume: any
+    nonzero (non-background) label id counts as brain -- same 'background'
+    convention as cell_points.py."""
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path)))
+    return arr > 0
+
+
+def restrict_to_slices(mask: np.ndarray, slices: list[int] | None, z_axis: int = 0) -> np.ndarray:
+    """For sparse-slice evaluation: zero out everything except annotated z-slices,
+    so Dice/HD95 are computed only where you actually annotated."""
+    if slices is None:
+        return mask
+    keep = np.zeros_like(mask, dtype=bool)
+    idx = [slice(None)] * mask.ndim
+    for z in slices:
+        idx[z_axis] = z
+        keep[tuple(idx)] = mask[tuple(idx)]
+    return keep
+
+
+def dice(a: np.ndarray, b: np.ndarray) -> float:
+    """M2: Dice overlap of two binary masks."""
+    a = a.astype(bool); b = b.astype(bool)
+    denom = a.sum() + b.sum()
+    if denom == 0:
+        return float("nan")
+    return float(2.0 * np.logical_and(a, b).sum() / denom)
+
+
+def _surface_distances(a: np.ndarray, b: np.ndarray,
+                       spacing_um: tuple[float, float, float]) -> np.ndarray:
+    """Symmetric set of boundary-to-boundary nearest distances (um).
+    Used by HD95. Boundary = voxels removed by one erosion."""
+    a = a.astype(bool); b = b.astype(bool)
+    a_border = a ^ binary_erosion(a)
+    b_border = b ^ binary_erosion(b)
+    sp = np.asarray(spacing_um, dtype=float)
+    a_pts = np.argwhere(a_border) * sp
+    b_pts = np.argwhere(b_border) * sp
+    if len(a_pts) == 0 or len(b_pts) == 0:
+        return np.array([np.nan])
+    d_ab = cKDTree(b_pts).query(a_pts)[0]
+    d_ba = cKDTree(a_pts).query(b_pts)[0]
+    return np.concatenate([d_ab, d_ba])
+
+
+def hd95(a: np.ndarray, b: np.ndarray, spacing_um: tuple[float, float, float]) -> float:
+    """M3: 95th-percentile symmetric surface distance (um). Robust to a few outliers
+    that would blow up the raw Hausdorff; sensitive to thin-cortex boundary errors."""
+    d = _surface_distances(a, b, spacing_um)
+    return float(np.percentile(d, 95))
+
+
+def evaluate_structure(warped_atlas_mask: np.ndarray, sample_mask: np.ndarray,
+                       sample_resolution_um: float, annotated_slices: list[int] | None = None) -> dict:
+    """Run M2 + M3 for one structure (e.g. whole-brain outline, or one coarse
+    region). Both masks are SAMPLE-space (z,y,x) arrays (see
+    load_region_mask/load_brain_mask_from_labels/load_binary_mask), so
+    z_axis=0 always; sample grid is isotropic so spacing_um is just
+    sample_resolution_um repeated 3x (axis order doesn't matter for an
+    isotropic spacing)."""
+    a = restrict_to_slices(warped_atlas_mask, annotated_slices, z_axis=0)
+    b = restrict_to_slices(sample_mask, annotated_slices, z_axis=0)
+    spacing_um = (sample_resolution_um,) * 3
+    return {"dice": dice(a, b), "hd95_um": hd95(a, b, spacing_um)}
+
+
+# =====================================================================================
+# M5 / M7 -- Jacobian-based metrics (ATLAS space)    M6 -- inverse consistency
+# =====================================================================================
+def load_jacobian(warp_path, atlas_template):
+    """M5/M7 input: ANTs Jacobian determinant image, on the ATLAS grid.
+
+    The forward warp field (<prefix>1Warp.nii.gz) is defined on the
+    fixed/atlas domain (ants.create_jacobian_determinant_image's own
+    docstring example passes the FIXED image as domain_image) -- so
+    atlas_template must be the SAME atlas image object/grid the original
+    registration used as `fixed=` (atlas_utils.load_custom_atlas reloads it
+    the same way register.py originally loaded it). Returns an (x,y,z)-order
+    numpy array (ants convention), matching atlas_template.numpy()/
+    atlas_annotation.numpy()'s order -- do not mix this with the SAMPLE-space
+    (z,y,x) arrays above.
+    """
+    import ants
+    return ants.create_jacobian_determinant_image(atlas_template, str(warp_path), do_log=False).numpy()
+
+
+def neg_jacobian_fraction(jac: np.ndarray, atlas_brain_mask: np.ndarray) -> float:
+    """M5: fraction of voxels with det(J) <= 0 inside the atlas brain (folding). Should be ~0."""
+    inside = jac[atlas_brain_mask.astype(bool)]
+    return float((inside <= 0).mean())
+
+
+def region_jacobian_stats(jac: np.ndarray, atlas_region_mask: np.ndarray, region_key: str) -> dict:
+    """M7: det(J) distribution inside one atlas region (generalized to any
+    region in cfg.dice_regions, not just cortex). det<1 = the registration
+    COMPRESSED this tissue to fit the sample; det>1 = expanded. Compare TSC
+    vs normal for a given region: if TSC's det is systematically smaller,
+    the registration is squashing that region's real anatomical expansion
+    (e.g. undercounting cortex cell density) -- the confound this eval
+    exists to catch. Computed against the atlas's own (sample-independent)
+    region mask -- same ROI for every sample, only the Jacobian values vary."""
+    vals = jac[atlas_region_mask.astype(bool)]
+    return {
+        f"{region_key}_jac_mean": float(vals.mean()),
+        f"{region_key}_jac_median": float(np.median(vals)),
+        f"{region_key}_jac_p05": float(np.percentile(vals, 5)),
+        f"{region_key}_jac_p95": float(np.percentile(vals, 95)),
+    }
+
+
+def inverse_consistency(reg, atlas_brain_mask, atlas_resolution_um, n_points=2000, seed=0) -> float:
+    """M6: round-trip random atlas-space points through atlas->sample->atlas
+    (invtransforms then fwdtransforms via transform_cell_points), and measure
+    the mean residual displacement from the original point, in atlas physical
+    microns. Cheap point-based check instead of composing dense warp fields.
+
+    atlas_brain_mask/atlas_resolution_um: (x,y,z)-order atlas-space mask (see
+    load_jacobian's docstring on why atlas arrays use that order here) and
+    the atlas's isotropic voxel size.
+    """
+    rng = np.random.default_rng(seed)
+    idx_xyz = np.argwhere(atlas_brain_mask)
+    if len(idx_xyz) == 0:
+        return float("nan")
+    chosen = idx_xyz[rng.choice(len(idx_xyz), size=min(n_points, len(idx_xyz)), replace=False)]
+    xyz_um = chosen.astype(float) * atlas_resolution_um
+
+    df = pd.DataFrame({"x": xyz_um[:, 0], "y": xyz_um[:, 1], "z": xyz_um[:, 2]})
+    to_sample = transforms.transform_cell_points(df, reg, direction="atlas_to_sample")
+    back_to_atlas = transforms.transform_cell_points(to_sample, reg, direction="sample_to_atlas")
+
+    residual = np.linalg.norm(back_to_atlas[["x", "y", "z"]].to_numpy() - xyz_um, axis=1)
+    return float(residual.mean())
+
+
+# =====================================================================================
+# MAIN
+# =====================================================================================
+def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -> dict:
+    """Full metric set for one sample. Metrics whose required annotation
+    files aren't configured yet are skipped (with a printed note) rather
+    than raising -- annotation is a progressive, manual process, so a sample
+    can be listed and partially scored before every ground-truth file exists.
+    """
+    row: dict = {"sample": sample_id, "group": cfg.groups.get(sample_id, "unknown")}
+
+    # ---- M1 TRE ----
+    if paths.get("sample_landmarks_csv") and paths.get("atlas_landmarks_csv"):
+        sample_pts_vox = load_points(paths["sample_landmarks_csv"])
+        atlas_pts_vox = load_points(paths["atlas_landmarks_csv"])
+        sample_pts_um = sample_pts_vox * paths["sample_resolution_um"]
+        atlas_pts_um = atlas_pts_vox * paths["atlas_resolution_um"]
+        warped_um = apply_transform_to_points(sample_pts_um, paths["transforms_prefix"])
+        tre = compute_tre(warped_um, atlas_pts_um)
+        row.update(summarize_tre(tre, paths.get("cortex_landmark_idx")))
+    else:
+        print(f"[{sample_id}] no landmark CSVs configured yet -- skipping M1 (TRE).")
+
+    # ---- M2 / M3 whole-brain outline ----
+    if paths.get("sample_brain_mask_corrected"):
+        wa_brain = load_brain_mask_from_labels(paths["labels_in_sample"])
+        sm_brain = load_binary_mask(paths["sample_brain_mask_corrected"])
+        wb = evaluate_structure(wa_brain, sm_brain, paths["sample_resolution_um"], cfg.annotated_slices)
+        row.update({"brain_dice": wb["dice"], "brain_hd95_um": wb["hd95_um"]})
+    else:
+        print(f"[{sample_id}] no sample_brain_mask_corrected configured yet -- skipping whole-brain Dice/HD95.")
+
+    # ---- M2 / M3 coarse regions ----
+    if paths.get("labels_in_sample_corrected"):
+        for region in cfg.dice_regions:
+            key = region.lower().replace(" ", "_")
+            wa = load_region_mask(paths["labels_in_sample"], region, atlas_ctx["structures"])
+            sm = load_region_mask(paths["labels_in_sample_corrected"], region, atlas_ctx["structures"])
+            r = evaluate_structure(wa, sm, paths["sample_resolution_um"], cfg.annotated_slices)
+            row.update({f"{key}_dice": r["dice"], f"{key}_hd95_um": r["hd95_um"]})
+    else:
+        print(f"[{sample_id}] no labels_in_sample_corrected configured yet -- skipping region Dice/HD95.")
+
+    # ---- M5 / M6 / M7 Jacobian + inverse consistency (atlas space) ----
+    warp_path = Path(paths["transforms_prefix"] + "1Warp.nii.gz")
+    if warp_path.exists():
+        jac = load_jacobian(warp_path, atlas_ctx["atlas_template"])
+        row["neg_jac_frac"] = neg_jacobian_fraction(jac, atlas_ctx["atlas_brain_mask"])
+        for region in cfg.dice_regions:
+            key = region.lower().replace(" ", "_")
+            row.update(region_jacobian_stats(jac, atlas_ctx["atlas_region_masks"][region], key))
+
+        reg = transforms.load_saved_transforms(paths["transforms_prefix"])
+        row["inv_consistency_um"] = inverse_consistency(
+            reg, atlas_ctx["atlas_brain_mask"], atlas_ctx["atlas_resolution_um"]
+        )
+    else:
+        print(f"[{sample_id}] no forward warp found at {warp_path} -- skipping Jacobian/inverse-consistency metrics.")
+
+    return row
+
+
+def main(eval_config_path: str, out_csv: str = "reg_metrics.csv"):
+    """Run all samples listed in eval_config_path, save a tidy table, print a
+    per-group summary."""
+    cfg, per_sample_paths, atlas_cfg = load_eval_config(eval_config_path)
+
+    atlas_template, atlas_annotation = atlas_utils.load_custom_atlas(
+        atlas_cfg["template_path"], atlas_cfg["annotation_path"], atlas_cfg["resolution_um"],
+    )
+    structures = (
+        atlas_utils.load_ccf_ontology_json(atlas_cfg["ontology_path"]) if atlas_cfg.get("ontology_path") else None
+    )
+    atlas_arr = atlas_annotation.numpy()
+    atlas_ctx = {
+        "atlas_template": atlas_template,
+        "structures": structures,
+        "atlas_brain_mask": atlas_arr > 0,
+        "atlas_region_masks": {
+            region: ~atlas_utils.build_region_exclusion_mask(atlas_arr, structures, [region])
+            for region in cfg.dice_regions
+        },
+        "atlas_resolution_um": float(atlas_cfg["resolution_um"]),
+    }
+
+    rows = [evaluate_sample(sid, paths, cfg, atlas_ctx) for sid, paths in per_sample_paths.items()]
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv, index=False)
+
+    print("\n=== per-sample ===")
+    print(df.to_string(index=False))
+
+    key_cols = [c for c in df.columns if c not in ("sample", "group")]
+    if key_cols:
+        print("\n=== per-group (compare TSC vs normal by eye; small n -> describe, don't p-test) ===")
+        print(df.groupby("group")[key_cols].agg(["median", "min", "max"]).to_string())
+    return df
+
+
+if __name__ == "__main__":
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/eval_config.yaml"
+    main(config_path)

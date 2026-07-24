@@ -1,0 +1,50 @@
+#   conda activate antsreg
+#   cd src
+#   python -m registration_ants.pipeline /home/fyu7/My_project/Registration_ants/configs/s12t.yaml
+
+sample:
+  name: tsc12t                   
+  raw_tiff: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/registration.tif
+  voxel_size_um: [2.6, 2.6, 32.0]    #[x, y, z]
+
+  # channels:
+  #   - name: signal_channel1
+  #     raw_tiff: /path/to/signal_channel1.tif
+  #     voxel_size_um: [2.6, 2.6, 32.0]
+
+output_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t   # 所有中间结果/变换/最终结果都写在这里
+
+atlas:
+  source: custom #brainglobe
+  template_path: /home/fyu7/My_project/ClearMap/ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_reference_trimmed_1_3_2__285-510_full_full.tif
+  annotation_path: /home/fyu7/My_project/ClearMap/ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_annotation_trimmed_1_3_2__285-510_full_full.tif
+  resolution_um: 25           
+  ontology_path: /home/fyu7/My_project/ClearMap/ClearMap/Resources/Atlas/p5_trimmed/CCF_v3_ontology.json  # 可选，label id -> 脑区名称
+
+  # 如果样本是成年小鼠、想用标准 Allen CCF，改成这样（删掉上面 custom 那几行）：
+  # orientation: [1, 3, 2]
+  # slicing: [[285, 510], null, null]
+
+registration:
+  fine_target_um: 25          # 重采样到的各向同性分辨率——建议跟 atlas.resolution_um（或下面 atlas_res_um）保持一致
+  atlas_res_um: 25            # 只有 atlas.source: brainglobe 时才用得到，custom 时忽略这一项
+  use_coarse_to_fine: false   # 单次配准用 false；只有极少数配准不收敛、想先做一次粗对齐时才设 true（目前不支持跟 custom atlas 一起用）
+  type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
+
+  # crop_for_registration:
+  #   z: [15, 189]   # 举例，需要根据实际打开文件核对，不要直接用这个数字
+
+mask:
+
+  atlas_exclude_regions: ["Olfactory bulb"]
+
+  # sample_damage_mask_path: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/damage_mask.nii.gz
+  auto_brain_mask: true
+
+preprocess:
+  n4_bias_correction: true              # 是否做 N4 偏场校正（光片照明不均匀，比如样本一侧比另一侧暗）
+  intensity_clip_percentiles: [0.1, 99.9]   # 强度裁剪的百分位，按每张图自己的分布算，不受16-bit绝对亮暗影响
+
+cells:
+  cell_centroids_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/cell_centroids
+  voxel_size_um: [0.65, 0.65, 8.0]

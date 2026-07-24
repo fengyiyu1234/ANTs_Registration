@@ -1,0 +1,54 @@
+# Config for registration_eval.py -- lists which samples have been through
+# the ants registration pipeline (see configs/<name>.yaml, run via
+# `python -m registration_ants.pipeline`) and are ready to be scored, plus
+# where to find the semi-manual ground-truth annotations for each.
+#
+# Usage:
+#   conda activate antsreg
+#   python registration_eval.py configs/eval_config.yaml
+
+# TSC vs normal sample->group mapping -- reused from the existing manifest
+# instead of duplicating it here, so there's one source of truth.
+# ClearMap/stats_vis/stats_config.yaml's groups.a = "Control" = normal,
+# groups.b = "Experimental" = TSC (confirmed with the user 2026-07-22).
+groups_manifest: /home/fyu7/My_project/ClearMap/stats_vis/stats_config.yaml
+
+# Coarse (high-level) brain regions to score Dice/HD95 on, matched by name
+# against the atlas ontology (same fuzzy substring + all-descendants match
+# atlas_utils.build_region_exclusion_mask already uses for
+# mask.atlas_exclude_regions) -- add/remove regions freely.
+dice_regions: ["Isocortex", "Hippocampal formation", "Cerebellum"]
+
+# Same atlas file every sample below was registered to (see configs/s12t.yaml's
+# atlas: block -- must match, since Jacobian/region masks are computed on
+# this exact grid). If you ever mix samples registered to different atlas
+# files/resolutions, split them into separate eval_config.yaml runs.
+atlas:
+  template_path: /home/fyu7/My_project/ClearMap/ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_reference_trimmed_1_3_2__285-510_full_full.tif
+  annotation_path: /home/fyu7/My_project/ClearMap/ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_annotation_trimmed_1_3_2__285-510_full_full.tif
+  resolution_um: 25
+  ontology_path: /home/fyu7/My_project/ClearMap/ClearMap/Resources/Atlas/p5_trimmed/CCF_v3_ontology.json
+
+samples:
+  s12t:
+    output_dir: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t
+    name: tsc12t                # sample.name in configs/s12t.yaml -- the output filename prefix
+    atlas_resolution_um: 25     # atlas.resolution_um in configs/s12t.yaml
+    sample_resolution_um: 25    # registration.fine_target_um in configs/s12t.yaml
+
+    # From scripts/place_landmarks.py --role sample / --role atlas (row i =
+    # same anatomical landmark in both files). Not yet created -- fill in
+    # once you've placed landmarks for this sample.
+    # sample_landmarks_csv: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_sample_landmarks.csv
+    # atlas_landmarks_csv: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_atlas_landmarks.csv
+    # cortex_landmark_idx: []   # which landmark rows (0-indexed) are cortex landmarks, for M1's cortex subset
+
+    # From scripts/edit_sample_labels.py (hand-corrected region boundaries,
+    # ground truth for the Dice/HD95 region metrics) and
+    # mask_tools/paint_mask.py (KIND="mask") (hand-corrected whole-brain outline).
+    # Not yet created -- fill in once you've done one correction pass.
+    # labels_in_sample_corrected: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_labels_in_sample_corrected.nii.gz
+    # sample_brain_mask_corrected: /data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/tsc12t_brain_mask_corrected.nii.gz
+
+  # Add s8/s12q (normal) and s18/s11/s10 (TSC) here once each has been
+  # through the ants pipeline (configs/<name>.yaml) and annotated the same way.
