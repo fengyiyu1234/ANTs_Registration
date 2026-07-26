@@ -19,12 +19,8 @@ antspyx -- one env for the whole pipeline):
     conda activate antsreg
     python scripts/edit_sample_labels.py
     # no CLI args -- a form window opens for the sample/labels/output paths
-    # and the ontology/region-level options, pre-filled with whatever you
-    # used last time (kept in scripts/.dialog_state/, gitignored).
-
-    Region picker level min/max: restricts the region picker to structures
-    at that CCF ontology tree depth (root = level 1), so you're choosing
-    from major structures instead of scrolling every fine leaf area.
+    # and the ontology options, pre-filled with whatever you used last time
+    # (kept in scripts/.dialog_state/, gitignored).
 
 Workflow:
     1. A napari window opens with the sample image and a Labels layer
@@ -33,22 +29,50 @@ Workflow:
        scratch. Sliced along axis 0, the actual imaging z-planes (same
        SimpleITK convention as the other two paint scripts -- see their
        docstrings for why this matters).
-    2. Pick a region from the dock's region list (filtered to the form's
-       region-picker level min/max) -- this sets the paint brush to that
-       region's real CCF id. Moving the mouse over the image shows which
-       region is currently under the cursor, so you can tell what you're
-       about to overwrite.
-    3. Repaint only the area that's wrong, on a handful of representative
+    2. Pick a CCF ontology tree depth from the "Region picker level" dropdown
+       (root = level 1). This re-collapses the labels layer ITSELF to that
+       level (see atlas_utils.collapse_labels_to_level) -- the whole volume
+       declutters to that level's boundaries, not just one region, and
+       painting assigns that level's own ids. Switch levels anytime; voxels
+       you've actually painted are preserved exactly, everything else is
+       re-derived fresh from the original file at the new level. The region
+       list below refreshes to just that level's structures.
+    3. Pick a region from the list -- this sets the paint brush to that
+       region's real CCF id. Check "Show only selected region" to hide every
+       other region and isolate just this one for painting. Moving the
+       mouse over the image shows which region is currently under the
+       cursor, so you can tell what you're about to overwrite.
+    4. Repaint only the area that's wrong, on a handful of representative
        z-planes (where the mismatch starts, ends, and where its shape
        changes a lot) -- leave everything else on those planes alone, and
        leave every other plane untouched entirely. This is a delta edit on
-       top of the existing labels, not a full resegmentation.
-    4. Click "Export Corrected Labels". This auto-detects which planes/pixels
-       you actually touched (by diffing against the original), interpolates
-       the correction (not the whole plane) between edited planes using
-       shape-aware per-region signed-distance blending, and writes a full
-       corrected label volume on the exact same grid as the input --
-       ready for scripts/relabel_cells.py.
+       top of the existing labels, not a full resegmentation. Cmd/Ctrl+Z
+       (and Cmd/Ctrl+Shift+Z to redo) undoes/redoes paint strokes at any
+       time -- note undo doesn't retroactively un-mark a voxel as edited for
+       export purposes below, it only restores its value. Erasing to 0 and
+       then picking a different region + using napari's own fill/bucket
+       tool re-assigns that patch in one click, without repainting by hand.
+    5. Click "Export Corrected Labels". This auto-detects which pixels you
+       actually painted (tracked precisely, not by diffing against the
+       original -- collapsing to a level already changes most values),
+       interpolates the correction (not the whole plane) between edited
+       planes using shape-aware per-region signed-distance blending, and
+       writes a full corrected label volume on the exact same grid as the
+       input -- ready for scripts/relabel_cells.py.
+
+Saving one region on its own (for Dice/HD95 ground truth): picking a region
+in step 3 also isolates it (id + all its ontology descendants) into its own
+binary `[isolate] <name>` layer, built fresh from whatever's currently in
+labels_layer. Paint/erase on THAT layer, then click "Save This Region" to
+write just `<sample>_<region_slug>_corrected_mask.nii.gz`, independent of
+everything else -- this is how src/eval/registration_eval.py's
+`dice_region_masks` ground truth is meant to be built. Because it's keyed
+by the exact structure id (not a name match), parent/child regions that
+nest -- e.g. Cerebellum and Cerebellar cortex -- can each be corrected and
+saved on their own without interfering with each other. Switching to a
+different region resets this isolate layer, so save before you switch if
+you want to keep it; painting on labels_layer itself (step 4) is unaffected
+either way.
 """
 import sys
 from pathlib import Path
@@ -57,7 +81,12 @@ from types import SimpleNamespace
 import napari
 import numpy as np
 import SimpleITK as sitk
-from PyQt5.QtWidgets import QLabel, QLineEdit, QListWidget, QPushButton, QVBoxLayout, QWidget
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import (
+    QCheckBox, QComboBox, QLabel, QLineEdit, QListWidget, QPushButton,
+    QShortcut, QVBoxLayout, QWidget,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from registration_ants import atlas_utils, mask_utils  # noqa: E402
@@ -79,11 +108,27 @@ _FORM_FIELDS = [
     {"key": "atlas_res_um", "label": "Atlas resolution, um (BrainGlobe only)",
      "type": "float", "default": 25.0, "minimum": 1.0, "maximum": 1000.0,
      "enabled_when": ("use_brainglobe", True)},
-    {"key": "level_min", "label": "Region picker level min",
-     "type": "int", "default": 4, "minimum": 1, "maximum": 20},
-    {"key": "level_max", "label": "Region picker level max",
-     "type": "int", "default": 6, "minimum": 1, "maximum": 20},
 ]
+
+
+def _sample_name_from_labels_path(labels_path):
+    stem = Path(labels_path).name
+    for suf in (".nii.gz", ".nii"):
+        if stem.endswith(suf):
+            stem = stem[: -len(suf)]
+            break
+    return stem.removesuffix("_labels_in_sample")
+
+
+def _region_output_path(args, region_name):
+    """<name>_<region_slug>_corrected_mask.nii.gz next to labels_path. The
+    slug matches exactly src/eval/registration_eval.py's
+    `region.lower().replace(" ", "_")` column-key convention, so a
+    dice_region_masks entry keyed by the real region name maps straight onto
+    this filename with no separate lookup table."""
+    slug = region_name.lower().replace(" ", "_")
+    name = _sample_name_from_labels_path(args.labels_path)
+    return Path(args.labels_path).resolve().parent / f"{name}_{slug}_corrected_mask.nii.gz"
 
 
 def _load_structures(args):
@@ -104,14 +149,12 @@ def main():
         ontology_json=form["ontology_json"],
         atlas_source="brainglobe" if form["use_brainglobe"] else None,
         atlas_res_um=form["atlas_res_um"] or 25.0,
-        level_min=form["level_min"],
-        level_max=form["level_max"],
     )
 
     structures = _load_structures(args)
-    pickable = atlas_utils.structures_at_levels(structures, args.level_min, args.level_max)
     id_to_name = {sid: info["name"] for sid, info in structures.items()}
-    sorted_pickable = sorted(pickable.items(), key=lambda kv: kv[1]["name"])
+    levels = sorted({len(info["structure_id_path"]) for info in structures.values()})
+    default_level = 4 if 4 in levels else levels[0]
 
     # Same axis-order reasoning as mask_tools/paint_mask.py:
     # SimpleITK's Array<->Image round trip gives natural (z,y,x), axis 0 = the
@@ -124,23 +167,79 @@ def main():
     if original_labels.shape != sample_arr.shape:
         print(f"WARNING: labels shape {original_labels.shape} != sample shape {sample_arr.shape}")
 
+    # Precisely which voxels the user has actually painted/erased/filled, as
+    # opposed to voxels that merely look different because the level view
+    # below re-collapsed them. Updated only from real edits via the `paint`
+    # event -- napari fires that for paint/fill/erase, but NOT for the bulk
+    # `labels_layer.data = ...` reassignment apply_level_view() does below,
+    # which is what makes the two distinguishable. export() uses this too,
+    # instead of diffing values against original_labels: once the display
+    # can be a collapsed level, "differs from original" stops meaning
+    # "the user touched this".
+    touched_mask = np.zeros(original_labels.shape, dtype=bool)
+
     viewer = napari.Viewer(title="Edit labels in sample space")
     viewer.add_image(sample_arr, name="sample", colormap="gray")
     labels_layer = viewer.add_labels(original_labels.copy(), name="labels (edit here)", opacity=0.5)
 
+    def on_paint(event):
+        for indices, _old_values, _new_value in event.value:
+            touched_mask[indices] = True
+
+    labels_layer.events.paint.connect(on_paint)
+
+    # A reusable binary layer for "isolate whichever region is currently
+    # picked, edit it, save it on its own" -- separate from labels_layer's
+    # shared multi-region editing. Filled in by on_region_selected() below.
+    # Needed because target regions can nest (e.g. Cerebellum id=512 is the
+    # direct parent of Cerebellar cortex id=528) -- both are legitimate,
+    # independently-corrected ground-truth targets, so there's no single
+    # shared "level" buffer that represents "just this one region" cleanly.
+    isolate_state = {"region_id": None, "region_name": None, "init": None}
+    isolate_layer = viewer.add_labels(
+        np.zeros(original_labels.shape, dtype=np.uint8),
+        name="[isolate] (none selected)", opacity=0.6,
+    )
+
     status_label = QLabel(
-        "Pick a region below, repaint only the wrong area on a few planes,\n"
-        "then click Export. Hover the image to see the region under the cursor."
+        "Pick a level, then a region below. Toggle 'Show only selected region'\n"
+        "to isolate it, repaint only the wrong area, then click Export."
     )
     status_label.setWordWrap(True)
 
     hover_label = QLabel("Region under cursor: -")
 
+    level_combo = QComboBox()
+    level_combo.addItems([str(lvl) for lvl in levels])
+    level_combo.setCurrentText(str(default_level))
+
+    isolate_checkbox = QCheckBox("Show only selected region")
+
     search_box = QLineEdit()
     search_box.setPlaceholderText("Filter regions by name...")
     region_list = QListWidget()
 
+    def current_level():
+        return int(level_combo.currentText())
+
+    def apply_level_view():
+        """Re-collapse the EDITABLE labels layer itself to the chosen level
+        (not a separate reference layer) -- painting then assigns that
+        level's own ids, and the whole volume declutters to that level's
+        boundaries, not just the currently-selected region. touched_mask
+        voxels (real prior edits) are preserved verbatim; every other voxel
+        is re-derived fresh from original_labels, so switching levels back
+        and forth never loses or freezes past edits."""
+        lvl = current_level()
+        view = atlas_utils.collapse_labels_to_level(original_labels, structures, lvl)
+        view[touched_mask] = labels_layer.data[touched_mask]
+        labels_layer.data = view
+
     def refresh_list(filter_text=""):
+        lvl = current_level()
+        pickable = atlas_utils.structures_at_levels(structures, lvl, lvl)
+        sorted_pickable = sorted(pickable.items(), key=lambda kv: kv[1]["name"])
+
         region_list.clear()
         filter_text = filter_text.lower()
         for sid, info in sorted_pickable:
@@ -150,16 +249,47 @@ def main():
         region_list._ids = [sid for sid, info in sorted_pickable
                              if not filter_text or filter_text in info["name"].lower()]
 
+    def on_level_changed(_text):
+        refresh_list(search_box.text())
+        apply_level_view()
+
+    apply_level_view()
     refresh_list()
     search_box.textChanged.connect(refresh_list)
+    level_combo.currentTextChanged.connect(on_level_changed)
 
     def on_region_selected():
         row = region_list.currentRow()
         if row < 0:
             return
-        labels_layer.selected_label = region_list._ids[row]
+        region_id = region_list._ids[row]
+        labels_layer.selected_label = region_id
+
+        # Isolate this region (id + all its ontology descendants, found via
+        # structure_id_path containment -- no name-string matching, so
+        # parent/child overlap like Cerebellum/Cerebellar cortex is handled
+        # unambiguously) into its own binary layer for individual editing
+        # and saving. Built from the CURRENT label state, not the pristine
+        # original, so it reflects any prior general edits already made.
+        region_name = structures[region_id]["name"]
+        descendant_ids = {sid for sid, info in structures.items()
+                           if region_id in info["structure_id_path"]}
+        init = np.isin(labels_layer.data, list(descendant_ids)).astype(np.uint8)
+
+        isolate_state.update(region_id=region_id, region_name=region_name, init=init)
+        isolate_layer.data = init.copy()
+        isolate_layer.name = f"[isolate] {region_name}"
+        isolate_status_label.setText(
+            f"Isolated: {region_name}. Edit here, then Save This Region.\n"
+            f"Switching regions resets this view -- save first if you want to keep it."
+        )
 
     region_list.currentRowChanged.connect(lambda _row: on_region_selected())
+
+    def on_isolate_toggled(checked):
+        labels_layer.show_selected_label = checked
+
+    isolate_checkbox.toggled.connect(on_isolate_toggled)
 
     def on_mouse_move(_layer, event):
         if labels_layer.data.ndim != 3:
@@ -179,7 +309,7 @@ def main():
         edited = labels_layer.data
         keyframe_edits = {}
         for z in range(edited.shape[0]):
-            edit_mask = edited[z] != original_labels[z]
+            edit_mask = touched_mask[z]
             if np.any(edit_mask):
                 keyframe_edits[z] = (edit_mask, edited[z])
 
@@ -204,15 +334,68 @@ def main():
     export_btn = QPushButton("Export Corrected Labels")
     export_btn.clicked.connect(export)
 
+    def save_isolated_region():
+        if isolate_state["region_id"] is None:
+            isolate_status_label.setText("No region isolated yet -- pick one from the list first.")
+            return
+        edited = isolate_layer.data
+        init = isolate_state["init"]
+        keyframe_edits = {z: (edited[z] != init[z], edited[z])
+                          for z in range(edited.shape[0]) if np.any(edited[z] != init[z])}
+        if not keyframe_edits:
+            isolate_status_label.setText(f"No changes to {isolate_state['region_name']} yet.")
+            return
+
+        corrected = mask_utils.interpolate_sparse_label_correction(keyframe_edits, init)
+        out_path = _region_output_path(args, isolate_state["region_name"])
+        out_sitk = sitk.GetImageFromArray(corrected.astype(np.uint8))
+        out_sitk.CopyInformation(labels_sitk)
+        sitk.WriteImage(out_sitk, str(out_path))
+
+        n_changed = int(np.sum(corrected != init))
+        msg = (f"Wrote {out_path}\n"
+               f"Edited planes: {sorted(keyframe_edits.keys())}\n"
+               f"Voxels changed: {n_changed}")
+        isolate_status_label.setText(msg)
+        print(msg)
+
+    isolate_status_label = QLabel("Pick a region above to isolate it for individual saving.")
+    isolate_status_label.setWordWrap(True)
+    save_isolated_btn = QPushButton("Save This Region")
+    save_isolated_btn.clicked.connect(save_isolated_region)
+
     dock = QWidget()
     layout = QVBoxLayout(dock)
     layout.addWidget(status_label)
     layout.addWidget(hover_label)
-    layout.addWidget(QLabel(f"Regions (level {args.level_min}-{args.level_max}):"))
+    layout.addWidget(QLabel("Region picker level:"))
+    layout.addWidget(level_combo)
+    layout.addWidget(isolate_checkbox)
     layout.addWidget(search_box)
     layout.addWidget(region_list)
     layout.addWidget(export_btn)
+    layout.addWidget(isolate_status_label)
+    layout.addWidget(save_isolated_btn)
     viewer.window.add_dock_widget(dock, area="right", name="Label Correction Export")
+
+    # Application-wide (not focus-dependent) so Cmd/Ctrl+Z always reaches
+    # whichever layer napari itself currently considers active -- there are
+    # now two independently-paintable layers (labels_layer, isolate_layer),
+    # so this can no longer be hardcoded to one of them. `.undo`/`.redo` on a
+    # layer with empty history is a safe no-op (verified directly).
+    def _undo():
+        getattr(viewer.layers.selection.active, "undo", lambda: None)()
+
+    def _redo():
+        getattr(viewer.layers.selection.active, "redo", lambda: None)()
+
+    undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), dock)
+    undo_shortcut.setContext(Qt.ApplicationShortcut)
+    undo_shortcut.activated.connect(_undo)
+
+    redo_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), dock)
+    redo_shortcut.setContext(Qt.ApplicationShortcut)
+    redo_shortcut.activated.connect(_redo)
 
     napari.run()
 

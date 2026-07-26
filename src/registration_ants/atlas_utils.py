@@ -215,6 +215,23 @@ def structures_at_levels(structures, min_level, max_level):
             if min_level <= len(info["structure_id_path"]) <= max_level}
 
 
+def collapse_labels_to_level(label_arr, structures, level):
+    """Remap every voxel's (possibly fine-grained) label id to its ontology
+    ancestor at tree depth `level` (root = level 1, via structure_id_path).
+    Ids whose own path is already shorter than `level` (no descendant that
+    deep) are left unchanged. Used to build a read-only reference view of a
+    chosen level's regions without finer subdivisions cluttering it (see
+    scripts/edit_sample_labels.py's level-overview layer).
+    """
+    max_id = max(int(label_arr.max()) if label_arr.size else 0,
+                 max(structures) if structures else 0)
+    lut = np.arange(max_id + 1, dtype=label_arr.dtype)
+    for sid, info in structures.items():
+        path = info["structure_id_path"]
+        lut[sid] = path[level - 1] if len(path) >= level else sid
+    return lut[label_arr]
+
+
 def build_region_exclusion_mask(annotation_arr, structures, exclude_names):
     """Binary mask over an annotation array: True = keep (use in
     registration), False = excluded region -- e.g. olfactory bulb, absent in
@@ -234,3 +251,24 @@ def build_region_exclusion_mask(annotation_arr, structures, exclude_names):
         if set(info["structure_id_path"]) & exclude_root_ids
     }
     return ~np.isin(annotation_arr, list(exclude_ids))
+
+
+def region_mask_by_exact_name(annotation_arr, structures, exact_name):
+    """Binary inclusion mask (True = in this structure or a descendant of
+    it) resolved by an EXACT (case/whitespace-insensitive) name match,
+    unlike build_region_exclusion_mask's substring match. Substring matching
+    can silently pull in unrelated structures whose name merely contains the
+    target as a substring -- e.g. "Cerebellum" also matches "cerebellum
+    related fiber tracts", a totally different top-level branch (verified
+    against a real CCF ontology + segmentation: that alone is ~22% of
+    Cerebellum's true descendant-voxel count). Raises if the name doesn't
+    resolve to exactly one structure.
+    """
+    name_norm = exact_name.strip().lower()
+    matches = [sid for sid, info in structures.items() if info["name"].strip().lower() == name_norm]
+    if len(matches) != 1:
+        found = [(sid, structures[sid]["name"]) for sid in matches]
+        raise ValueError(f"expected exactly one structure named {exact_name!r}, found {len(matches)}: {found}")
+    root_id = matches[0]
+    include_ids = {sid for sid, info in structures.items() if root_id in info["structure_id_path"]}
+    return np.isin(annotation_arr, list(include_ids))

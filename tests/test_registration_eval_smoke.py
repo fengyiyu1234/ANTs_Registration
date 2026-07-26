@@ -186,11 +186,18 @@ def test_end_to_end_synthetic_registration(tmp_dir):
     arr_reread = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path)))
     assert set(np.unique(arr_written)) == set(np.unique(arr_reread)), "label ids changed across ants<->sitk round trip"
 
-    corrected_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path))).copy()
-    corrected_path = tmp_dir / "sample_labels_in_sample_corrected.nii.gz"
-    corrected_sitk = sitk.GetImageFromArray(corrected_arr)
-    corrected_sitk.CopyInformation(sitk.ReadImage(str(labels_path)))
-    sitk.WriteImage(corrected_sitk, str(corrected_path))
+    # Per-region ground-truth masks (fabricated identical to the auto labels),
+    # matching scripts/edit_sample_labels.py's "Save This Region" output --
+    # one independent binary mask per region, not one combined multi-label file.
+    cortex_mask_path = tmp_dir / "sample_fakecortex_corrected_mask.nii.gz"
+    hippo_mask_path = tmp_dir / "sample_fakehippo_corrected_mask.nii.gz"
+    reference_sitk = sitk.ReadImage(str(labels_path))
+    cortex_mask_sitk = sitk.GetImageFromArray((arr_reread == 10).astype(np.uint8))
+    cortex_mask_sitk.CopyInformation(reference_sitk)
+    sitk.WriteImage(cortex_mask_sitk, str(cortex_mask_path))
+    hippo_mask_sitk = sitk.GetImageFromArray((arr_reread == 20).astype(np.uint8))
+    hippo_mask_sitk.CopyInformation(reference_sitk)
+    sitk.WriteImage(hippo_mask_sitk, str(hippo_mask_path))
 
     brain_mask_path = tmp_dir / "sample_brain_mask_corrected.nii.gz"
     brain_mask_sitk = sitk.GetImageFromArray((arr_reread > 0).astype(np.uint8))
@@ -225,7 +232,7 @@ def test_end_to_end_synthetic_registration(tmp_dir):
 
     atlas_arr = atlas_annotation.numpy()
     atlas_brain_mask = atlas_arr > 0
-    atlas_cortex_mask = ~atlas_utils.build_region_exclusion_mask(atlas_arr, structures, ["FakeCortex"])
+    atlas_cortex_mask = atlas_utils.region_mask_by_exact_name(atlas_arr, structures, "FakeCortex")
     neg_frac = ev.neg_jacobian_fraction(jac, atlas_brain_mask)
     assert 0.0 <= neg_frac <= 1.0
     jac_stats = ev.region_jacobian_stats(jac, atlas_cortex_mask, "fakecortex")
@@ -248,7 +255,7 @@ def test_end_to_end_synthetic_registration(tmp_dir):
         "sample_landmarks_csv": sample_landmarks_path,
         "atlas_landmarks_csv": atlas_landmarks_path,
         "cortex_landmark_idx": None,
-        "labels_in_sample_corrected": corrected_path,
+        "dice_region_masks": {"FakeCortex": cortex_mask_path, "FakeHippo": hippo_mask_path},
         "sample_brain_mask_corrected": brain_mask_path,
     }
     atlas_ctx = {
@@ -256,7 +263,7 @@ def test_end_to_end_synthetic_registration(tmp_dir):
         "structures": structures,
         "atlas_brain_mask": atlas_brain_mask,
         "atlas_region_masks": {
-            r: ~atlas_utils.build_region_exclusion_mask(atlas_arr, structures, [r])
+            r: atlas_utils.region_mask_by_exact_name(atlas_arr, structures, r)
             for r in cfg.dice_regions
         },
         "atlas_resolution_um": target_um,
@@ -289,7 +296,7 @@ def test_end_to_end_synthetic_registration(tmp_dir):
         "sample_landmarks_csv": None,
         "atlas_landmarks_csv": None,
         "cortex_landmark_idx": None,
-        "labels_in_sample_corrected": None,
+        "dice_region_masks": {},
         "sample_brain_mask_corrected": None,
     }
     row_minimal = ev.evaluate_sample("synth01", paths_minimal, cfg, atlas_ctx)

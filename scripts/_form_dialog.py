@@ -19,6 +19,12 @@ from PyQt5.QtWidgets import (
 
 _STATE_DIR = Path(__file__).resolve().parent / ".dialog_state"
 
+# Held here for the life of the process -- QApplication has no Python
+# reference otherwise and gets garbage-collected right after the `or`
+# expression in run_form(), aborting the next widget construction with
+# "QWidget: Must construct a QApplication before a QWidget".
+_app = None
+
 
 def _state_path(script_name):
     return _STATE_DIR / f"{script_name}.json"
@@ -82,8 +88,9 @@ def run_form(script_name, title, fields):
     Disabled fields resolve to None in the result. Raises SystemExit if the
     user cancels the dialog.
     """
+    global _app
     state = _load_state(script_name)
-    QApplication.instance() or QApplication([])
+    _app = QApplication.instance() or QApplication([])
 
     dialog = QDialog()
     dialog.setWindowTitle(title)

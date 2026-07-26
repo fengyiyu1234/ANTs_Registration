@@ -1,0 +1,57 @@
+# registration_eval.py 的配置文件模板。复制这份改成自己的路径，存成
+# configs/eval_config.yaml（或任意文件名），然后运行：
+#   conda activate antsreg
+#   python -m eval.registration_eval configs/eval_config.yaml
+#
+# 每个样本先跑一遍配准 pipeline 得到 labels_in_sample.nii.gz，再用
+# scripts/edit_sample_labels.py 挑几个关心的脑区手工修正、逐个 "Save This
+# Region" 单独导出成二值 mask，作为下面 dice_region_masks 的输入——不需要
+# 同时修完所有区域，某个样本某个区域还没标注就不写那个 key，跳过就行。
+
+# 可选：复用 stats_config.yaml 里已经维护的 TSC/normal 分组，不写就都是 "unknown"。
+groups_manifest: /path/to/stats_config.yaml
+
+# 要在哪些脑区上算 Dice/HD95，按 CCF ontology 的精确名字（atlas_utils.region_mask_by_exact_name，
+# 不是子串模糊匹配，避免误伤名字里恰好包含这个片段的无关结构）。不写这一项就用下面这份默认值。
+dice_regions:
+  - Isocortex
+  - Caudoputamen
+  - Hippocampal formation
+  - Brain stem
+  - Cerebellum
+  - Cerebellar cortex
+
+# 可选：只在这些 z 平面（sample-space, axis 0）上算 Dice/HD95——只有手工标注只做了
+# 几个代表性切面、还没铺满整个体积时才需要;不写=用整个体积。
+# annotated_slices: [40, 60, 80]
+
+# 图谱：跟配准 pipeline 用的是同一份（custom 来源，见 config.example.yaml 的 atlas 块）。
+atlas:
+  template_path: /path/to/atlas_reference.tif
+  annotation_path: /path/to/atlas_annotation.tif
+  resolution_um: 25
+  ontology_path: /path/to/ontology.json   # 可选；不需要 M7 区域 Jacobian 统计时可以不写
+
+samples:
+  mouse01:
+    output_dir: /path/to/output/mouse01   # 跟 config.example.yaml 里这个样本的 output_dir 一致
+    name: mouse01                          # 跟 config.example.yaml 里 sample.name 一致
+    sample_resolution_um: 25               # 通常等于 registration.fine_target_um
+    atlas_resolution_um: 25
+
+    # M1 TRE：scripts/place_landmarks.py 分别在 sample/atlas 上放的匹配点对（可选）。
+    # sample_landmarks_csv: /path/to/mouse01_sample_landmarks.csv
+    # atlas_landmarks_csv: /path/to/atlas_landmarks.csv
+    # cortex_landmark_idx: [0, 1, 2]        # 可选：这几个点单独再报一次皮层子集的 TRE
+
+    # M2/M3 全脑轮廓：mask_tools/paint_mask.py（KIND="mask"）手工修正的全脑二值 mask（可选）。
+    # sample_brain_mask_corrected: /path/to/mouse01_brain_mask_corrected.nii.gz
+
+    # M2/M3 逐脑区 ground truth：scripts/edit_sample_labels.py 里每个区域单独
+    # "Save This Region" 导出的二值 mask，key 用跟 dice_regions 完全一样的名字。
+    # 只标注了一部分区域也没关系，其余的 key 不写就会被跳过（不报错）。
+    dice_region_masks:
+      Isocortex: /path/to/mouse01_isocortex_corrected_mask.nii.gz
+      Cerebellum: /path/to/mouse01_cerebellum_corrected_mask.nii.gz
+      # Caudoputamen / Hippocampal formation / Brain stem / Cerebellar cortex:
+      # 还没标注完，先不写这几个 key

@@ -31,7 +31,9 @@ for its design history). Two key simplifications vs. a generic skeleton:
 Ground truth for M2/M3 comes from a semi-manual workflow already built in
 this repo (not new tooling): run the ants pipeline once, then hand-correct
 whichever regions came out wrong --
-  scripts/edit_sample_labels.py        -> labels_in_sample_corrected.nii.gz
+  scripts/edit_sample_labels.py ("Save This Region")
+                                        -> <name>_<region_slug>_corrected_mask.nii.gz,
+                                           one per region, wired up via dice_region_masks
   mask_tools/paint_mask.py (KIND="mask")   -> sample_brain_mask_corrected.nii.gz
 Landmarks for M1 come from scripts/place_landmarks.py (new tool, this
 session) -- place matching points on the sample and on the atlas in napari.
@@ -81,11 +83,14 @@ from registration_ants import atlas_utils, transforms
 # =====================================================================================
 @dataclass
 class Config:
-    # Coarse (high-level) regions to score Dice/HD95 on, matched by name
-    # against the atlas ontology via atlas_utils.build_region_exclusion_mask
-    # (fuzzy substring match, includes all descendants). Add/remove freely.
+    # Coarse (high-level) regions to score Dice/HD95 on, matched by exact
+    # name against the atlas ontology via atlas_utils.region_mask_by_exact_name
+    # (includes all descendants). Add/remove freely.
     dice_regions: list[str] = field(
-        default_factory=lambda: ["Isocortex", "Hippocampal formation", "Cerebellum"]
+        default_factory=lambda: [
+            "Isocortex", "Caudoputamen", "Hippocampal formation",
+            "Brain stem", "Cerebellum", "Cerebellar cortex",
+        ]
     )
 
     # Which z-slices (sample-space axis 0) are annotated, for sparse-slice
@@ -146,6 +151,13 @@ def load_eval_config(path):
                 "-- has this sample been run through registration_ants.pipeline yet?"
             )
 
+        if "labels_in_sample_corrected" in s:
+            raise ValueError(
+                f"sample '{sample_id}': 'labels_in_sample_corrected' is no longer supported -- "
+                "use 'dice_region_masks: {<Region Name>: <path>}' instead "
+                "(see configs/eval_config.example.yaml)."
+            )
+
         per_sample_paths[sample_id] = {
             "sample_resolution_um": sample_res,
             "atlas_resolution_um": float(s["atlas_resolution_um"]),
@@ -154,7 +166,7 @@ def load_eval_config(path):
             "sample_landmarks_csv": s.get("sample_landmarks_csv"),
             "atlas_landmarks_csv": s.get("atlas_landmarks_csv"),
             "cortex_landmark_idx": s.get("cortex_landmark_idx") or None,
-            "labels_in_sample_corrected": s.get("labels_in_sample_corrected"),
+            "dice_region_masks": {name: Path(p) for name, p in (s.get("dice_region_masks") or {}).items()},
             "sample_brain_mask_corrected": s.get("sample_brain_mask_corrected"),
         }
 
@@ -239,19 +251,21 @@ def annotator_reproducibility(pts_a_um: np.ndarray, pts_b_um: np.ndarray) -> flo
 # =====================================================================================
 def load_region_mask(labels_path, region_name, structures):
     """Boolean mask for one coarse region (+ all its ontology descendants)
-    inside a SAMPLE-space label volume (read via SimpleITK, (z,y,x) order).
-
-    Reuses atlas_utils.build_region_exclusion_mask (True = kept, i.e. NOT in
-    `[region_name]`'s descendants) inverted -- an inclusion mask for one named
-    region is just "not kept by an exclusion mask built from that one name."
+    inside a SAMPLE-space label volume (read via SimpleITK, (z,y,x) order),
+    resolved by exact name (atlas_utils.region_mask_by_exact_name) -- used
+    for the WARPED-ATLAS side of a Dice comparison (labels_in_sample, the
+    registration output), which is always one combined multi-label volume.
+    The ground-truth side uses load_binary_mask instead (see
+    scripts/edit_sample_labels.py's per-region "Save This Region" output).
     """
     arr = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path)))
-    return ~atlas_utils.build_region_exclusion_mask(arr, structures, [region_name])
+    return atlas_utils.region_mask_by_exact_name(arr, structures, region_name)
 
 
 def load_binary_mask(path):
     """Load an already-binary 0/1 mask (e.g. a hand-corrected brain outline
-    from mask_tools/paint_mask.py's `mask` kind) as a bool array, SAMPLE-space
+    from mask_tools/paint_mask.py's `mask` kind, or one region's corrected
+    mask from scripts/edit_sample_labels.py) as a bool array, SAMPLE-space
     (z,y,x) order."""
     return sitk.GetArrayFromImage(sitk.ReadImage(str(path))) > 0
 
@@ -426,15 +440,24 @@ def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -
         print(f"[{sample_id}] no sample_brain_mask_corrected configured yet -- skipping whole-brain Dice/HD95.")
 
     # ---- M2 / M3 coarse regions ----
-    if paths.get("labels_in_sample_corrected"):
-        for region in cfg.dice_regions:
-            key = region.lower().replace(" ", "_")
-            wa = load_region_mask(paths["labels_in_sample"], region, atlas_ctx["structures"])
-            sm = load_region_mask(paths["labels_in_sample_corrected"], region, atlas_ctx["structures"])
-            r = evaluate_structure(wa, sm, paths["sample_resolution_um"], cfg.annotated_slices)
-            row.update({f"{key}_dice": r["dice"], f"{key}_hd95_um": r["hd95_um"]})
-    else:
-        print(f"[{sample_id}] no labels_in_sample_corrected configured yet -- skipping region Dice/HD95.")
+    # Each region is annotated independently (see scripts/edit_sample_labels.py's
+    # "Save This Region"), so each is skipped on its own rather than all-or-nothing.
+    region_masks = paths.get("dice_region_masks") or {}
+    if not region_masks:
+        print(f"[{sample_id}] no dice_region_masks configured yet -- skipping all region Dice/HD95.")
+    for region in cfg.dice_regions:
+        key = region.lower().replace(" ", "_")
+        mask_path = region_masks.get(region)
+        if not mask_path:
+            print(f"[{sample_id}] no dice_region_masks['{region}'] yet -- skipping {key} Dice/HD95.")
+            continue
+        wa = load_region_mask(paths["labels_in_sample"], region, atlas_ctx["structures"])
+        sm = load_binary_mask(mask_path)
+        if sm.shape != wa.shape:
+            raise ValueError(f"[{sample_id}] dice_region_masks['{region}'] shape {sm.shape} "
+                              f"!= labels_in_sample shape {wa.shape}")
+        r = evaluate_structure(wa, sm, paths["sample_resolution_um"], cfg.annotated_slices)
+        row.update({f"{key}_dice": r["dice"], f"{key}_hd95_um": r["hd95_um"]})
 
     # ---- M5 / M6 / M7 Jacobian + inverse consistency (atlas space) ----
     warp_path = Path(paths["transforms_prefix"] + "1Warp.nii.gz")
@@ -472,7 +495,7 @@ def main(eval_config_path: str, out_csv: str = "reg_metrics.csv"):
         "structures": structures,
         "atlas_brain_mask": atlas_arr > 0,
         "atlas_region_masks": {
-            region: ~atlas_utils.build_region_exclusion_mask(atlas_arr, structures, [region])
+            region: atlas_utils.region_mask_by_exact_name(atlas_arr, structures, region)
             for region in cfg.dice_regions
         },
         "atlas_resolution_um": float(atlas_cfg["resolution_um"]),
