@@ -1,0 +1,9 @@
+# Mac-local copy for testing (gitignored). devccf_p04 only -- Path A doesn't need an
+# atlas preset at all, and this machine doesn't have the production demba_p5 files
+# (those live on the remote server, see s12t.yaml's real atlas: block).
+devccf_p04:
+  template_path: /Users/fengyiyu/Downloads/projects/Registration/DevCCF/P04/P04_LSFM_20um.nii.gz
+  annotation_path: /Users/fengyiyu/Downloads/projects/Registration/DevCCF/P04/P04_DevCCF_Annotations_20um.nii.gz
+  resolution_um: 20
+  ontology_path: /Users/fengyiyu/Downloads/projects/Registration/DevCCF/DevCCFv1_ontology.json
+  orientation: [-1, -3, -2]
