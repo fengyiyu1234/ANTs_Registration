@@ -6,7 +6,6 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
-PROGRESS_LOG.md
 configs/*.yaml
 !configs/config.example.yaml
 !configs/eval_config.example.yaml
