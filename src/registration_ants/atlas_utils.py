@@ -38,22 +38,42 @@ def get_allen_atlas(resolution_um):
     return template, annotation, atlas.structures
 
 
+def _is_nifti(path):
+    """.nii/.nii.gz check on the full filename, not Path.suffix -- .suffix on a
+    double extension like '...20um.nii.gz' would wrongly return just '.gz'."""
+    name = Path(path).name.lower()
+    return name.endswith(".nii") or name.endswith(".nii.gz")
+
+
+def _split_stem_suffix(path):
+    """Like (Path.stem, Path.suffix), but treats '.nii.gz' as one suffix
+    instead of splitting it into stem='...nii', suffix='.gz'."""
+    if _is_nifti(path) and path.name.lower().endswith(".nii.gz"):
+        return path.name[: -len(".nii.gz")], ".nii.gz"
+    return path.stem, path.suffix
+
+
 def load_custom_atlas(template_path, annotation_path, resolution_um):
     """Load a template + annotation you've already reoriented/cropped
-    yourself (e.g. exported from a ClearMap-style pipeline) instead of
-    fetching from BrainGlobe.
+    yourself (e.g. exported from a ClearMap-style pipeline, or a NIfTI atlas
+    like DevCCF) instead of fetching from BrainGlobe.
 
-    resolution_um: isotropic voxel size of these files, in microns. Both
-    files are treated as raw TIFF stacks (no reliable embedded spacing), so
-    this value is what actually sets the physical grid ANTs registers on —
-    get it right (see the elastix/ClearMap config that produced these files).
+    resolution_um: isotropic voxel size of these files, in microns. Neither
+    file's own embedded spacing is trusted (TIFF has none; NIfTI's is
+    typically in mm and/or paired with a non-identity direction this codebase
+    doesn't handle -- see io_utils.load_nifti_stack_as_ants) -- this value is
+    what actually sets the physical grid ANTs registers on, get it right (see
+    the elastix/ClearMap config, or the atlas's own published resolution, that
+    produced these files).
     Returns (template_img, annotation_img).
     """
     from . import io_utils
 
     spacing = (float(resolution_um),) * 3
-    template = io_utils.load_tiff_stack_as_ants(template_path, spacing)
-    annotation = io_utils.load_tiff_stack_as_ants(annotation_path, spacing)
+    loader = io_utils.load_nifti_stack_as_ants if _is_nifti(template_path) else io_utils.load_tiff_stack_as_ants
+    template = loader(template_path, spacing)
+    loader = io_utils.load_nifti_stack_as_ants if _is_nifti(annotation_path) else io_utils.load_tiff_stack_as_ants
+    annotation = loader(annotation_path, spacing)
     return template, annotation
 
 
@@ -133,9 +153,11 @@ def prepare_custom_atlas(template_path, annotation_path, resolution_um, orientat
     DeMBA/Allen download) can be pointed at directly from config instead of
     requiring a file already pre-baked by running ClearMap first.
 
-    template_path/annotation_path: raw TIFF stacks in the source atlas's own
-    orientation, read the same way io_utils.load_tiff_stack_as_ants does
-    (tifffile (z,y,x) on disk -> transposed to (x,y,z) before any reorienting).
+    template_path/annotation_path: raw TIFF or NIfTI (.nii/.nii.gz) stacks in
+    the source atlas's own orientation, read into (x,y,z) order the same way
+    load_custom_atlas does per-format (TIFF: tifffile (z,y,x) on disk ->
+    transposed; NIfTI: already (x,y,z) on disk, no transpose -- see
+    io_utils.load_nifti_stack_as_ants) before any reorienting.
     orientation: see reorient_volume; None keeps the source's native axes.
     slicing: see _parse_slicing, applied after reorientation; None = no crop.
 
@@ -153,25 +175,39 @@ def prepare_custom_atlas(template_path, annotation_path, resolution_um, orientat
     if orientation is None and slicing is None:
         return load_custom_atlas(template_path, annotation_path, resolution_um)
 
-    import tifffile
-
     postfix = _atlas_prep_postfix(orientation, slicing)
     slicing_tuple = _parse_slicing(slicing)
 
     prepared_paths = []
     for src_path in (template_path, annotation_path):
         src_path = Path(src_path)
+        nifti = _is_nifti(src_path)
+        stem, suffix = _split_stem_suffix(src_path)
         out_dir = Path(cache_dir) if cache_dir else src_path.parent
-        out_path = out_dir / f"{src_path.stem}_{postfix}{src_path.suffix}"
+        out_path = out_dir / f"{stem}_{postfix}{suffix}"
         if overwrite or not out_path.exists():
             out_dir.mkdir(parents=True, exist_ok=True)
-            arr_xyz = np.transpose(tifffile.imread(str(src_path)), (2, 1, 0))
+            if nifti:
+                import ants
+                # Already (x,y,z) on disk (see io_utils.load_nifti_stack_as_ants) --
+                # no transpose needed before reorienting, unlike the TIFF branch below.
+                arr_xyz = ants.image_read(str(src_path)).numpy()
+            else:
+                import tifffile
+                arr_xyz = np.transpose(tifffile.imread(str(src_path)), (2, 1, 0))
             arr_xyz = reorient_volume(arr_xyz, orientation)
             if slicing_tuple is not None:
                 arr_xyz = arr_xyz[slicing_tuple]
-            # Write back out in (z,y,x) on-disk order, matching how every
-            # other raw TIFF in this codebase is stored/read.
-            tifffile.imwrite(str(out_path), np.ascontiguousarray(np.transpose(arr_xyz, (2, 1, 0))))
+            if nifti:
+                # Spacing here is only what this cache file's own header claims;
+                # load_custom_atlas always overrides it from config.atlas.resolution_um
+                # when this cache is loaded back, same as for the TIFF branch.
+                out_img = ants.from_numpy(arr_xyz.astype(np.float32), spacing=(float(resolution_um),) * 3)
+                ants.image_write(out_img, str(out_path))
+            else:
+                # Write back out in (z,y,x) on-disk order, matching how every
+                # other raw TIFF in this codebase is stored/read.
+                tifffile.imwrite(str(out_path), np.ascontiguousarray(np.transpose(arr_xyz, (2, 1, 0))))
         prepared_paths.append(out_path)
 
     return load_custom_atlas(str(prepared_paths[0]), str(prepared_paths[1]), resolution_um)

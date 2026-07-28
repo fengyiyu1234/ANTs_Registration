@@ -28,6 +28,29 @@ def load_tiff_stack_as_ants(raw_path, voxel_size_xyz):
     return ants.from_numpy(arr_xyz, spacing=(sx, sy, sz))
 
 
+def load_nifti_stack_as_ants(raw_path, voxel_size_xyz):
+    """Read a NIfTI volume and wrap it as an ANTs image with correct spacing,
+    discarding the file's own header spacing/direction/origin.
+
+    Unlike this codebase's own outputs, a NIfTI file from an external source
+    (e.g. DevCCF's downloads) typically has spacing in mm and/or a non-identity
+    direction matrix -- but every image built in this codebase assumes identity
+    direction/origin and a spacing value that's directly microns (see
+    crop_to_bounds's docstring). Trusting the file's own header here would
+    silently misalign or rescale the registration, so it's never read.
+
+    raw_path: path to a .nii/.nii.gz volume.
+    voxel_size_xyz: (sx, sy, sz) in microns, matching the physical x/y/z axes.
+
+    ants.image_read(...).numpy() returns the array in the same on-disk (i,j,k)
+    order as e.g. nibabel's dataobj -- no reorientation happens on read, so
+    (unlike the TIFF path) no transpose is needed here to reach (x,y,z) order.
+    """
+    arr_xyz = ants.image_read(str(raw_path)).numpy().astype(np.float32)
+    sx, sy, sz = voxel_size_xyz
+    return ants.from_numpy(arr_xyz, spacing=(sx, sy, sz))
+
+
 def resample_to_isotropic(img, target_um):
     """Resample an anisotropic ANTs image onto an isotropic grid at target_um.
 

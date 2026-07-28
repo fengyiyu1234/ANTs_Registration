@@ -3,6 +3,19 @@ from pathlib import Path
 
 import yaml
 
+# Named atlas shortcuts, e.g. atlas.source: devccf_p04 instead of spelling out
+# template_path/annotation_path/resolution_um/ontology_path/orientation every time --
+# see configs/atlas_presets.example.yaml for the format. Real file is gitignored
+# (machine-specific paths), same convention as mask_tools/paint_mask_local.yaml.
+_ATLAS_PRESETS_PATH = Path(__file__).resolve().parents[2] / "configs" / "atlas_presets_local.yaml"
+
+
+def _load_atlas_presets():
+    if not _ATLAS_PRESETS_PATH.exists():
+        return {}
+    with open(_ATLAS_PRESETS_PATH) as f:
+        return yaml.safe_load(f) or {}
+
 _DEFAULTS = {
     "atlas": {
         "source": "brainglobe",  # "brainglobe" (auto-fetch by resolution) or "custom" (your own files)
@@ -78,6 +91,18 @@ def load_config(path):
             raise FileNotFoundError(f"channel '{ch['name']}' raw_tiff not found: {ch['raw_tiff']}")
 
     atlas_cfg = config["atlas"]
+    if atlas_cfg["source"] not in ("brainglobe", "custom"):
+        presets = _load_atlas_presets()
+        if atlas_cfg["source"] not in presets:
+            raise ValueError(
+                f"config.atlas.source {atlas_cfg['source']!r} is not 'brainglobe'/'custom' "
+                f"and not a known preset in {_ATLAS_PRESETS_PATH} (known: {sorted(presets)})"
+            )
+        atlas_cfg = {**presets[atlas_cfg["source"]],
+                     **{k: v for k, v in atlas_cfg.items() if k != "source"}}
+        atlas_cfg["source"] = "custom"
+        config["atlas"] = atlas_cfg
+
     if atlas_cfg["source"] == "custom":
         for required in ("template_path", "annotation_path", "resolution_um"):
             if required not in atlas_cfg:

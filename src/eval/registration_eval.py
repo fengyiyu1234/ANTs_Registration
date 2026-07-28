@@ -64,6 +64,7 @@ the same warning repeated at each place this matters.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,10 +95,21 @@ class Config:
     )
 
     # Which z-slices (sample-space axis 0) are annotated, for sparse-slice
-    # Dice/HD95. None = full volume (typical once you have a full hand
-    # correction; set this if your ground truth is only a few representative
-    # planes).
+    # Dice/HD95. Explicit override applied to EVERY region regardless of any
+    # per-region hint below; None (the default) lets use_annotation_hints
+    # decide per region instead. Set this only if you want one fixed set of
+    # slices for all regions no matter what scripts/edit_sample_labels.py's
+    # sidecar files say.
     annotated_slices: list[int] | None = None
+
+    # When annotated_slices above is None, use each region's own
+    # <mask>.annotated_slices.json sidecar (written by
+    # scripts/edit_sample_labels.py's "Save This Region") to restrict that
+    # region's Dice/HD95 to just the z-planes actually hand-drawn, instead of
+    # the full volume (which includes signed-distance-interpolated guesses
+    # in between). Set False to ignore any hints and always use the full
+    # volume.
+    use_annotation_hints: bool = True
 
     # sample_id -> group name (e.g. "Control"/"Experimental"), loaded from
     # configs/eval_config.yaml's groups_manifest.
@@ -134,6 +146,7 @@ def load_eval_config(path):
     cfg = Config(
         dice_regions=raw.get("dice_regions", Config().dice_regions),
         annotated_slices=raw.get("annotated_slices"),
+        use_annotation_hints=raw.get("use_annotation_hints", Config().use_annotation_hints),
         groups=groups,
     )
 
@@ -268,6 +281,22 @@ def load_binary_mask(path):
     mask from scripts/edit_sample_labels.py) as a bool array, SAMPLE-space
     (z,y,x) order."""
     return sitk.GetArrayFromImage(sitk.ReadImage(str(path))) > 0
+
+
+def load_region_annotation_hint(mask_path):
+    """Read the <mask_path>.annotated_slices.json sidecar
+    scripts/edit_sample_labels.py's "Save This Region" writes alongside a
+    region's corrected mask -- {"hand_drawn_slices": [...], ...}. Returns the
+    hand-drawn z-index list, or None if no sidecar exists (e.g. the mask was
+    fully hand-corrected some other way, or predates this feature)."""
+    mask_path = Path(mask_path)
+    name = mask_path.name
+    if name.endswith(".nii.gz"):
+        name = name[: -len(".nii.gz")]
+    sidecar_path = mask_path.parent / f"{name}.annotated_slices.json"
+    if not sidecar_path.exists():
+        return None
+    return json.loads(sidecar_path.read_text())["hand_drawn_slices"]
 
 
 def load_brain_mask_from_labels(labels_path):
@@ -456,7 +485,16 @@ def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -
         if sm.shape != wa.shape:
             raise ValueError(f"[{sample_id}] dice_region_masks['{region}'] shape {sm.shape} "
                               f"!= labels_in_sample shape {wa.shape}")
-        r = evaluate_structure(wa, sm, paths["sample_resolution_um"], cfg.annotated_slices)
+        # Explicit annotated_slices (if set) applies to every region as-is;
+        # otherwise fall back to this region's own hand-drawn-slices sidecar
+        # (see load_region_annotation_hint), so sparse per-region ground
+        # truth is scored on just the planes actually drawn without having
+        # to retype z-indices per region -- None (no override, no hint)
+        # means the full volume, same as before.
+        slices = cfg.annotated_slices
+        if slices is None and cfg.use_annotation_hints:
+            slices = load_region_annotation_hint(mask_path)
+        r = evaluate_structure(wa, sm, paths["sample_resolution_um"], slices)
         row.update({f"{key}_dice": r["dice"], f"{key}_hd95_um": r["hd95_um"]})
 
     # ---- M5 / M6 / M7 Jacobian + inverse consistency (atlas space) ----

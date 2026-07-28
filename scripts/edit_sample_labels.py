@@ -73,7 +73,28 @@ saved on their own without interfering with each other. Switching to a
 different region resets this isolate layer, so save before you switch if
 you want to keep it; painting on labels_layer itself (step 4) is unaffected
 either way.
+
+If you only hand-drew a handful of representative z-planes for a region
+(the usual case -- see mask_utils.interpolate_sparse_label_correction's
+docstring on why the planes in between are an interpolated guess, not
+verified ground truth), "Save This Region" also writes a sidecar
+`<...>_corrected_mask.annotated_slices.json` recording exactly which planes
+you actually drew. registration_eval.py picks this up automatically and
+restricts Dice/HD95 to just those planes -- you don't need to remember or
+retype the z-indices yourself (see Config.use_annotation_hints there to
+turn this off and always compare the full volume instead).
+
+Adding more hand-drawn planes to a region later (same file, no versioning):
+picking a region that already has a saved file + sidecar resumes from it --
+only the exact planes recorded as hand-drawn get loaded back in (their real
+values, not the whole file, since the rest of it may be an old interpolation
+guess), everything else starts fresh from the true registration baseline.
+Draw more planes and click "Save This Region" again: it re-interpolates
+from the full union of old + new hand-drawn planes against that baseline,
+overwriting the same file -- so interpolation error never compounds across
+sessions, and nothing you've already hand-verified gets silently lost.
 """
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,6 +150,39 @@ def _region_output_path(args, region_name):
     slug = region_name.lower().replace(" ", "_")
     name = _sample_name_from_labels_path(args.labels_path)
     return Path(args.labels_path).resolve().parent / f"{name}_{slug}_corrected_mask.nii.gz"
+
+
+def _annotation_sidecar_path(mask_path):
+    """<mask_path> with .nii.gz replaced by .annotated_slices.json -- records
+    exactly which z-planes were actually hand-drawn for this region (as
+    opposed to signed-distance-interpolated in between), so
+    src/eval/registration_eval.py can restrict Dice/HD95 to just those planes
+    automatically instead of you having to remember and retype them."""
+    name = mask_path.name
+    if name.endswith(".nii.gz"):
+        name = name[: -len(".nii.gz")]
+    return mask_path.parent / f"{name}.annotated_slices.json"
+
+
+def _load_prior_hand_drawn(args, region_name):
+    """If this region was already saved in an earlier session (Save This
+    Region writes <region>_corrected_mask.nii.gz + its
+    .annotated_slices.json sidecar), return (hand_drawn_slices, mask_arr) so
+    editing can resume from exactly those planes' values instead of
+    starting over and losing them. Only those specific z's are trusted as
+    real hand-verified correction -- everything else in that file may be
+    this tool's own earlier interpolation guess, and must NOT be treated as
+    ground truth to interpolate on top of again (that would compound
+    interpolation error across sessions; see on_region_selected). Returns
+    None if this region has no prior save yet.
+    """
+    out_path = _region_output_path(args, region_name)
+    sidecar_path = _annotation_sidecar_path(out_path)
+    if not (out_path.exists() and sidecar_path.exists()):
+        return None
+    hand_drawn_slices = json.loads(sidecar_path.read_text())["hand_drawn_slices"]
+    mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(out_path)))
+    return hand_drawn_slices, mask_arr
 
 
 def _load_structures(args):
@@ -275,14 +329,37 @@ def main():
         descendant_ids = {sid for sid, info in structures.items()
                            if region_id in info["structure_id_path"]}
         init = np.isin(labels_layer.data, list(descendant_ids)).astype(np.uint8)
-
         isolate_state.update(region_id=region_id, region_name=region_name, init=init)
-        isolate_layer.data = init.copy()
+
+        # Resume from a prior session's save, if this region has one: overlay
+        # ONLY the exact z's it recorded as hand-drawn (their real values, not
+        # just its overall array, since the rest of that file may be this
+        # tool's own earlier interpolation guess) onto the fresh baseline.
+        # save_isolated_region()'s existing diff-vs-init logic then naturally
+        # re-detects those planes as touched too, alongside anything newly
+        # painted -- interpolation always recomputes from the full union of
+        # real hand-drawn keyframes against the true baseline, never on top
+        # of a previous session's own interpolated guess.
+        view = init.copy()
+        prior = _load_prior_hand_drawn(args, region_name)
+        if prior is not None:
+            prior_slices, prior_arr = prior
+            for z in prior_slices:
+                view[z] = prior_arr[z]
+            isolate_status_label.setText(
+                f"Isolated: {region_name}. Resumed {len(prior_slices)} previously "
+                f"hand-drawn plane(s): {prior_slices}. Keep painting, then Save This "
+                f"Region to update.\nSwitching regions resets this view -- save first "
+                f"if you want to keep it."
+            )
+        else:
+            isolate_status_label.setText(
+                f"Isolated: {region_name}. Edit here, then Save This Region.\n"
+                f"Switching regions resets this view -- save first if you want to keep it."
+            )
+
+        isolate_layer.data = view
         isolate_layer.name = f"[isolate] {region_name}"
-        isolate_status_label.setText(
-            f"Isolated: {region_name}. Edit here, then Save This Region.\n"
-            f"Switching regions resets this view -- save first if you want to keep it."
-        )
 
     region_list.currentRowChanged.connect(lambda _row: on_region_selected())
 
@@ -352,9 +429,18 @@ def main():
         out_sitk.CopyInformation(labels_sitk)
         sitk.WriteImage(out_sitk, str(out_path))
 
+        hand_drawn_slices = sorted(keyframe_edits.keys())
+        sidecar_path = _annotation_sidecar_path(out_path)
+        sidecar_path.write_text(json.dumps({
+            "region": isolate_state["region_name"],
+            "hand_drawn_slices": hand_drawn_slices,
+            "total_z": int(edited.shape[0]),
+        }, indent=2))
+
         n_changed = int(np.sum(corrected != init))
         msg = (f"Wrote {out_path}\n"
-               f"Edited planes: {sorted(keyframe_edits.keys())}\n"
+               f"Wrote {sidecar_path}\n"
+               f"Hand-drawn planes: {hand_drawn_slices}\n"
                f"Voxels changed: {n_changed}")
         isolate_status_label.setText(msg)
         print(msg)

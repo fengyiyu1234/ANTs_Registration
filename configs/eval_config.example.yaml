@@ -21,9 +21,17 @@ dice_regions:
   - Cerebellum
   - Cerebellar cortex
 
-# 可选：只在这些 z 平面（sample-space, axis 0）上算 Dice/HD95——只有手工标注只做了
-# 几个代表性切面、还没铺满整个体积时才需要;不写=用整个体积。
+# 一般不需要手动填这个：scripts/edit_sample_labels.py 的 "Save This Region" 会给每个
+# 区域的 mask 自动写一个 <...>_corrected_mask.annotated_slices.json，记录你实际手绘过
+# 哪几层（其余是插值猜的），下面 use_annotation_hints 默认就会按区域自动读取、只在那几层
+# 上算 Dice/HD95，不需要在这里重复填。只有你想让**所有区域**都强制用同一组 z 平面
+# （忽略每个区域自己的记录）时才需要手动写这个：
 # annotated_slices: [40, 60, 80]
+
+# 默认 true：自动读取每个区域 mask 旁边的 .annotated_slices.json，只在手绘过的那几层
+# 上算 Dice/HD95（没有 sidecar 文件的区域仍然按整个体积算，比如以前的数据或整层手工修正过的）。
+# 设成 false 就完全忽略这些记录，所有区域都按整个体积算（也可以用于验证插值质量本身）。
+# use_annotation_hints: true
 
 # 图谱：跟配准 pipeline 用的是同一份（custom 来源，见 config.example.yaml 的 atlas 块）。
 atlas:

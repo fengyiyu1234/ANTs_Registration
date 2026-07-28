@@ -28,7 +28,8 @@ sample:
 output_dir: /path/to/output/mouse01   # 所有中间结果/变换/最终结果都写在这里
 
 # 图谱来源：brainglobe 会自动下载标准成年 Allen CCF；如果是发育期/其他非标准
-# 图谱（比如 P5 用的 DeMBA），改成 custom 直接指向已经准备好方向/裁剪的文件。
+# 图谱（比如 P5 用的 DeMBA、或者 DevCCF），改成 custom 直接指向已经准备好方向/裁剪的文件，
+# 或者更省事地用图谱预设（下面第三种写法）。
 atlas:
   source: brainglobe
 
@@ -38,6 +39,12 @@ atlas:
   # annotation_path: /path/to/atlas_annotation.tif
   # resolution_um: 25          # 这两个文件本身的各向同性体素尺寸（不是你样本的），决定配准的物理网格
   # ontology_path: /path/to/ontology.json   # 可选，label id -> 脑区名称
+
+  # 第三种写法：图谱预设——如果同一个图谱（比如 DeMBA P5、DevCCF P04）要在多个样本间复用，
+  # 把 template_path/annotation_path/resolution_um/ontology_path/orientation/slicing
+  # 集中写一次到 configs/atlas_presets_local.yaml（复制 atlas_presets.example.yaml 改成
+  # 真实路径，gitignored），这里直接写预设名字就行，等价于 source: custom + 那些字段：
+  # source: devccf_p04   # 或 demba_p5，见 configs/atlas_presets.example.yaml
 
   # 如果 template_path/annotation_path 指向的是"原始"、还没摆正方向/裁剪过的图谱文件
   # （比如直接下载的 DeMBA/Allen 原始数据），可以加下面两项，让本流程自己做方向转换+
