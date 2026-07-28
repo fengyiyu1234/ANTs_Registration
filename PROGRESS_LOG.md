@@ -325,3 +325,40 @@
 3. 重跑 `tests/` 下全部 5 份 smoke test，全部通过——`mask_utils.py` 删掉的两个函数本来就没有任何测试直接引用，其余测试路径不受影响。
 
 **下一步**：用户需要在有显示的 `antsreg` 会话里实际跑一遍新的 `KIND="mask"`（空白开始画裂缝、以及从 `auto_brain_mask` 产物开始补画/擦除两种场景都试一下），确认合并后的行为符合预期——这部分当前无显示的会话里没法验证。
+
+---
+
+## 2026-07-28：调研 + 接入 Kim Lab DevCCF（developmental ontology），两条路径都做了准备
+
+用户一直用的是 DeMBA P5 图谱配 `CCF_v3_ontology.json`（成年 Allen CCFv3 本体），发现 DeMBA 官方还提供了一份 `KimLabDevCCFv001_MouseOntologyStructure.csv`（developmental-specific 本体，术语是 neural plate/ventricular-mantle zone 这种发育期分区），怀疑对 P5 样本来说这份可能比成年本体更合适。这次先做了大量只读调研确认真实情况，再按用户决定实现了两条对比路径。
+
+**关键发现（调研阶段，决定了后面怎么做）**：
+1. 直接对着真实数据验证：`tsc12t_labels_in_sample.nii.gz`（DeMBA-based 配准结果）里实际出现的 id（2/19/20/28/52...）**全部**能在 `CCF_v3_ontology.json`（成年 CCFv3）里查到，一个都不在 `KimLabDevCCFv001` 的 id 空间里——说明 DeMBA 的 P5 annotation 本质上就是成年 CCFv3 结构层级 warp 到 P5 模板坐标系，跟 Kim Lab 那套独立的 developmental ontology 完全不是一回事。DeMBA 自己的 data descriptor PDF 也明确写了这一点（P4/P5 segmentation 就是"Allen CCFv3 2017/2022 版本 warp 到各年龄模板"）。
+2. 用户下载了 DevCCF 论文（Kronman et al., Nat Commun 2024）的官方数据（`DevCCFv1`，含 E11.5-P56 共 7 个年龄段的 template+annotation，本地没有 P5，最近的是 P04/P14）和论文补充材料 `41467_2024_53254_MOESM4_ESM.xlsx`。其中 `SupplementaryData3`（"DevCCF vs CCFv3 Voxel Mapping"）就是官方发布的、在 P56 空间靠体素 overlap 算出来的 CCFv3↔DevCCF 对照表——多对多关系（一个 CCFv3 结构中位数会被拆到 6 个不同 DevCCF label 里，81% 能拿到 ≥50% 的多数匹配）。
+3. **踩了一个关键的 id 陷阱**：`DevCCFv1_OntologyStructure.xlsx` 里同时有 `ID`（旧 ADMBA id，部分结构上亿）和 `ID16`（16-bit 安全 id）两列。直接对着真实 `P04_DevCCF_Annotations_20um.nii.gz` 验证：体素里实际出现的 192 个 id **100% 命中 `ID16`**，只有 180/192 命中 `ID`（12 个 developmental-only 的细分结构只有 `ID16`，没有 `ID`）——annotation 体数据实际用的是 `ID16`，不是更直觉的 `ID`。`SupplementaryData3` 的 `DevCCF Label ID` 列也是 `ID16` 空间，两边天然对得上，不用额外转换。
+4. DevCCF 的 nii.gz 文件头 spacing 是 mm（比如 `0.02` 代表 20um）、direction 是非 identity 矩阵——这个项目全程约定"每张 ants image 都是 identity direction、spacing 数值直接就是微米数"（`io_utils.py`/`cell_points.py`/`registration_eval.py` 好几处硬编码依赖这个假设），如果直接信任 DevCCF 文件自己的 header 会导致 1000 倍物理尺度错位或者悄悄错位而不报错，必须显式丢弃重建。
+
+**用户的决定**：不是二选一，两条路径都要做，方便互相比较——
+- **Path A**（不用重新配准）：用 `SupplementaryData3` 的多数票 overlap，把现有 DeMBA/CCFv3 配准结果的 id 直接翻译成 DevCCF id（边界不变，只是换名字/分组）。
+- **Path B**（真的重新配准）：直接拿 DevCCF 自己的 P04 template+annotation 当图谱重新配准一次（P5 没有原生年龄，P04 是最近的）。
+
+**新增：图谱预设功能**（用户追加的需求："能不能在 config 里选用哪个图谱"）：
+- `configs/atlas_presets.example.yaml`（新建，模板）+ `configs/atlas_presets_local.yaml`（gitignored，真实路径，同 `paint_mask_local.yaml` 的约定）：把每个图谱的 `template_path`/`annotation_path`/`resolution_um`/`ontology_path`/`orientation` 集中定义一次。
+- `src/registration_ants/config.py`：`load_config` 里 `atlas.source` 不是 `brainglobe`/`custom` 时当预设名字去 `atlas_presets_local.yaml` 查，合并进 `atlas_cfg` 并把 `source` 归一成 `custom`，之后原有校验逻辑完全不用改；样本自己额外写的字段会覆盖预设的同名字段。样本配置从此可以只写 `atlas: {source: devccf_p04}`。
+- **踩的坑**：`.gitignore` 原来是 `configs/*.yaml` 全部忽略、只对 `config.example.yaml`/`eval_config.example.yaml` 开白名单——新建的 `atlas_presets.example.yaml` 忘了加对应白名单行，导致这份本该被追踪的模板文件被静默忽略了，用户自己发现的（"我的 atlas config 是最新的吗"追问出来）。补了 `!configs/atlas_presets.example.yaml`。
+
+**新增代码**：
+- `scripts/convert_devccf_ontology.py`：把 `DevCCFv1_OntologyStructure.xlsx` 的平铺表（`ID16`/`Name`/`Acronym`/`Parent ID16`，根节点 `Parent ID16` 是字符串 `'[]'`）转成 `atlas_utils.load_ccf_ontology_json` 已经认识的 Allen API 嵌套 `{"msg":[...]}` JSON——这样下游所有消费方（`mask.atlas_exclude_regions`、`edit_sample_labels.py`、`relabel_cells.py`、`registration_eval.py`）**一行代码都不用改**就能用 DevCCF 本体。跑出来 2552 个结构，全部 192 个真实 annotation id 都能正确解析出名字（验证过）。
+- `src/registration_ants/io_utils.py` + `atlas_utils.py`：`load_custom_atlas`/`prepare_custom_atlas` 加了 `.nii.gz` 支持（原来硬编码只认 `.tif`）。新增 `load_nifti_stack_as_ants`（用 `ants.image_read(...).numpy()` 直接拿，不用像 TIFF 那样手动转置，但显式丢弃文件自己的 spacing/direction，用 config 里的 `resolution_um` 重建）、`_is_nifti`/`_split_stem_suffix`（正确处理 `.nii.gz` 双后缀，顺手修了 `prepare_custom_atlas` 缓存文件名原来用 `Path.stem`/`.suffix` 处理双后缀文件会产出非法文件名的 bug）。
+- `scripts/relabel_labels_to_devccf.py`（Path A 脚本）：`SupplementaryData3` 多数票建 `{ccfv3_id: devccf_id}` 查找表（避免建 `np.arange(max_id+1)` 这种按最大 id 分配的 LUT——这份数据真实 id 能到 6 亿多，会分配几 GB 的数组；改用 `np.unique(..., return_inverse=True)` 只对实际出现的几百个值建表），未命中的 id 再对着 `CCF_v3_ontology.json` 拆成"根本不是合法 CCFv3 id"（float32 舍入噪声）和"是真实结构、只是这份 crosswalk 没覆盖到"两类分别报告。输出 relabel 后的 nii.gz + 一份 `..._crosswalk_applied.csv`（每个结构的 dominance_pct，方便事后按置信度筛选）。
+
+**验证结果**：
+1. `config.py` 预设解析：手写临时 yaml 测试 `source: devccf_p04` 正确合并出完整 `atlas_cfg`（在 ontology_path 那步准确报错，因为当时还没生成那个文件），未知预设名报错信息正确列出已知预设列表。
+2. `load_ccf_ontology_json` 加载 `convert_devccf_ontology.py` 的产出：2552 个结构，`15565`→"neural plate"、`15564`（根节点）解析正确，真实 annotation 192 个 id 全部能查到名字。
+3. `atlas_utils.load_custom_atlas` 直接对着原始（未摆正）P04 nii.gz 验证：spacing 正确读成 `(20.0,20.0,20.0)`（不是文件自己 header 里的 mm 数值），direction 正确变成 identity（不是 DevCCF 原生的非 identity 矩阵）。
+4. 方向假设 `orientation=[-1,-3,-2]`（根据 P04 文件的 direction matrix 代数推算）：`prepare_custom_atlas` 跑出的缓存文件目视核对——矢状面/水平面/背侧面三个切片，皮层、小脑、嗅球都清晰可辨，左右对称，没有轴错位/镜像的迹象，双后缀缓存文件名也确认正确（`P04_LSFM_20um_-1_-3_-2__full.nii.gz`）。**这只是初步目视核对，不是最终配准 QC**，真正结论要等用户在 server 上跑完真实配准后确认。
+5. Path A 在真实 `tsc12t_labels_in_sample.nii.gz` 上完整跑了一遍：625 个不同非零 id 里 583 个（93%）命中 crosswalk；42 个未命中里 20 个是 float32 舍入噪声，22 个是真实结构（海马 CA1/CA2/CA3 各分层、嗅球各分层、视神经等，逐个打印了名字）——输出文件 shape/spacing/origin 跟原文件完全一致，只有 id 值变了。
+
+**环境备注**：这次调研用的 DevCCF/DeMBA 原始数据、以及 Path A 的完整运行，全程在用户本机 Mac 上完成（`/Users/fengyiyu/Downloads/projects/Registration/` 下）；用户真正跑配准 pipeline 是在远程 server 上（`/home/fyu7/...`、`/data/hdd12tb-1/...`，CPU 比本机好），本机的 `demba_p5` 本地文件跟 server 上真正在用的那份 `p5_trimmed`（已经过 ClearMap 摆正裁剪）不是同一份文件，不能混用。
+
+**下一步**：用户把 `P04_LSFM_20um.nii.gz`/`P04_DevCCF_Annotations_20um.nii.gz`/`DevCCFv1_ontology.json` 三个文件传到 server（放到跟现有 `p5_trimmed` 同级的位置），`git pull` 这份改动，在 server 上自己建一份 `configs/atlas_presets_local.yaml`（gitignored，不会跟着 git pull 过去）填 `devccf_p04` 预设（server 路径 + `orientation: [-1,-3,-2]`），新建一份样本配置（复用 `s12t.yaml` 的 `sample:`/`cells:` 块，`atlas: {source: devccf_p04}`，`registration.fine_target_um`/`atlas_res_um` 改成 20），跑一次真实 Path B 配准，跟 Path A 的结果、以及原来的 DeMBA/CCFv3 结果三方比较。
