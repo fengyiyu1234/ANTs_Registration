@@ -47,12 +47,64 @@ def _merge_defaults(config, defaults):
     return config
 
 
+# Where each atlas_variants field lands: (section, field). "top" means a
+# top-level config key (just output_dir today) rather than a nested section.
+_ATLAS_VARIANT_FIELDS = {
+    "output_dir": ("top", "output_dir"),
+    "fine_target_um": ("registration", "fine_target_um"),
+    "atlas_res_um": ("registration", "atlas_res_um"),
+    "orientation": ("atlas", "orientation"),
+    "slicing": ("atlas", "slicing"),
+}
+
+
+def _apply_atlas_variant(config):
+    """Optional per-sample config.atlas_variants: {source_name: {output_dir,
+    fine_target_um, atlas_res_um, orientation, slicing}} -- fields that must
+    track *which atlas* this sample is registered against (output_dir so
+    results from different atlases don't overwrite each other, the two
+    resolution knobs so they stay matched to that atlas's own resolution,
+    orientation/slicing for atlases that need reorienting) but that
+    atlas_presets_local.yaml can't own itself since output_dir is per-sample,
+    not per-atlas. Switching config.atlas.source then flips all of these at
+    once instead of hand-editing several commented-out lines in sync.
+
+    A variant entry may be partial -- fields it doesn't mention are left as
+    whatever's already in the config (e.g. a top-level `output_dir:` you
+    still want to set directly). Pops atlas_variants off the returned config;
+    it's consumed here, not part of the pipeline's own config shape.
+    """
+    variants = config.pop("atlas_variants", None)
+    if variants is None:
+        return config
+
+    source = config.get("atlas", {}).get("source")
+    if source not in variants:
+        raise ValueError(
+            f"config.atlas.source {source!r} has no entry under atlas_variants (known: {sorted(variants)})"
+        )
+
+    for key, value in variants[source].items():
+        if key not in _ATLAS_VARIANT_FIELDS:
+            raise ValueError(
+                f"atlas_variants.{source}.{key} is not a recognized field (known: {sorted(_ATLAS_VARIANT_FIELDS)})"
+            )
+        section, field = _ATLAS_VARIANT_FIELDS[key]
+        if section == "top":
+            config[field] = value
+        else:
+            config.setdefault(section, {})[field] = value
+
+    return config
+
+
 def load_config(path):
     """Load a pipeline config YAML file, fill in defaults, and validate that
     the referenced input files exist (fails fast before any expensive step)."""
     with open(path) as f:
         config = yaml.safe_load(f)
 
+    config = _apply_atlas_variant(config)
     config = _merge_defaults(config, _DEFAULTS)
 
     if "output_dir" not in config:

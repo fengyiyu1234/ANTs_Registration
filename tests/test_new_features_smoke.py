@@ -7,6 +7,7 @@ Synthetic data only, same manual assert-based style as test_pipeline_smoke.py
 (no pytest). Run manually: `python tests/test_new_features_smoke.py`.
 """
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ import pandas as pd
 import tifffile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from registration_ants import atlas_utils, cell_points, io_utils  # noqa: E402
+from registration_ants import atlas_utils, cell_points, config, io_utils  # noqa: E402
 
 
 def test_reorient_volume():
@@ -191,15 +192,67 @@ def test_assign_cell_regions(tmp_dir):
     print("   OK (resample/atlas indices, region names, background vs out-of-bounds, provenance columns all correct)")
 
 
+def test_apply_atlas_variant():
+    print("6. config._apply_atlas_variant...")
+
+    # No atlas_variants key -> passed through unchanged (existing configs
+    # that don't use this feature must be completely unaffected).
+    plain = {"atlas": {"source": "demba_p5"}}
+    assert config._apply_atlas_variant(dict(plain)) == plain
+
+    # Matching source flips output_dir/registration/atlas fields all at once.
+    raw = {
+        "atlas": {"source": "devccf_p04"},
+        "atlas_variants": {
+            "demba_p5": {"output_dir": "/a", "fine_target_um": 25, "atlas_res_um": 25},
+            "devccf_p04": {"output_dir": "/b", "fine_target_um": 20, "atlas_res_um": 20,
+                           "orientation": [-1, -3, -2]},
+        },
+    }
+    out = config._apply_atlas_variant(raw)
+    assert "atlas_variants" not in out  # consumed here, not part of the pipeline's own config shape
+    assert out["output_dir"] == "/b"
+    assert out["registration"] == {"fine_target_um": 20, "atlas_res_um": 20}
+    assert out["atlas"]["orientation"] == [-1, -3, -2]
+
+    # A variant entry may be partial -- fields it doesn't mention are left alone.
+    partial = {
+        "atlas": {"source": "demba_p5"},
+        "registration": {"type_of_transform": "SyNRA"},
+        "atlas_variants": {"demba_p5": {"fine_target_um": 25}},
+    }
+    out2 = config._apply_atlas_variant(partial)
+    assert out2["registration"] == {"type_of_transform": "SyNRA", "fine_target_um": 25}
+
+    # atlas.source not present under atlas_variants -> loud error, not a silent no-op.
+    try:
+        config._apply_atlas_variant({"atlas": {"source": "nope"}, "atlas_variants": {"demba_p5": {}}})
+        assert False, "unknown source must raise"
+    except ValueError:
+        pass
+
+    # Unrecognized field name inside a variant entry -> loud error too (catches typos).
+    try:
+        config._apply_atlas_variant({
+            "atlas": {"source": "demba_p5"},
+            "atlas_variants": {"demba_p5": {"not_a_real_field": 1}},
+        })
+        assert False, "unknown variant field must raise"
+    except ValueError:
+        pass
+
+    print("   OK (pass-through / multi-field override / partial entry / unknown-source and unknown-field validation all correct)")
+
+
 def main():
-    tmp_dir = Path("/tmp/claude-1004/-home-fyu7-My-project-Registration-ants/4b6da97c-5cac-42de-b398-9c89d0ce513e/scratchpad/new_features_smoketest")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="registration_ants_smoketest_"))
 
     test_reorient_volume()
     test_prepare_custom_atlas(tmp_dir)
     test_crop_to_bounds()
     test_read_centroid_csv(tmp_dir)
     test_assign_cell_regions(tmp_dir)
+    test_apply_atlas_variant()
 
     print("\nALL SMOKE TESTS PASSED")
 

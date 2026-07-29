@@ -11,6 +11,7 @@ configs/*.yaml
 !configs/eval_config.example.yaml
 !configs/atlas_presets.example.yaml
 data/
+atlas/
 # per-script local path configs (see mask_tools/paint_mask_local.example.yaml) --
 # real paths live in *_local.yaml, gitignored so editing them isn't a git diff.
 *_local.yaml

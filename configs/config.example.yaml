@@ -1,16 +1,5 @@
-# 配准流程配置文件模板。每个样本一份配置，复制这份模板改成你自己的路径/参数，
-# 存到 configs/ 目录下，文件名用样本名区分，例如：
-#   configs/mouse01.yaml
-#   configs/mouse02.yaml
-# 然后运行（配置文件路径用绝对路径或相对路径都可以）：
 #   conda activate antsreg
 #   python -m registration_ants.pipeline configs/mouse01.yaml
-#
-# 默认是单次配准（不用粗-精两级策略）：每个样本通常只有一份降采样后的 TIFF，
-# 只是不同样本降采样倍数可能不一样（比如有的是4x有的是8x），所以每个样本要
-# 各自写对 voxel_size_um——这是样本之间真正会变的参数。fine_target_um /
-# atlas_res_um 建议所有样本保持一致（都配准到同一个图谱分辨率），这样不同
-# 样本的结果之间才有可比性。
 
 sample:
   name: mouse01                     # 样本标识，会用作输出文件名前缀
@@ -18,99 +7,51 @@ sample:
   raw_tiff: /path/to/downsampled_stack.tif
   voxel_size_um: [2.6, 2.6, 32.0]    # 顺序是 [x, y, z]，单位微米——每个样本自己实际的降采样体素尺寸
 
-  # 只有一个通道就不用管这个——只有当你除了这个配准用的通道之外，还有别的
-  # 信号通道也需要用同一套变换搬到图谱空间时才加（取消注释），一般用不到：
-  # channels:
+  # if the sample has multiple channels, you can specify them here. 
   #   - name: signal_channel1
   #     raw_tiff: /path/to/signal_channel1.tif
   #     voxel_size_um: [2.6, 2.6, 32.0]
 
-output_dir: /path/to/output/mouse01   # 所有中间结果/变换/最终结果都写在这里
+cells:
+  cell_centroids_dir: /path/to/cell_centroids   
+  prefix: "ob_"                                  
+  voxel_size_um: [0.65, 0.65, 8.0]   
 
-# 图谱来源：brainglobe 会自动下载标准成年 Allen CCF；如果是发育期/其他非标准
-# 图谱（比如 P5 用的 DeMBA、或者 DevCCF），改成 custom 直接指向已经准备好方向/裁剪的文件，
-# 或者更省事地用图谱预设（下面第三种写法）。
 atlas:
-  source: brainglobe
+  source: devccf_p04
 
-  # source: custom 时用这几行代替上面（把上面 source: brainglobe 删掉/注释掉）：
-  # source: custom
-  # template_path: /path/to/atlas_reference.tif
-  # annotation_path: /path/to/atlas_annotation.tif
-  # resolution_um: 25          # 这两个文件本身的各向同性体素尺寸（不是你样本的），决定配准的物理网格
-  # ontology_path: /path/to/ontology.json   # 可选，label id -> 脑区名称
-
-  # 第三种写法：图谱预设——如果同一个图谱（比如 DeMBA P5、DevCCF P04）要在多个样本间复用，
-  # 把 template_path/annotation_path/resolution_um/ontology_path/orientation/slicing
-  # 集中写一次到 configs/atlas_presets_local.yaml（复制 atlas_presets.example.yaml 改成
-  # 真实路径，gitignored），这里直接写预设名字就行，等价于 source: custom + 那些字段：
-  # source: devccf_p04   # 或 demba_p5，见 configs/atlas_presets.example.yaml
-
-  # 如果 template_path/annotation_path 指向的是"原始"、还没摆正方向/裁剪过的图谱文件
-  # （比如直接下载的 DeMBA/Allen 原始数据），可以加下面两项，让本流程自己做方向转换+
-  # 裁剪（等价于以前用 ClearMap 的 ano.prepare_annotation_files 预处理一遍图谱）：
-  # orientation: [1, 3, 2]   # 3 个带符号整数（1=x 2=y 3=z，负号=该轴翻转），描述"原始轴顺序 -> 目标轴顺序"
-  # slicing: [null, null, [285, 510]]   # 摆正方向之后再裁剪，每轴 [start, end] 或 null(不裁)，顺序 x,y,z
-  # 结果会缓存在 template_path/annotation_path 同目录下（按 orientation+slicing 生成文件名后缀），
-  # 多个样本共用同一份图谱+同样的 orientation/slicing 时不会重复计算。
-  # 如果 template_path/annotation_path 已经是摆正裁剪好的文件（比如下面 s12t.yaml 里用的
-  # p5_trimmed 那份），不要加这两项，直接照现在这样用就行。
+atlas_variants:
+  demba_p5:
+    output_dir: /path/to/output/mouse01/DeMBA
+    fine_target_um: 25
+    atlas_res_um: 25
+  devccf_p04:
+    output_dir: /path/to/output/mouse01/DevCCF
+    fine_target_um: 20
+    atlas_res_um: 20
+    orientation: [-1, -3, -2]   # change atlas orientation to match the sample
 
 registration:
-  fine_target_um: 25          # 重采样到的各向同性分辨率——建议跟 atlas.resolution_um（或下面 atlas_res_um）保持一致
-  atlas_res_um: 25            # 只有 atlas.source: brainglobe 时才用得到，custom 时忽略这一项
   use_coarse_to_fine: false   # 单次配准用 false；只有极少数配准不收敛、想先做一次粗对齐时才设 true（目前不支持跟 custom atlas 一起用）
   type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
 
-  # 以下两项只有 use_coarse_to_fine: true 时才需要，此时还要在 sample 里加
-  # raw_tiff_coarse / voxel_size_coarse_um（另一份更粗的降采样数据）
-  # coarse_target_um: 50
-  # coarse_atlas_res_um: 50
+  crop_for_registration:
+    x: [50, 400]
+    y: null
+    z: [10, 200]
 
-  # 配准前裁剪：只把 fine_target_um 重采样后的图像里的一部分（比如去掉大片背景/
-  # 非脑组织）拿去配准，而不是整张图。坐标是重采样后图像自己的体素索引（跟
-  # <name>_fine_<fine_target_um>um.nii.gz 是同一个网格），每轴 [start, end] 或不写=整轴不裁。
-  # 注意：裁剪只影响"喂给配准算法的输入"，<name>_fine_*um.nii.gz、
-  # cell_registration.csv 的 resample-space 坐标、labels_in_sample.nii.gz 这些
-  # 产出仍然是完整（未裁剪）网格，不需要额外换算。目前不支持跟 use_coarse_to_fine: true 一起用。
-  # crop_for_registration:
-  #   x: [50, 400]
-  #   y: null
-  #   z: [10, 200]
-
-# 配准 mask：排除掉不该硬配准的区域（真实结构缺失/损伤），不参与代价函数计算。
-# 不需要就都留空/删掉整个 mask 块。
 mask:
-  # 图谱侧：自动排除，不需要手画。按名称匹配 ontology（大小写不敏感、子串匹配），
-  # 连同该结构的所有子区域一起排除。例如样本缺嗅球：
   # atlas_exclude_regions: ["Olfactory bulb"]
   atlas_exclude_regions: []
 
-  # 样本侧：裂缝/损伤区域的手绘 mask，用 `mask_tools/paint_mask.py`（KIND="mask"）生成：
-  # sample_damage_mask_path: /path/to/damage_mask.nii.gz
+  # potential mask for samples:
 
-  # 自动脑组织轮廓 mask：Otsu 阈值+形态学（凸包填充+最大连通域+膨胀），自动生成一个
-  # "哪里是脑组织"的二值 mask 传给配准的 moving_mask（跟上面手绘的损伤 mask 不冲突，
-  # 两个都打开会取交集）。同时会在 run.log 里打印一个裁剪建议，可以直接抄到上面
-  # registration.crop_for_registration 里。先自动生成、觉得哪里不对，可以用
-  # `mask_tools/paint_mask.py`（KIND="mask"，`EXISTING_MASK_PATH` 指向自动生成的文件）在这基础上手动补画/擦除，另存一份再填到
-  # sample_damage_mask_path（或者覆盖 <name>_brain_mask.nii.gz 这个自动生成的文件）——
-  # 流程本身每次都重新自动生成，不会记得你手工改过。
-  # auto_brain_mask: true
-  # 或者带参数覆盖默认值（sigma/closing_radius/dilate_radius 的单位都是体素，
-  # slice_axis: 2 表示按 z 轴逐层做凸包填充，跟这个仓库的 (x,y,z) 数组顺序一致）：
   # auto_brain_mask:
   #   sigma: 1.0
   #   closing_radius: 3
   #   dilate_radius: 2
   #   slice_axis: 2
 
-  # 引导区域（跟上面的 mask 相反）：组织真实存在、只是局部形变太大导致纯强度
-  # 配准跟丢的区域（比如某块皮层鼓起来配成了 background）——不是排除，而是额外
-  # 给一对"这两块应该重合"的约束主动引导形变场。产出方式见
-  # `mask_tools/paint_mask.py`（KIND="guide"）（先画样本侧，再用
-  # scripts/project_outline.py 把样本侧投影到图谱空间当起点，图谱侧
-  # 手动调整/确认）。weight 可选，默认 1.0。
   # guide_regions:
   #   - atlas_outline_path: /path/to/atlas_outline.nii.gz
   #     sample_outline_path: /path/to/sample_outline.nii.gz
@@ -120,17 +61,4 @@ preprocess:
   n4_bias_correction: true              # 是否做 N4 偏场校正（光片照明不均匀，比如样本一侧比另一侧暗）
   intensity_clip_percentiles: [0.1, 99.9]   # 强度裁剪的百分位，按每张图自己的分布算，不受16-bit绝对亮暗影响
 
-# 细胞脑区归属：读取细胞检测产出的 cell_centroids/<prefix><class>.csv（原始全分辨率像素坐标，
-# 跟 ClearMap cellMap.py 读的是同一份文件/格式），把每个细胞的坐标经过本次配准变换到图谱空间，
-# 查出所在脑区，写出 output_dir/cell_registration/<class>/cell_registration.csv
-# （跟 ClearMap 生成的格式完全一致，列布局：0-2原始像素xyz，3-5 resample空间体素坐标
-#   [跟 <name>_fine_<fine_target_um>um.nii.gz 同一网格]，6-8 图谱空间体素坐标，
-#   9 label id，10 脑区名称，11-13 slice_name/tile_name/score）。
-# 不需要就整个 cells: 块删掉/不写，流程会自动跳过这一步。
-# cells:
-#   cell_centroids_dir: /path/to/cell_centroids   # 存放 ob_<class>.csv 的目录
-#   prefix: "ob_"                                  # 可选，默认 "ob_"
-#   voxel_size_um: [0.65, 0.65, 8.0]                # 细胞检测所用的原始（未降采样）体素尺寸 [x,y,z]，单位微米
-#                                                     # 注意：跟上面 sample.voxel_size_um 不是一回事——
-#                                                     # 那个是配准输入（降采样后）的体素尺寸，这里要填
-#                                                     # 细胞坐标本身所在的、通常更精细的原始分辨率。
+            
