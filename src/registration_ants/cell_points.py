@@ -29,6 +29,7 @@ No .npy structured-array output (unlike cellMap.py) -- nothing on the ANTs
 side reads it; the CSV alone is the established interchange format here.
 """
 import glob
+import logging
 import os
 from pathlib import Path
 
@@ -36,6 +37,8 @@ import numpy as np
 import pandas as pd
 
 from . import transforms
+
+logger = logging.getLogger(__name__)
 
 
 def read_centroid_csv(csv_path):
@@ -116,10 +119,10 @@ def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fi
         try:
             df_src = read_centroid_csv(csv_path)
         except Exception as e:
-            print(f"Skipping class {class_name}: failed to read CSV ({e}).")
+            logger.warning("Skipping class %s: failed to read CSV (%s).", class_name, e)
             continue
         if len(df_src) == 0:
-            print(f"Skipping class {class_name}: 0 cells found in csv.")
+            logger.warning("Skipping class %s: 0 cells found in csv.", class_name)
             continue
 
         raw_xyz = np.ascontiguousarray(df_src[['cx', 'cy', 'z']].values, dtype=float)
@@ -160,7 +163,7 @@ def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fi
         class_dir = Path(output_dir) / 'cell_registration' / class_name
         class_dir.mkdir(parents=True, exist_ok=True)
         out_df.to_csv(class_dir / 'cell_registration.csv', header=False, index=False)
-        print(f"{class_name}: {len(out_df)} cell(s) -> {class_dir / 'cell_registration.csv'}")
+        logger.info("%s: %d cell(s) -> %s", class_name, len(out_df), class_dir / 'cell_registration.csv')
         processed.append(class_name)
 
     return processed

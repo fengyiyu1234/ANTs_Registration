@@ -23,23 +23,31 @@ from .config import load_config
 
 logger = logging.getLogger("registration_ants.pipeline")
 
+# Handlers are attached to the "registration_ants" package logger (not just
+# .pipeline), so per-module loggers elsewhere (e.g. cell_points.py's
+# per-class counts) propagate into run.log too instead of only reaching the
+# console via print().
+_package_logger = logging.getLogger("registration_ants")
+
 
 def _setup_logging(output_dir):
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    _package_logger.setLevel(logging.INFO)
+    _package_logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
     file_handler = logging.FileHandler(output_dir / "run.log")
     file_handler.setFormatter(fmt)
-    logger.addHandler(stream_handler)
-    logger.addHandler(file_handler)
+    _package_logger.addHandler(stream_handler)
+    _package_logger.addHandler(file_handler)
 
 
 def _preprocess(img, prep_cfg):
     if prep_cfg["n4_bias_correction"]:
+        logger.info("Preprocessing: N4 bias correction, input shape=%s", img.shape)
         return preprocess.preprocess_for_registration(img)
     lo, hi = prep_cfg["intensity_clip_percentiles"]
+    logger.info("Preprocessing: intensity clip_and_normalize percentiles=(%s, %s), input shape=%s", lo, hi, img.shape)
     return preprocess.clip_and_normalize(img, lo, hi)
 
 
@@ -69,6 +77,8 @@ def run_pipeline(config_path):
     sample_fine = io_utils.convert_to_isotropic_nifti(
         sample["raw_tiff"], tuple(sample["voxel_size_um"]), reg_cfg["fine_target_um"], fine_iso_path,
     )
+    logger.info("Resampled sample_fine: shape=%s spacing=%s, wrote %s",
+                sample_fine.shape, sample_fine.spacing, fine_iso_path)
 
     sample_fine_for_reg = sample_fine
     crop_cfg = reg_cfg.get("crop_for_registration")
@@ -81,7 +91,7 @@ def run_pipeline(config_path):
         ants.image_write(sample_fine_for_reg, str(cropped_path))
         logger.info("Cropped: %s -> %s, wrote %s", sample_fine.shape, sample_fine_for_reg.shape, cropped_path)
 
-    logger.info("[2/6] Preprocessing (N4 + intensity normalization)...")
+    logger.info("[2/6] Preprocessing...")
     sample_fine_prep = _preprocess(sample_fine_for_reg, prep_cfg)
 
     logger.info("[3/6] Registering to atlas (source=%s)...", config["atlas"]["source"])
@@ -94,6 +104,8 @@ def run_pipeline(config_path):
             reg_cfg["coarse_target_um"], coarse_iso_path,
         )
         sample_coarse_prep = _preprocess(sample_coarse, prep_cfg)
+        logger.info("Registration params: strategy=coarse_to_fine, coarse_atlas_res_um=%s, atlas_res_um=%s, "
+                    "outprefix=%s", reg_cfg["coarse_atlas_res_um"], reg_cfg["atlas_res_um"], transforms_prefix)
         reg = register.register_to_allen_coarse_to_fine(
             sample_coarse_prep, sample_fine_prep,
             coarse_res_um=reg_cfg["coarse_atlas_res_um"], fine_res_um=reg_cfg["atlas_res_um"],
@@ -171,15 +183,24 @@ def run_pipeline(config_path):
             logger.info("Loaded %d guide region(s): %s", len(guide_regions),
                         [gr["sample_outline_path"] for gr in mask_cfg["guide_regions"]])
 
+        logger.info("Registration params: strategy=single_shot, type_of_transform=%s, atlas_mask=%s, "
+                    "sample_mask=%s, guide_regions=%d, outprefix=%s",
+                    reg_cfg["type_of_transform"], atlas_mask is not None, sample_mask is not None,
+                    len(guide_regions or []), transforms_prefix)
         reg = register.register_to_atlas(
             sample_fine_prep, atlas_template, atlas_annotation, atlas_structures,
             type_of_transform=reg_cfg["type_of_transform"], outprefix=transforms_prefix,
             mask=atlas_mask, moving_mask=sample_mask, guide_regions=guide_regions,
         )
 
+    logger.info("Registration complete: fwdtransforms=%s, invtransforms=%s",
+                reg.get("fwdtransforms"), reg.get("invtransforms"))
+
     logger.info("[4/6] Applying transforms (sample <-> atlas)...")
     sample_in_atlas = transforms.warp_sample_to_atlas(sample_fine_prep, reg)
-    ants.image_write(sample_in_atlas, str(output_dir / f"{sample['name']}_in_atlas.nii.gz"))
+    sample_in_atlas_path = output_dir / f"{sample['name']}_in_atlas.nii.gz"
+    ants.image_write(sample_in_atlas, str(sample_in_atlas_path))
+    logger.info("Wrote sample_in_atlas: shape=%s -> %s", sample_in_atlas.shape, sample_in_atlas_path)
 
     # Reference = the UNCROPPED sample_fine grid, not sample_fine_prep --
     # apply_transforms only uses its `fixed` argument as an output-grid
@@ -192,16 +213,21 @@ def run_pipeline(config_path):
     # already depends on (it looks up corrected labels via those columns with
     # no rescaling).
     labels_in_sample = transforms.warp_labels_to_sample(sample_fine, reg)
-    ants.image_write(labels_in_sample, str(output_dir / f"{sample['name']}_labels_in_sample.nii.gz"))
+    labels_in_sample_path = output_dir / f"{sample['name']}_labels_in_sample.nii.gz"
+    ants.image_write(labels_in_sample, str(labels_in_sample_path))
+    logger.info("Wrote labels_in_sample: shape=%s -> %s", labels_in_sample.shape, labels_in_sample_path)
 
-    logger.info("[5/6] Warping additional channels (if any)...")
-    for ch in sample.get("channels", []):
+    channels = sample.get("channels", [])
+    logger.info("[5/6] Warping additional channels (%d configured)...", len(channels))
+    for ch in channels:
         ch_img = io_utils.convert_to_isotropic_nifti(
             ch["raw_tiff"], tuple(ch["voxel_size_um"]), reg_cfg["fine_target_um"],
             output_dir / f"{ch['name']}_fine_{reg_cfg['fine_target_um']}um.nii.gz",
         )
         ch_in_atlas = transforms.warp_sample_to_atlas(ch_img, reg)
-        ants.image_write(ch_in_atlas, str(output_dir / f"{ch['name']}_in_atlas.nii.gz"))
+        ch_in_atlas_path = output_dir / f"{ch['name']}_in_atlas.nii.gz"
+        ants.image_write(ch_in_atlas, str(ch_in_atlas_path))
+        logger.info("Warped channel '%s': shape=%s -> %s", ch["name"], ch_in_atlas.shape, ch_in_atlas_path)
 
     logger.info("[6/6] Assigning cell regions (if configured)...")
     if "cells" in config:
