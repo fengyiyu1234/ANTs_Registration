@@ -103,8 +103,9 @@ def test_region_mask_dice_hd95(tmp_dir):
     # expects that -- mirrors ants.image_write -> sitk.ReadImage round trip).
     sitk.WriteImage(sitk.GetImageFromArray(np.transpose(arr, (2, 1, 0)).astype(np.uint32)), str(labels_path))
 
-    cortex_mask = ev.load_region_mask(labels_path, "FakeCortex", structures)
-    hippo_mask = ev.load_region_mask(labels_path, "FakeHippo", structures)
+    labels_arr = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path)))
+    cortex_mask = ev.load_region_mask(labels_arr, "FakeCortex", structures)
+    hippo_mask = ev.load_region_mask(labels_arr, "FakeHippo", structures)
     brain_mask = ev.load_brain_mask_from_labels(labels_path)
 
     assert cortex_mask.sum() == int((arr == 10).sum())
@@ -125,8 +126,65 @@ def test_region_mask_dice_hd95(tmp_dir):
     print("   OK")
 
 
+def test_resample_mask_to_reference():
+    print("3. resample_mask_to_reference / remap_annotated_slices "
+          "(cross-resolution ground truth, e.g. demba_p5 @25um vs devccf_p04 @20um)...")
+
+    def make_box_image(spacing_um, size_um=400.0, box_um=(100.0, 300.0)):
+        """A synthetic box with an EXACT physical bounding box (chosen as a
+        multiple of both 20 and 25um so there's no rounding ambiguity in the
+        test itself), rasterized at whatever isotropic spacing is passed in
+        -- standing in for two registrations of the same sample at different
+        resolutions (e.g. demba_p5 @25um vs devccf_p04 @20um)."""
+        n = int(round(size_um / spacing_um))
+        lo = int(round(box_um[0] / spacing_um))
+        hi = int(round(box_um[1] / spacing_um))
+        arr = np.zeros((n, n, n), dtype=np.uint8)
+        arr[lo:hi, lo:hi, lo:hi] = 1
+        img = sitk.GetImageFromArray(arr)
+        img.SetSpacing((spacing_um,) * 3)
+        return img
+
+    reference_img = make_box_image(20.0)     # e.g. devccf_p04's own grid
+    ground_truth_img = make_box_image(25.0)  # e.g. hand-drawn against demba_p5's grid
+
+    same = ev.resample_mask_to_reference(reference_img, reference_img)
+    assert same is reference_img, "same-grid input must be returned as-is (no-op)"
+
+    resampled = ev.resample_mask_to_reference(ground_truth_img, reference_img)
+    assert resampled.GetSize() == reference_img.GetSize()
+    assert np.allclose(resampled.GetSpacing(), reference_img.GetSpacing())
+
+    # The resampled mask's physical bounding box should land close to the
+    # ORIGINAL ground-truth box's physical bounding box ([100,300]um), within
+    # one reference voxel (20um) of slop -- i.e. resampling relocated the
+    # mask onto the new grid without shifting *where in physical space* it
+    # sits. (Checking bounding boxes directly, rather than Dice against an
+    # independently-rasterized box, avoids conflating resample correctness
+    # with this test's own box/grid quantization.)
+    resampled_arr = sitk.GetArrayFromImage(resampled) > 0
+    idx = np.argwhere(resampled_arr)
+    assert idx.size > 0, "resampled mask should not be empty"
+    resampled_lo_um = idx.min(axis=0) * 20.0
+    resampled_hi_um = (idx.max(axis=0) + 1) * 20.0
+    assert np.all(np.abs(resampled_lo_um - 100.0) <= 20.0), resampled_lo_um
+    assert np.all(np.abs(resampled_hi_um - 300.0) <= 20.0), resampled_hi_um
+    print(f"   resampled bbox (um): lo={resampled_lo_um}, hi={resampled_hi_um} "
+          f"(original ground truth box was [100,300]um) -- shape {resampled_arr.shape}")
+
+    # A z-plane hand-drawn at index 5 on the 25um ground truth grid (physical
+    # z = 5*25 = 125um) should land at index round(125/20) = 6 on the 20um
+    # reference grid.
+    remapped = ev.remap_annotated_slices([5], ground_truth_img, reference_img)
+    assert remapped == [6], f"expected z=5 @25um -> z=6 @20um, got {remapped}"
+    # Same-grid case must be a no-op passthrough.
+    assert ev.remap_annotated_slices([3, 7], reference_img, reference_img) == [3, 7]
+    assert ev.remap_annotated_slices(None, ground_truth_img, reference_img) is None
+    print("   OK (cross-resolution resample + slice-index remap correct)")
+
+
 def test_eval_config_groups(tmp_dir):
-    print("3. load_eval_config / _load_groups_from_manifest...")
+    print("4. load_eval_config / _load_groups_from_manifest...")
     manifest_path = tmp_dir / "fake_stats_config.yaml"
     manifest_path.write_text(
         "groups:\n"
@@ -139,7 +197,7 @@ def test_eval_config_groups(tmp_dir):
 
 
 def test_end_to_end_synthetic_registration(tmp_dir):
-    print("4. end-to-end: synthetic registration -> transforms reload -> "
+    print("5. end-to-end: synthetic registration -> transforms reload -> "
           "apply_transform_to_points / load_jacobian / inverse_consistency / evaluate_sample...")
 
     raw_tiff = tmp_dir / "synthetic_sample.tif"
@@ -318,6 +376,7 @@ def main():
 
     test_load_points()
     test_region_mask_dice_hd95(tmp_dir)
+    test_resample_mask_to_reference()
     test_eval_config_groups(tmp_dir)
     test_end_to_end_synthetic_registration(tmp_dir)
 

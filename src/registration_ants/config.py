@@ -23,9 +23,6 @@ _DEFAULTS = {
     "registration": {
         "fine_target_um": 25,
         "atlas_res_um": 25,
-        "use_coarse_to_fine": False,
-        "coarse_target_um": 50,
-        "coarse_atlas_res_um": 50,
         "type_of_transform": "SyNRA",
     },
     "preprocess": {
@@ -117,23 +114,8 @@ def load_config(path):
     if not Path(sample["raw_tiff"]).exists():
         raise FileNotFoundError(f"sample.raw_tiff not found: {sample['raw_tiff']}")
 
-    if config["registration"]["use_coarse_to_fine"]:
-        for required in ("raw_tiff_coarse", "voxel_size_coarse_um"):
-            if required not in sample:
-                raise ValueError(
-                    f"config.sample.{required} is required when registration.use_coarse_to_fine is true"
-                )
-        if not Path(sample["raw_tiff_coarse"]).exists():
-            raise FileNotFoundError(f"sample.raw_tiff_coarse not found: {sample['raw_tiff_coarse']}")
-        if config["atlas"]["source"] == "custom":
-            raise ValueError("atlas.source: custom + registration.use_coarse_to_fine: true isn't supported yet")
-
     crop_cfg = config["registration"].get("crop_for_registration")
     if crop_cfg:
-        if config["registration"]["use_coarse_to_fine"]:
-            raise ValueError(
-                "registration.crop_for_registration isn't supported together with use_coarse_to_fine: true yet"
-            )
         for axis in ("x", "y", "z"):
             if crop_cfg.get(axis) is not None and len(crop_cfg[axis]) != 2:
                 raise ValueError(f"registration.crop_for_registration.{axis} must be a [start, end] pair or null")
@@ -186,8 +168,6 @@ def load_config(path):
                           "(sigma/closing_radius/dilate_radius/slice_axis)")
 
     if mask_cfg.get("guide_regions"):
-        if config["registration"]["use_coarse_to_fine"]:
-            raise ValueError("mask.guide_regions isn't supported together with registration.use_coarse_to_fine: true yet")
         for i, gr in enumerate(mask_cfg["guide_regions"]):
             for required in ("atlas_outline_path", "sample_outline_path"):
                 if required not in gr:

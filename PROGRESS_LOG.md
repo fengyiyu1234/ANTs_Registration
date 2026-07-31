@@ -362,3 +362,115 @@
 **环境备注**：这次调研用的 DevCCF/DeMBA 原始数据、以及 Path A 的完整运行，全程在用户本机 Mac 上完成（`/Users/fengyiyu/Downloads/projects/Registration/` 下）；用户真正跑配准 pipeline 是在远程 server 上（`/home/fyu7/...`、`/data/hdd12tb-1/...`，CPU 比本机好），本机的 `demba_p5` 本地文件跟 server 上真正在用的那份 `p5_trimmed`（已经过 ClearMap 摆正裁剪）不是同一份文件，不能混用。
 
 **下一步**：用户把 `P04_LSFM_20um.nii.gz`/`P04_DevCCF_Annotations_20um.nii.gz`/`DevCCFv1_ontology.json` 三个文件传到 server（放到跟现有 `p5_trimmed` 同级的位置），`git pull` 这份改动，在 server 上自己建一份 `configs/atlas_presets_local.yaml`（gitignored，不会跟着 git pull 过去）填 `devccf_p04` 预设（server 路径 + `orientation: [-1,-3,-2]`），新建一份样本配置（复用 `s12t.yaml` 的 `sample:`/`cells:` 块，`atlas: {source: devccf_p04}`，`registration.fine_target_um`/`atlas_res_um` 改成 20），跑一次真实 Path B 配准，跟 Path A 的结果、以及原来的 DeMBA/CCFv3 结果三方比较。
+
+---
+
+## 2026-07-29：`run.log` 补参数 + 加 `run_pipeline.sh` 解决 ANTs 原生输出漏记的坑
+
+用户发现真实跑出来的 `run.log`（s12t 样本）只有 `[1/6]`~`[6/6]` 这种步骤标记，没有任何具体参数/输出路径，也完全没有 ANTs 配准过程的 iteration 输出。分两轮修：
+
+**第一轮：补齐 pipeline.py 自己该打的参数**（之前只打步骤名，没打输出）：
+- `[1/6]` 补 resample 后的 shape/spacing/输出路径；`[2/6]` 补实际用的预处理方式（N4 vs clip percentiles）；`[3/6]` 补 `type_of_transform`、是否用了 atlas/sample mask、guide_regions 数量，配准完成后补 `fwdtransforms`/`invtransforms` 路径；`[4/6]`/`[5/6]` 补每个输出文件的 shape+路径；`[6/6]` 的每类细胞数量之前是 `cell_points.py` 用 `print()` 打的，根本不走 logging——改成 `logger.info`，并且把 `_setup_logging` 挂 handler 的对象从 `"registration_ants.pipeline"` 改成父级 `"registration_ants"` logger，这样 `cell_points.py` 这类子模块的 log 也能传播上来。
+
+**第二轮：发现 ANTs 的 SyN 迭代日志（DIAGNOSTIC 那些行）还是没进 run.log**——这是本来就在模块 docstring 里记录过的已知坑：ANTs 底层 C++ 直接往进程的 stdout 文件描述符写，完全绕过 Python 的 `sys.stdout`/`logging`，`FileHandler` 天生抓不到，唯一办法是重定向整个进程的输出。问了用户要"包一个 shell 脚本"还是"进程内 os.dup2 自动重定向"，用户选了前者（更简单可靠）：
+- 新增 `run_pipeline.sh`（repo 根目录，`chmod +x`）：先用 `registration_ants.config.load_config` 解析出真实 `output_dir`（因为 `output_dir` 是通过 `atlas.source` 从 `atlas_variants` 里选出来的，不能直接手工解析 yaml），再 `python -m registration_ants.pipeline "$1" 2>&1 | tee -a "$output_dir/run.log"`。以后统一用 `./run_pipeline.sh configs/xxx.yaml` 跑，不用再记 tee 命令。
+- **踩的坑**：一开始只想着"加个 tee 脚本"，忘了 `pipeline.py` 自己的 `_setup_logging` 里还留着一个 `FileHandler` 直接写 `run.log`——如果两个都留着，`tee` 会把 Python logger 打到 console 的每一行**又**重复写一遍进 `run.log`（一次来自 `FileHandler` 直写，一次来自 tee 抓 console 镜像）。发现后把 `FileHandler` 删掉了，`_setup_logging` 现在只留 console 的 `StreamHandler`，run.log 完全交给 `run_pipeline.sh` 的 tee 统一处理（这样 pipeline 自己的 step marker 和 ANTs 的原生输出会按实际发生顺序交织在同一个文件里，不是分两段）。
+- 同步更新了 `configs/s12t.yaml`/`configs/config.example.yaml` 顶部注释、`pipeline.py` 的 `__main__` usage 提示、`README.md`，都指向 `./run_pipeline.sh` 而不是裸的 `python -m registration_ants.pipeline`。**注意**：如果谁绕开 wrapper 直接跑 `python -m registration_ants.pipeline config.yaml`，现在完全不会写 `run.log`（只有 console 输出）——这是有意的取舍，不是 bug。
+
+**验证结果**：`run_pipeline.sh` 对着真实 `configs/s12t.yaml` 验证了 `output_dir` 能正确解析成 `.../s12t/DevCCF`（DevCCF 分支）；Python 侧起了一个临时 pipeline/cell_points logger 手动 `_setup_logging()` 验证过日志能正常传播、无重复；未跑完整真实配准验证 tee 端到端效果（那次要 1+ 小时，本次改动逻辑简单直接信任了）。
+
+**追加：每步耗时统计**（用户追加的需求：方便以后比较不同配置/参数跑出来的时长）：
+- `run_pipeline`里加了`step_marks`列表，在每个`[n/6]`步骤开始时记`time.perf_counter()`，`[6/6]`结束后再记一次`"done"`，跑完打印一段`Step timing summary`，逐步列出每步耗时（`[1/6] resample`到`[6/6] assign_cells`）+ `total`总时长，格式`H:MM:SS`（`timedelta(seconds=round(...))`）。这样能一眼看出哪一步最耗时（通常是`[3/6] register`）,也方便同一样本换`type_of_transform`/mask 配置后比较运行时间。
+
+**下一步**：用户下次真实跑 `./run_pipeline.sh configs/s12t.yaml` 时确认 `run.log` 里能同时看到 step marker 参数、ANTs 的 DIAGNOSTIC 迭代行、以及末尾的每步耗时统计。
+
+---
+
+## 2026-07-29（续）：DevCCF 配准奇慢 → 查出 orientation 错了 + 半球没裁，两个坑一起修
+
+用户跑 DevCCF 那次配准两个多小时没跑完（第二个分辨率层级单次迭代要 ~21 分钟，`SINCE_LAST` 从 ~135s 跳到 ~1263s），问是不是 atlas 方向错了。查下来**两个问题叠在一起**，都会让 SyN 拼命去拟合根本对不上的结构：
+
+**坑 1：orientation 推错了**（`[-1,-3,-2]` → 正确是 `[1,-3,2]`）
+之前 2026-07-28 那条记录里 `[-1,-3,-2]` 是"根据 direction matrix 代数推算 + 目视核对"得到的，但**目视核对对左右对称的图谱天然无效**——图谱自己左右对称，单独看切片根本看不出 X 轴翻没翻，当时"三个切面都清晰可辨、左右对称"的结论并不能证明方向对。这次拿到了关键的缺失信息：用户的样本方位（horizontal plane，轴0=左→右、轴1=前→后、轴2=上→下），才能把映射真正定下来：
+
+- `P04_LSFM_20um.nii.gz` 的 affine（NIfTI RAS+，+X=Right/+Y=Anterior/+Z=Superior）解出**原始文件三个轴的解剖含义**（形状 640×560×800）：
+  - 轴0 递增 → Right（左→右）
+  - 轴1 递增 → Inferior（上→下）
+  - 轴2 递增 → Anterior（后→前）
+- 对着样本三个轴逐个填：轴0=Right ← 源轴0 同向 → `+1`；轴1=Posterior ← 源轴2 反向 → `-3`；轴2=Inferior ← 源轴1 同向 → `+2` ⇒ **`orientation: [1, -3, 2]`**，用户确认正确。
+
+**坑 2：样本是右半脑，图谱却是全脑**——用户在 ClearMap 里本来就是把图谱裁成右半球再配的，这次迁到 ants 漏了。半个脑去配全脑，SyN 会硬拉伸去匹配不存在的另一半，既慢又必然配歪。修法是用现成的 `atlas.slicing`：转向后 X 轴 = 左→右共 640 体素，用左右镜像匹配实测中线正好在 **320**（匹配度 0.9999），右半球 = `[320, 640)` ⇒ `slicing: [[320, 640], null, null]`。**注意 `slicing` 在 `orientation` 之后生效**（`atlas_utils.prepare_custom_atlas` 先 `reorient_volume` 再切片），所以索引写的是转向后网格上的坐标，不是原始 nii 的。
+
+**踩的坑 / 教训**：
+- 中途试过"跑一次快速 Affine 比 NCC，哪个 orientation 分高就选哪个"来做客观判据——**这个方法失效了**（current 0.6002 vs candidate 0.5966，几乎无差别，还反而是错的那个略高）。原因是 Affine 在两种朝向下都能找到某个"凑合"的局部最优。真正看出差别的是**把 warp 后的样本和图谱轮廓并排画出来**：错误朝向下样本被压成一条扁长条，正确朝向下轮廓能套上。以后判断方向不要只看单一相似性数值。
+- orientation **不是图谱的固有属性**，它是"图谱轴 → 样本轴"的映射，样本方位一变就要重推。所以这次把职责拆开了：图谱原始文件三个轴的解剖含义（可复用的客观事实）记在预设里，orientation/slicing（依赖样本）记在样本配置的 `atlas_variants` 里。
+
+**改动**：
+- `configs/atlas_presets.example.yaml`：`devccf_p04` 的 orientation 改成 `[1,-3,2]`，记上原始文件三个轴的解剖含义 + 中线 320；顶部新增一大段「**怎么推 orientation**」的通用步骤（怎么从 affine 读轴含义、样本轴怎么写、怎么逐个填、怎么核对）和「**半球裁剪 slicing**」说明——以后换成像方位的新样本照着走就行。
+- `configs/atlas_presets_local.yaml`（gitignored）：同步真实路径版，orientation 改 `[1,-3,2]` + 原始轴含义注释。
+- `configs/s12t.yaml`：`sample:` 块记上"本样本是右半脑"+ 三个轴的解剖方位（作为 orientation 的推导依据）；`atlas_variants.devccf_p04` 里 orientation 改 `[1,-3,2]`（并写上逐轴推导），新增 `slicing: [[320,640], null, null]`。**slicing 放在 `atlas_variants` 而不是顶层 `atlas:`**，因为索引是 DevCCF 网格专用的，切回 `demba_p5` 时不能套用。
+
+**验证结果**：`load_config('configs/s12t.yaml')` 解析出 `orientation=[1,-3,2]`/`slicing=[[320,640],None,None]`/`output_dir=.../s12t/DevCCF`/20um；`prepare_custom_atlas` 实跑出 template+annotation 都是 `(320, 800, 560)`（X 正好半边）、spacing `(20,20,20)`、annotation 里 193 个 label。另外确认了 `mask.atlas_exclude_regions: ["Olfactory bulb"]` 在 DevCCF 本体里能匹配到（1 个："olfactory bulb, principal part"，子结构会一并排除），不会静默失效。**没有跑完整配准验证**——最终对齐质量要等用户真实跑完看。
+
+**产物/清理**：`atlas/DevCCF/_orientation_check/` 下导了三个 TIFF 供肉眼核对（`atlas_CURRENT_orient_-1_-3_-2.tif`、`atlas_CANDIDATE_orient_1_-3_2.tif`、`atlas_FINAL_orient_1_-3_2_rightHemi.tif`，各 ~0.3-0.6GB，核对完可以整个目录删掉）。`atlas/DevCCF/` 下旧的 `*_-1_-3_-2__full.nii.gz` 两个缓存文件已经作废（新缓存是 `*_1_-3_2__320-640_full_full.nii.gz`），可以删。
+
+**下一步**：用户重跑 `./run_pipeline.sh configs/s12t.yaml`，预期比之前快很多（图谱体素少一半 + 不再硬拟合缺失的半个脑），跑完检查 `tsc12t_in_atlas.nii.gz` 的实际对齐质量。
+
+---
+
+## 2026-07-29（当天第二轮）：DevCCF 配准跑不动 → 查出 orientation 错 + 漏了半球裁剪
+
+用户反馈 DevCCF 那次配准跑了 2 个多小时还没完（SyN 第二个分辨率层级单次迭代要 ~1263s，第一层级只要 ~135s），怀疑是不是 atlas 方向错了。排查过程和结论：
+
+**先排除的假象**：ANTs 的 DIAGNOSTIC 日志本身是正常的（metricValue 单调变负、convergenceValue 单调下降、前几次迭代显示 `inf` 是滑动窗口没攒够、第二段重新从 1 计数是进入下一个金字塔层级，不是重启）。用户还问过"metricValue 才 -0.004 是不是太小"——ANTs 的 `CC` 是带邻域半径的局部互相关，没有固定值域，绝对大小受邻域半径和强度归一化影响，判断收敛要看趋势不是绝对值。所以慢不是"配准崩了"，是别的原因。
+
+**两个真正的问题**：
+
+1. **样本是右半脑，图谱是全脑，之前完全没裁**。用户明确说了样本只有右半球（ClearMap 里当初也是把图谱裁成半球再配的），而 DevCCF 全脑图谱一直整个喂给 SyN——SyN 只能去硬拉伸匹配根本不存在的另一半，既慢又必然配不准。
+
+2. **`orientation` 之前是错的**。原来配的 `[-1, -3, -2]`（2026-07-28 那轮"根据 direction matrix 代数推算 + 目视核对"的初步值，当时日志里就写了"这只是初步目视核对，不是最终配准 QC"）。这次做了一次快速 Affine-only 对比试验（各 30-40s，不跑耗时的 SyN）：两个候选方向的 NCC 几乎一样（0.6002 vs 0.5966，**这个指标没有区分度，不能用来判方向**），但把 warp 后的样本画出来一看差别很明显——旧方向下样本被压成一个扁长条、跟图谱轮廓完全对不上（affine 陷入局部最优的典型表现），新方向下轮廓能套上。用户最后自己用导出的 TIFF 目视确认了新方向 `[1, -3, 2]` 是对的。
+
+**为什么之前的目视核对没发现**：DevCCF 图谱左右对称，单独看图谱的三视图**看不出 X 轴翻没翻**（镜像后长得一模一样，实测左右镜像匹配度 0.9999）。必须拿图谱去跟样本对照才能定方向——这是这次踩到的关键教训。
+
+**orientation 的正确推法（已写进 `configs/atlas_presets.example.yaml` 顶部，含完整步骤）**：orientation 描述的是"把图谱的轴转成跟**样本**的轴一致"，**同时取决于图谱和样本，不是图谱的固有属性**，样本方位一换就要重推。
+
+- DevCCF P04 原始 nii 的 affine（NIfTI RAS+ 约定，+X=Right/+Y=Anterior/+Z=Superior）解出来的三个数组轴含义（形状 640×560×800）：
+  - 轴0 递增 → **Right**（左→右）
+  - 轴1 递增 → **Inferior**（上→下）
+  - 轴2 递增 → **Anterior**（后→前）
+- tsc12t 样本（horizontal plane 成像）的三个轴：轴0=左→右、轴1=前→后、轴2=上→下。
+- 逐个目标轴映射（第 d 项 = 样本轴 d 对应哪个源轴，1/2/3 表示图谱轴 0/1/2，反向加负号）：
+  - 样本轴0 = Right ← 图谱轴0 就是 Right，同向 → `+1`
+  - 样本轴1 = Posterior ← 图谱轴2 是 Anterior，反向 → `-3`
+  - 样本轴2 = Inferior ← 图谱轴1 就是 Inferior，同向 → `+2`
+  - ⇒ **`orientation: [1, -3, 2]`**
+
+**半球裁剪（`slicing`）**：转向后 X 轴 = 左→右共 640 体素，中线实测在 320（用左右镜像匹配度扫出来的，最佳点 0.9999），所以**右半球 = `[320, 640)`**，左半脑样本就是 `[0, 320]`。关键顺序：`atlas_utils.prepare_custom_atlas` 是**先 reorient 再 slicing**（`atlas_utils.py:198-200`），所以 slicing 索引写的是**转向之后**网格上的坐标，不是原始文件的。
+
+**改动落地位置**（有意分成两层，避免以后切图谱/换样本时错配）：
+- `configs/atlas_presets_local.yaml` + `configs/atlas_presets.example.yaml`：记录 **DevCCF 原始文件三个轴的解剖含义**（图谱的固有属性，以后不用再从 affine 重算）+ 完整的「怎么推 orientation」步骤 + 「半球裁剪」说明；`orientation` 修正为 `[1, -3, 2]`。
+- `configs/s12t.yaml`：`sample:` 块下用注释记录**本样本三个轴的解剖方位**（orientation 的推导依据）；`atlas_variants.devccf_p04` 下放 `orientation: [1, -3, 2]` + `slicing: [[320, 640], null, null]`。放在 `atlas_variants` 而不是 `atlas:` 顶层，是因为 `slicing` 索引是 DevCCF 网格专属的——切回 `demba_p5`（不同 shape）时不会被错误地套上（`slicing` 本来就已经是 `_ATLAS_VARIANT_FIELDS` 支持的字段，`config.py:57`）。
+
+**验证结果**：`load_config('configs/s12t.yaml')` 解析出 `orientation=[1,-3,2]` / `slicing=[[320,640],None,None]` / `output_dir=.../s12t/DevCCF` / fine=atlas=20um；`prepare_custom_atlas` 实跑产出 template+annotation 都是 `(320, 800, 560)`（X 正好半个）、spacing `(20,20,20)`、annotation 里 193 个不同 label。另外顺手确认了 `mask.atlas_exclude_regions: ["Olfactory bulb"]` 在 DevCCF 本体里能匹配上（命中 "olfactory bulb, principal part"，子结构会一起排除）——`build_region_exclusion_mask` 是子串匹配且匹配不到会**静默不排除**，换本体后值得每次确认一遍。
+
+**顺带产出/需要清理的文件**（都在 `atlas/DevCCF/` 下，都不该进 git）：
+- `_orientation_check/atlas_CURRENT_orient_-1_-3_-2.tif`、`_orientation_check/atlas_CANDIDATE_orient_1_-3_2.tif`（各 ~573MB，方向对比用，确认完可删）
+- `_orientation_check/atlas_FINAL_orient_1_-3_2_rightHemi.tif`（最终用的图谱，转向+右半球裁剪后，可留着做 QC 对照）
+- `P04_*_-1_-3_-2__full.nii.gz`（旧错误方向的缓存，已失效可删）；新缓存是 `P04_*_1_-3_2__320-640_full_full.nii.gz`
+
+**下一步**：用新配置重跑 `./run_pipeline.sh configs/s12t.yaml`。图谱体素少了一半 + 方向对了（affine 不会再陷局部最优），预期比之前那次 2 小时没跑完快很多。跑完要做的 QC：看 `tsc12t_in_atlas.nii.gz` 跟裁剪后的图谱对不对得上，以及 `tsc12t_labels_in_sample.nii.gz` 的脑区边界落在样本上合不合理。
+
+## 2026-07-31：删掉粗-精两级配准（coarse-to-fine）
+
+**动机**：这条路径从阶段4加进来后一直是 `use_coarse_to_fine: false`，实际项目里从没用过；而且它跟后来加的几乎所有功能都不兼容（custom atlas、`crop_for_registration`、`mask.guide_regions`、mask 支持），每加一个功能就要多写一条「跟 coarse 组合会报错」的校验。留着的维护成本大于价值，直接删干净。
+
+**删除范围**：
+- `register.py`：删掉 `register_to_allen_coarse_to_fine()` 整个函数，模块 docstring 改成「one-shot SyNRA」。
+- `pipeline.py`：`[3/6] register` 步骤里的 `if reg_cfg["use_coarse_to_fine"]: ... else: ...` 分支去掉，原来 else 里的单次配准逻辑（图谱解析 + mask 构建 + `register_to_atlas` 调用）整体去掉一层缩进；日志里的 `strategy=single_shot` 字段也去了（已经没有第二种 strategy 可选）。
+- `config.py`：`_DEFAULTS["registration"]` 删 `use_coarse_to_fine`/`coarse_target_um`/`coarse_atlas_res_um` 三个键；`load_config` 里删掉 coarse 相关的三段校验（`raw_tiff_coarse`/`voxel_size_coarse_um` 必填检查、`crop_for_registration` 互斥检查、`mask.guide_regions` 互斥检查）。
+- `configs/config.example.yaml`、`configs/s12t.yaml`：删掉 `use_coarse_to_fine` 行。
+- `README.md`：`register.py` 那行的描述改成「one-shot SyNRA」。
+
+**没动的东西**（同名但无关，别误删）：`io_utils.resample_to_isotropic` 注释里的 "axes coarser than target_um"、`src/eval/registration_eval.py` 里的 "coarse region"（指 M2/M3 的大脑区）、`tests/test_pipeline_smoke.py` 里的 "coarser than target" 注释。
+
+**验证结果**：全仓 grep `coarse_to_fine|raw_tiff_coarse|voxel_size_coarse|coarse_target_um|coarse_atlas_res` 无残留；三个改过的模块 import 正常，`config._DEFAULTS["registration"]` 现在只剩 `{fine_target_um, atlas_res_um, type_of_transform}`。注意 `tests/test_new_features_smoke.py` 目前会挂在 `assign_cell_regions`（假 `reg` dict 缺 `invtransforms` 键），这是**改动之前就存在**的测试自身的问题（已用 `git stash` 对照确认），跟这次删除无关。

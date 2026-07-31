@@ -4,13 +4,14 @@ ANTs-based registration of LSFM brain samples to the Allen CCF atlas, plus tools
 
 ## Core pipeline (`src/registration_ants/`)
 
+- `run_pipeline.sh` — recommended entry point: `./run_pipeline.sh configs/mouse01.yaml`. Wraps `python -m registration_ants.pipeline` and captures both the pipeline's own log lines and ANTs' native stdout output into `<output_dir>/run.log`.
 - `pipeline.py` — runs the full registration pipeline end-to-end from a YAML config.
 - `io_utils.py` — converts raw anisotropic TIFF stacks into isotropic ANTs/NIfTI images.
 - `preprocess.py` — bias correction and intensity normalization before registration.
 - `brain_mask.py` — Otsu-threshold tissue/brain mask generation.
 - `mask_utils.py` — registration masks: atlas-side region exclusion and sparse-mask interpolation.
 - `atlas_utils.py` — fetches/loads the atlas template and annotation (BrainGlobe or custom).
-- `register.py` — runs the ANTs registration itself (one-shot or coarse-to-fine) to the CCF.
+- `register.py` — runs the ANTs registration itself (one-shot SyNRA) to the CCF.
 - `transforms.py` — applies computed transforms to images and cell-coordinate points.
 - `cell_points.py` — reads ClearMap cell-centroid CSVs.
 - `config.py` — loads and validates the pipeline YAML config.

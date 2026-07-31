@@ -1,5 +1,5 @@
 #   conda activate antsreg
-#   python -m registration_ants.pipeline configs/mouse01.yaml
+#   ./run_pipeline.sh configs/mouse01.yaml
 
 sample:
   name: mouse01                     # 样本标识，会用作输出文件名前缀
@@ -29,10 +29,19 @@ atlas_variants:
     output_dir: /path/to/output/mouse01/DevCCF
     fine_target_um: 20
     atlas_res_um: 20
-    orientation: [-1, -3, -2]   # change atlas orientation to match the sample
+
+    # 把图谱的轴转成跟【本样本】一致。取决于样本的成像方位，换方位就要重推 ——
+    # 完整推导步骤见 configs/atlas_presets.example.yaml 顶部的「怎么推 orientation」。
+    # 下面这个值对应"轴0=左→右, 轴1=前→后, 轴2=上→下"的 horizontal plane 样本。
+    orientation: [1, -3, 2]
+
+    # 只有半个脑的样本，图谱也要裁成同一侧（否则 SyN 会去硬拉伸匹配不存在的另一半，
+    # 又慢又配不准）。索引是【转向之后】网格上的（slicing 在 orientation 之后生效）。
+    # DevCCF P04 转向后 X 轴 = 左→右共 640 体素，中线在 320：
+    #   右半球 [[320, 640], null, null] / 左半球 [[0, 320], null, null] / 全脑：整行删掉
+    # slicing: [[320, 640], null, null]
 
 registration:
-  use_coarse_to_fine: false   # 单次配准用 false；只有极少数配准不收敛、想先做一次粗对齐时才设 true（目前不支持跟 custom atlas 一起用）
   type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
 
   crop_for_registration:

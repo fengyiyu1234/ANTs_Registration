@@ -262,17 +262,81 @@ def annotator_reproducibility(pts_a_um: np.ndarray, pts_b_um: np.ndarray) -> flo
 # =====================================================================================
 # M2 / M3 -- Dice and HD95 (overlap of warped-atlas structure vs sample structure)
 # =====================================================================================
-def load_region_mask(labels_path, region_name, structures):
-    """Boolean mask for one coarse region (+ all its ontology descendants)
-    inside a SAMPLE-space label volume (read via SimpleITK, (z,y,x) order),
-    resolved by exact name (atlas_utils.region_mask_by_exact_name) -- used
-    for the WARPED-ATLAS side of a Dice comparison (labels_in_sample, the
-    registration output), which is always one combined multi-label volume.
-    The ground-truth side uses load_binary_mask instead (see
-    scripts/edit_sample_labels.py's per-region "Save This Region" output).
+def load_sample_space_image(path):
+    """Read a SAMPLE-space nii.gz via SimpleITK, keeping the full sitk.Image
+    (size + spacing), not just its array -- needed wherever a mask might come
+    from a DIFFERENT grid than the one it's being compared against (see
+    resample_mask_to_reference): ground truth hand-drawn against one
+    registration's output (one atlas, one fine_target_um) still needs scoring
+    against another registration of the same sample (a different atlas, a
+    different fine_target_um, or an entirely different tool -- ClearMap /
+    VoxelMorph / brainreg / mBrainAligner -- with its own native resolution).
     """
-    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(labels_path)))
-    return atlas_utils.region_mask_by_exact_name(arr, structures, region_name)
+    return sitk.ReadImage(str(path))
+
+
+def resample_mask_to_reference(mask_img: sitk.Image, reference_img: sitk.Image) -> sitk.Image:
+    """Nearest-neighbor-resample a binary/label mask onto another image's
+    exact grid (size + spacing), so ground truth drawn against one
+    registration's output can still be scored against a different
+    registration of the same sample without requiring every method/atlas to
+    share one fixed output resolution -- comparing labels_in_sample volumes
+    across methods is exactly this repo's motivating use case (see
+    PROGRESS_LOG.md). Nearest-neighbor keeps the result binary/integer
+    (unlike linear, which would blur label ids at the boundary).
+
+    A no-op (returns mask_img as-is) when the grids already match (same
+    size+spacing) -- resampling an already-matching grid onto itself would
+    still risk nudging border voxels by floating-point noise, for zero
+    benefit.
+
+    Both images must already follow this codebase's zero-origin/
+    identity-direction convention (see module docstring) for the result to be
+    physically meaningful -- a mask exported by a tool that writes its own
+    arbitrary origin/direction needs converting to that convention first (the
+    same conversion this project already had to do for DevCCF's own nii.gz
+    files).
+    """
+    if (mask_img.GetSize() == reference_img.GetSize()
+            and np.allclose(mask_img.GetSpacing(), reference_img.GetSpacing(), rtol=1e-6)):
+        return mask_img
+    return sitk.Resample(mask_img, reference_img, sitk.Transform(),
+                          sitk.sitkNearestNeighbor, 0, mask_img.GetPixelID())
+
+
+def remap_annotated_slices(slices, mask_img: sitk.Image, reference_img: sitk.Image):
+    """Convert a hand-drawn z-slice index list (recorded against mask_img's
+    own grid by load_region_annotation_hint) into the equivalent indices on
+    reference_img's grid, for when resample_mask_to_reference actually had to
+    resample (different z-spacing) -- otherwise the hint's indices would
+    silently point at the wrong planes once the mask has been moved onto a
+    different grid. SimpleITK's index order (GetSize()/GetSpacing()) has z at
+    position 2, matching this module's SAMPLE-space numpy arrays' axis 0
+    after GetArrayFromImage's index reversal (see module docstring).
+    """
+    if slices is None:
+        return None
+    if (mask_img.GetSize() == reference_img.GetSize()
+            and np.allclose(mask_img.GetSpacing(), reference_img.GetSpacing(), rtol=1e-6)):
+        return slices
+    old_z_sp = mask_img.GetSpacing()[2]
+    new_z_sp = reference_img.GetSpacing()[2]
+    new_z_size = reference_img.GetSize()[2]
+    remapped = sorted({int(round(z * old_z_sp / new_z_sp)) for z in slices})
+    return [z for z in remapped if 0 <= z < new_z_size]
+
+
+def load_region_mask(labels_arr, region_name, structures):
+    """Boolean mask for one coarse region (+ all its ontology descendants)
+    from an already-loaded SAMPLE-space label array ((z,y,x) order -- see
+    load_sample_space_image + sitk.GetArrayFromImage), resolved by exact name
+    (atlas_utils.region_mask_by_exact_name) -- used for the WARPED-ATLAS side
+    of a Dice comparison (labels_in_sample, the registration output), which
+    is always one combined multi-label volume. The ground-truth side uses
+    load_binary_mask instead (see scripts/edit_sample_labels.py's per-region
+    "Save This Region" output).
+    """
+    return atlas_utils.region_mask_by_exact_name(labels_arr, structures, region_name)
 
 
 def load_binary_mask(path):
@@ -447,6 +511,16 @@ def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -
     """
     row: dict = {"sample": sample_id, "group": cfg.groups.get(sample_id, "unknown")}
 
+    # Loaded once and reused as the reference grid for every ground-truth
+    # comparison below. Ground truth may have been hand-drawn against a
+    # DIFFERENT registration of this sample (a different atlas, a different
+    # fine_target_um, or a different tool entirely) -- every ground-truth
+    # mask gets nearest-neighbor-resampled onto THIS grid before comparison
+    # (see resample_mask_to_reference), so one set of hand corrections can
+    # score any number of registration methods/atlases without re-drawing.
+    labels_img = load_sample_space_image(paths["labels_in_sample"])
+    labels_arr = sitk.GetArrayFromImage(labels_img)
+
     # ---- M1 TRE ----
     if paths.get("sample_landmarks_csv") and paths.get("atlas_landmarks_csv"):
         sample_pts_vox = load_points(paths["sample_landmarks_csv"])
@@ -461,8 +535,10 @@ def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -
 
     # ---- M2 / M3 whole-brain outline ----
     if paths.get("sample_brain_mask_corrected"):
-        wa_brain = load_brain_mask_from_labels(paths["labels_in_sample"])
-        sm_brain = load_binary_mask(paths["sample_brain_mask_corrected"])
+        wa_brain = labels_arr > 0
+        sm_brain_img = resample_mask_to_reference(
+            load_sample_space_image(paths["sample_brain_mask_corrected"]), labels_img)
+        sm_brain = sitk.GetArrayFromImage(sm_brain_img) > 0
         wb = evaluate_structure(wa_brain, sm_brain, paths["sample_resolution_um"], cfg.annotated_slices)
         row.update({"brain_dice": wb["dice"], "brain_hd95_um": wb["hd95_um"]})
     else:
@@ -480,20 +556,26 @@ def evaluate_sample(sample_id: str, paths: dict, cfg: Config, atlas_ctx: dict) -
         if not mask_path:
             print(f"[{sample_id}] no dice_region_masks['{region}'] yet -- skipping {key} Dice/HD95.")
             continue
-        wa = load_region_mask(paths["labels_in_sample"], region, atlas_ctx["structures"])
-        sm = load_binary_mask(mask_path)
-        if sm.shape != wa.shape:
-            raise ValueError(f"[{sample_id}] dice_region_masks['{region}'] shape {sm.shape} "
-                              f"!= labels_in_sample shape {wa.shape}")
+        wa = load_region_mask(labels_arr, region, atlas_ctx["structures"])
+        # Ground truth's own grid may differ from this registration's
+        # labels_in_sample (drawn against a different atlas/fine_target_um/
+        # tool) -- resample onto labels_img's grid rather than requiring an
+        # exact shape match, so the same ground truth can score every
+        # registration method/atlas being compared.
+        sm_img_raw = load_sample_space_image(mask_path)
+        sm_img = resample_mask_to_reference(sm_img_raw, labels_img)
+        sm = sitk.GetArrayFromImage(sm_img) > 0
         # Explicit annotated_slices (if set) applies to every region as-is;
         # otherwise fall back to this region's own hand-drawn-slices sidecar
-        # (see load_region_annotation_hint), so sparse per-region ground
-        # truth is scored on just the planes actually drawn without having
-        # to retype z-indices per region -- None (no override, no hint)
-        # means the full volume, same as before.
+        # (see load_region_annotation_hint), remapped onto labels_img's grid
+        # if it needed resampling above -- so sparse per-region ground truth
+        # is scored on just the planes actually drawn without having to
+        # retype z-indices per region -- None (no override, no hint) means
+        # the full volume, same as before.
         slices = cfg.annotated_slices
         if slices is None and cfg.use_annotation_hints:
-            slices = load_region_annotation_hint(mask_path)
+            hint = load_region_annotation_hint(mask_path)
+            slices = remap_annotated_slices(hint, sm_img_raw, labels_img)
         r = evaluate_structure(wa, sm, paths["sample_resolution_um"], slices)
         row.update({f"{key}_dice": r["dice"], f"{key}_hd95_um": r["hd95_um"]})
 

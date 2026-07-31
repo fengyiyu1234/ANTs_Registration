@@ -1,4 +1,4 @@
-"""Registration to the Allen CCF: one-shot SyNRA, or coarse-to-fine two-tier."""
+"""Registration to the Allen CCF: one-shot SyNRA."""
 import ants
 
 from .atlas_utils import get_allen_atlas
@@ -99,43 +99,3 @@ def register_to_allen(sample_img, atlas_res_um=25, type_of_transform="SyNRA", ou
     template, annotation, structures = get_allen_atlas(atlas_res_um)
     return register_to_atlas(sample_img, template, annotation, structures, type_of_transform, outprefix, verbose,
                               mask, moving_mask, guide_regions)
-
-
-def register_to_allen_coarse_to_fine(
-    sample_coarse_img, sample_fine_img, coarse_res_um=50, fine_res_um=25, outprefix="", verbose=True
-):
-    """Two-tier strategy: Rigid+Affine on a small coarse resample (fast, robust
-    global alignment), then SyN refinement on the finer resample initialized
-    from that affine. Optional — use when a direct SyNRA at fine_res_um isn't
-    converging cleanly; otherwise register_to_allen() alone is simpler.
-
-    Both sample_*_img must already be isotropic-resampled and preprocessed at
-    their respective resolutions (see io_utils.convert_to_isotropic_nifti and
-    preprocess.preprocess_for_registration).
-
-    outprefix: applies to the fine-stage (SyN) transform files, the ones
-    actually used downstream; the coarse-stage affine is an intermediate and
-    always goes through a temp prefix.
-    """
-    coarse_template, _, _ = get_allen_atlas(coarse_res_um)
-    reg_coarse = ants.registration(
-        fixed=coarse_template, moving=sample_coarse_img, type_of_transform="Affine", verbose=verbose,
-    )
-
-    fine_template, fine_annotation, structures = get_allen_atlas(fine_res_um)
-    reg_fine = ants.registration(
-        fixed=fine_template,
-        moving=sample_fine_img,
-        type_of_transform="SyNOnly",
-        initial_transform=reg_coarse["fwdtransforms"][0],
-        syn_metric="CC",
-        flow_sigma=3,
-        total_sigma=0,
-        outprefix=outprefix,
-        verbose=verbose,
-    )
-    reg_fine["atlas_template"] = fine_template
-    reg_fine["atlas_annotation"] = fine_annotation
-    reg_fine["atlas_structures"] = structures
-    reg_fine["coarse_transform"] = reg_coarse["fwdtransforms"][0]
-    return reg_fine
