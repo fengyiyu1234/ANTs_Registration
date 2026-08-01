@@ -18,14 +18,15 @@ from PyQt5.QtCore import Qt
 # ================= ⚙️ 用户配置区域 =================
 
 CONFIG = {
-    # 1. 单个样本的工作目录 (即你提到的 cell_registration 文件夹)
-    "sample_dir": "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t", 
-    
-    # 2. 标准 Atlas 文件 (annotation_25.nrrd 或 tif)
-    "std_atlas_path": "/data/hdd12tb-1/fengyi/COMBINe/clearmap/DeMBA_p5/DeMBA_P5_annotation_trimmed_1_3_2__285-510_full_full.tif",
+    # 1. 单个样本的工作目录 (s12t.yaml 里 atlas_variants.devccf_p04.output_dir)
+    "sample_dir": "/data/hdd12tb-1/fengyi/COMBINe/clearmap/TSC_ants/s12t/DevCCF",
+
+    # 2. 标准 Atlas 文件 (DevCCF P04, 已按 s12t.yaml 的 orientation [1,-3,2] +
+    #    slicing [320,640] 转到跟 labels_in_sample.nii.gz 同一空间)
+    "std_atlas_path": "/home/fyu7/My_project/Registration_ants/atlas/DevCCF/P04_DevCCF_Annotations_20um_1_-3_2__320-640_full_full.nii.gz",
 
     # 3. JSON 格式脑区字典 (包含 graph_order 和 id)
-    "ontology_json_path": "/data/hdd12tb-1/fengyi/COMBINe/clearmap/DeMBA_p5/CCF_v3_ontology.json", 
+    "ontology_json_path": "/home/fyu7/My_project/Registration_ants/atlas/DevCCF/DevCCFv1_ontology.json",
 
     # 4. 视图旋转 (0=不旋转, 1=逆时针90°, 2=180°, 3=顺时针90°)
     "view_rotate_k": 0,
