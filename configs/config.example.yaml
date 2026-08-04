@@ -44,6 +44,10 @@ atlas_variants:
 registration:
   type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
 
+  # 配准前把样本图像四周多余的空白 buffer 裁掉——数值是【原始 TIFF 自己的】
+  # 体素序号（x=列, y=行, z=第几张切片，顺序跟 sample.voxel_size_um 一致），
+  # 直接在 ImageJ/Fiji 等工具里打开原始 raw_tiff 读出组织实际范围就行，不用
+  # 先跑流水线、不用换算到 fine_target_um 网格。裁剪发生在重采样【之前】。
   crop_for_registration:
     x: [50, 400]
     y: null

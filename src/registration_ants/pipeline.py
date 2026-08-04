@@ -88,28 +88,42 @@ def run_pipeline(config_path):
     step_marks = [("[1/6] resample", time.perf_counter())]
     logger.info("[1/6] Resampling fine level to %sum isotropic...", reg_cfg["fine_target_um"])
     fine_iso_path = output_dir / f"{sample['name']}_fine_{reg_cfg['fine_target_um']}um.nii.gz"
+    # Load the raw stack once, at its own native (anisotropic) resolution --
+    # reused below both for the full resample and, if crop_for_registration
+    # is set, for the cropped one, instead of decoding the TIFF twice.
+    raw_img = io_utils.load_tiff_stack_as_ants(sample["raw_tiff"], tuple(sample["voxel_size_um"]))
+
     # sample_fine is the UNCROPPED fine/isotropic image, always written to
     # this exact path -- napari viewers in ../ClearMap/stats_vis/ glob for
     # *_fine_*um.nii.gz as the "resample space" grid cell_registration.csv
     # coordinates are indexed into (see cell_points.py), so this must stay
     # the full grid even when crop_for_registration below only registers a
     # sub-region of it.
-    sample_fine = io_utils.convert_to_isotropic_nifti(
-        sample["raw_tiff"], tuple(sample["voxel_size_um"]), reg_cfg["fine_target_um"], fine_iso_path,
-    )
+    sample_fine = io_utils.resample_to_isotropic(raw_img, reg_cfg["fine_target_um"])
+    ants.image_write(sample_fine, str(fine_iso_path))
     logger.info("Resampled sample_fine: shape=%s spacing=%s, wrote %s",
                 sample_fine.shape, sample_fine.spacing, fine_iso_path)
 
     sample_fine_for_reg = sample_fine
     crop_cfg = reg_cfg.get("crop_for_registration")
     if crop_cfg:
-        logger.info("Cropping fine image for registration: %s", crop_cfg)
-        sample_fine_for_reg = io_utils.crop_to_bounds(
-            sample_fine, x=crop_cfg.get("x"), y=crop_cfg.get("y"), z=crop_cfg.get("z"),
+        # crop_cfg bounds are RAW TIFF voxel indices (x=column, y=row,
+        # z=slice number -- same [x,y,z] convention as sample.voxel_size_um),
+        # exactly what you'd read off the raw stack directly in an image
+        # viewer, with no fine-grid resampling needed first to figure out
+        # what to write in config. Cropped on raw_img BEFORE resampling
+        # (not on sample_fine afterward), so there's no separate raw<->fine
+        # index conversion to get wrong -- the numbers you read off the raw
+        # stack are exactly the numbers that go in config.
+        logger.info("Cropping raw stack for registration (raw-tiff voxel-index space): %s", crop_cfg)
+        raw_img_cropped = io_utils.crop_to_bounds(
+            raw_img, x=crop_cfg.get("x"), y=crop_cfg.get("y"), z=crop_cfg.get("z"),
         )
+        sample_fine_for_reg = io_utils.resample_to_isotropic(raw_img_cropped, reg_cfg["fine_target_um"])
         cropped_path = output_dir / f"{sample['name']}_fine_{reg_cfg['fine_target_um']}um_cropped.nii.gz"
         ants.image_write(sample_fine_for_reg, str(cropped_path))
-        logger.info("Cropped: %s -> %s, wrote %s", sample_fine.shape, sample_fine_for_reg.shape, cropped_path)
+        logger.info("Cropped: raw shape=%s -> fine shape=%s, wrote %s",
+                    raw_img_cropped.shape, sample_fine_for_reg.shape, cropped_path)
 
     step_marks.append(("[2/6] preprocess", time.perf_counter()))
     logger.info("[2/6] Preprocessing...")
@@ -164,8 +178,22 @@ def run_pipeline(config_path):
 
         suggestion = brain_mask.suggest_crop(bbox, mask_arr.shape)
         logger.info("Auto brain mask: coverage=%.1f%%, bbox=%s, wrote %s", 100 * mask_arr.mean(), bbox, mask_out_path)
-        logger.info("Suggested registration.crop_for_registration (padded, on this fine_target_um grid): "
-                    "x=%s y=%s z=%s", suggestion[0], suggestion[1], suggestion[2])
+        # suggestion is in sample_fine_prep's own voxel-index space (fine_target_um
+        # grid, and already offset if crop_for_registration was set) -- convert
+        # through physical space (sample_fine_prep.origin/spacing -> raw_img's,
+        # which is always origin 0 at sample.voxel_size_um spacing) to get
+        # raw-tiff voxel indices, since that's what crop_for_registration now
+        # expects in config.
+        raw_um = sample["voxel_size_um"]
+        fine_origin, fine_spacing = sample_fine_prep.origin, sample_fine_prep.spacing
+        raw_suggestion = [
+            [round((fine_origin[axis] + lo * fine_spacing[axis]) / raw_um[axis]),
+             round((fine_origin[axis] + hi * fine_spacing[axis]) / raw_um[axis])]
+            for axis, (lo, hi) in enumerate(suggestion)
+        ]
+        logger.info("Suggested registration.crop_for_registration (raw-tiff voxel-index space, "
+                    "paste directly into config): x=%s y=%s z=%s",
+                    raw_suggestion[0], raw_suggestion[1], raw_suggestion[2])
 
         if sample_mask is None:
             sample_mask = auto_mask_img

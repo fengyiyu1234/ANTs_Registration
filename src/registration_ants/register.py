@@ -37,6 +37,13 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     through config.yaml's mask.auto_brain_mask).
     Files produced by those two helpers are already in this "nonzero=use"
     convention, no inversion needed here.
+    Whenever either mask is given (outside the guide_regions branch), a
+    coarse mask-constrained Translation pass runs first and its result is
+    fed in as initial_transform for the main type_of_transform call below --
+    see the inline comment where it's built for why (ANTs' own default
+    initializer ignores these masks, which can land the optimizer nowhere
+    near the true alignment for oddly-shaped mask pairs, e.g. a
+    zero-padded hemisphere atlas against a symmetrically-buffered sample).
 
     guide_regions: optional list of (atlas_outline_img, sample_outline_img,
     weight) tuples -- for tissue that's genuinely present but too locally
@@ -73,10 +80,31 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             multivariate_extras=extras,
         )
     else:
+        initial_transform = None
+        if mask is not None or moving_mask is not None:
+            # ANTs' own default initializer (used whenever initial_transform
+            # is left unset) aligns whole-image intensity centroids WITHOUT
+            # respecting mask/moving_mask -- fine when sample and atlas have
+            # similar background extent, but a hemisphere atlas with zero
+            # padding on its cut face vs. a sample with buffer on all sides
+            # pulls that centroid guess far enough off-target that the
+            # mask-constrained Affine/SyN metric below barely overlaps
+            # afterward, leaving the optimizer stuck near that bad initial
+            # pose. A coarse, mask-constrained translation pass first fixes
+            # that -- few enough DOF to have a large capture range, and
+            # orientation is already handled separately via atlas.orientation
+            # in config, so translation alone is what's left to correct.
+            reg_translation = ants.registration(
+                fixed=atlas_template, moving=sample_img, type_of_transform="Translation",
+                aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=moving_mask,
+            )
+            initial_transform = reg_translation["fwdtransforms"][0]
+
         reg = ants.registration(
             fixed=atlas_template,
             moving=sample_img,
             type_of_transform=type_of_transform,
+            initial_transform=initial_transform,
             aff_metric="mattes",
             syn_metric="CC",
             outprefix=outprefix,

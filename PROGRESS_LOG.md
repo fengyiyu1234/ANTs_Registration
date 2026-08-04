@@ -474,3 +474,29 @@
 **没动的东西**（同名但无关，别误删）：`io_utils.resample_to_isotropic` 注释里的 "axes coarser than target_um"、`src/eval/registration_eval.py` 里的 "coarse region"（指 M2/M3 的大脑区）、`tests/test_pipeline_smoke.py` 里的 "coarser than target" 注释。
 
 **验证结果**：全仓 grep `coarse_to_fine|raw_tiff_coarse|voxel_size_coarse|coarse_target_um|coarse_atlas_res` 无残留；三个改过的模块 import 正常，`config._DEFAULTS["registration"]` 现在只剩 `{fine_target_um, atlas_res_um, type_of_transform}`。注意 `tests/test_new_features_smoke.py` 目前会挂在 `assign_cell_regions`（假 `reg` dict 缺 `invtransforms` 键），这是**改动之前就存在**的测试自身的问题（已用 `git stash` 对照确认），跟这次删除无关。
+
+---
+
+## 2026-08-04：半球 atlas 配准几乎不变形的排查 + 两处修复
+
+**用户反馈**：7-31 那次 `tsc12t`/DevCCF 真实配准跑完后（用 `scripts/single_sample.py` 新写的 napari 工具目视核对），atlas 看起来完全没有跟样本做实质性配准——像是直接把原图跟 atlas 硬叠在一起，atlas 大部分落在样本图像四周的空白 buffer 区域里，形状也没有明显形变。
+
+**根因排查**（读实际代码路径 + 上次真实跑的 `run.log`，没有靠猜）：
+- 样本图像本身没裁：`registration.crop_for_registration` 在 `configs/s12t.yaml` 里一直是注释掉的，所以整张带前后上下 buffer 的原图直接送去配准。事后用 `brain_mask.generate_brain_mask` 在缓存的 `tsc12t_fine_20um.nii.gz` 上实测：脑组织只占整张图的 **21.6%**，其余接近八成是空白，且 buffer 集中在 x 轴（左右方向）。
+- 半球 atlas（`slicing: [[320,640], null, null]`）在正中线硬裁，裁切侧（medial）完全没有留白——正好是样本 buffer 集中的那个轴，两边形状/包围盒差异很大。
+- `register.py` 的 `register_to_atlas()` 没传 `initial_transform`，`ants.registration` 因此用它自己的默认初始化："Center of mass alignment"（`run.log` 里能直接看到这行）——这个质心是对**整张图原始强度**算的，不受 `mask`/`moving_mask` 限制。样本 buffer 大、atlas 裁切侧又没留白，两边质心对不上，一旦这步初始对齐偏差够大，后面 Affine/SyN 阶段用来算相似度的 mask 区域重叠就很少，优化器基本就卡在这个错误初始位置附近动不了——正好对应用户看到的"atlas 几乎没变形、大部分落在空白区"。
+
+**改动一：`register.py` 里加 mask-aware 的初始平移预对齐**（`register_to_atlas()` 非 `guide_regions` 分支）：只要传了 `mask`/`moving_mask`（`tsc12t` 已经在用），先跑一次受 mask 约束的 `type_of_transform="Translation"` 粗对齐，把结果当 `initial_transform` 喂给主配准，取代 ANTs 自己那个不受 mask 限制的质心初始化。沿用的是这个文件里 `guide_regions` 分支早就在用的"先跑一次粗配准→拿 `fwdtransforms[0]` 当 `initial_transform`"套路，没有新写一套逻辑。用合成数据验证过：模拟一个"图谱贴边无留白、样本四周大 buffer"的极端案例，单靠这一步 Translation 预对齐就能把 30 体素级的错位找回来，配准后 Dice 0.96。
+
+**改动二：`crop_for_registration` 语义重做**——期间用户指出旧设计有个实际问题：裁剪原来是在重采样成 `fine_target_um` 各向同性网格**之后**做的（`crop_to_bounds(sample_fine, ...)`），所以配置里的坐标是 fine 网格的体素号，用户想自己定这个参数就必须先把流水线跑到出 `sample_fine` 为止才知道该填什么数字，没法在跑之前就定好。改成：
+- `pipeline.py` 步骤 `[1/6]` 里把 `raw_tiff` 只读一次（`raw_img`，原始各向异性网格），一份直接重采样出完整的 `sample_fine`（下游 cell 坐标/`labels_in_sample` 用的全图网格，不受影响）；如果设了 `crop_for_registration`，另一份是先在 `raw_img` 上按**原始 TIFF 自己的体素序号**（x=列、y=行、z=第几张切片，跟 `sample.voxel_size_um` 顺序一致）裁剪，再重采样成 `sample_fine_for_reg` 送去配准。旧的"裁 fine 网格"路径整个删掉，不是加一层换算并存两套。
+- 好处：现在 `crop_for_registration` 的数值就是直接在 ImageJ/Fiji 打开 `raw_tiff` 读到的体素号，配准前就能自己核对好，不用先跑流水线也不用手动换算到 fine 网格。
+- `auto_brain_mask` 那行自动建议（`suggest_crop`）算出来还是 fine 网格坐标，同步加了一段通过物理坐标（`sample_fine_prep.origin/spacing` → 原始体素尺寸）换算回原始 TIFF 坐标系的逻辑，日志里打印的建议值现在直接是原始坐标，可以照抄进 config，不用手动换算。
+- `configs/s12t.yaml`/`configs/config.example.yaml` 的注释同步改成新语义；`s12t.yaml` 里原先我（Claude）填的一组 fine-网格坐标数值（因为语义变了会被错误当成原始坐标用，裁剪范围会完全错）已经删掉，整块注释掉，具体数值留给用户自己核对原始 TIFF 后再填——这次没有代填猜测值。
+
+**验证结果**：
+- `register.py` 改动：合成小体积数据跑通了"有 mask"（触发新的 Translation 预对齐）和"无 mask"（走原来的默认路径，行为不变）两条分支，无报错；上面提到的 30 体素错位恢复实验，Dice 0.96。
+- `crop_for_registration` 改动：合成了一个跟真实样本各向异性比例相近的 TIFF（xy 细、z 粗），验证裁剪现在确实发生在重采样之前、裁剪后物理范围跟预期一致（几体素级的离散化误差，可忽略）；又验证了"fine 坐标→原始坐标"这段换算能把已知的原始范围基本准确地换算回来（跟真值差 0-5 个体素，同样是离散化误差）。
+- 两处改动都只跑了合成数据，**没有跑真实 `tsc12t` 数据**——`sample.raw_tiff` 之前指向的路径已经不存在（用户已自行把 `s12t.yaml` 里改成 `raw_data/s12t/registration.tif`），且一次完整 SyN 配准要 4+ 小时，等用户自己核对完 `crop_for_registration` 的原始坐标数值、确认路径没问题后再跑。
+
+**下一步**：用户自己拿 `raw_tiff` 在图像查看器里核对组织实际边界，把原始体素坐标填进 `configs/s12t.yaml` 的 `registration.crop_for_registration`（当前是注释掉的，格式说明已经写在旁边），然后重跑 `./run_pipeline.sh configs/s12t.yaml`。跑完要做的 QC：`run.log` 里确认初始对齐不再是纯 "Center of mass alignment" 直接进 Affine/SyN（应该能看到新加的 Translation 预对齐这一步）、Rigid/Affine/SyN 的 metric 有实际收敛趋势；napari 里把 `tsc12t_in_atlas.nii.gz` 叠到裁剪后的 atlas 模板上、`tsc12t_labels_in_sample.nii.gz` 叠到原始样本上，确认这次 atlas 组织落在样本组织上而不是空白区，且形变不再是"贴图"式的刚性搬运。
