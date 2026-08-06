@@ -1,5 +1,5 @@
 """Smoke test for the post-registration correction workflow:
-mask_utils.interpolate_sparse_label_correction (scripts/edit_sample_labels.py's
+mask_utils.interpolate_sparse_label_correction (../GT_tool_for_registration/edit_sample_labels.py's
 export logic) and relabel_cell_csv (scripts/relabel_cells.py).
 
 Synthetic data only, same manual assert-based style as test_pipeline_smoke.py

@@ -16,18 +16,22 @@ ANTs-based registration of LSFM brain samples to the Allen CCF atlas, plus tools
 - `cell_points.py` — reads ClearMap cell-centroid CSVs.
 - `config.py` — loads and validates the pipeline YAML config.
 
-## Evaluation
+## Annotation, visualization and evaluation → `../GT_tool_for_registration`
 
-- `registration_eval.py` — computes registration quality metrics (Dice/HD95, landmark TRE, Jacobian) for a batch of samples.
-- `reg_metrics.csv` — example metrics output from `registration_eval.py`.
+Everything that opens a napari window (painting masks, placing landmarks,
+hand-correcting region labels, QC-viewing a registered sample) plus
+`registration_eval.py` now lives in a separate repo,
+[`../GT_tool_for_registration`](../GT_tool_for_registration). Those tools still
+run in this same `antsreg` env — they import `registration_ants` through its
+editable install — so nothing here needs to change to use them.
 
-## Manual correction tools (`mask_tools/`, `scripts/`)
+This repo keeps the non-interactive post-processing that is part of the
+pipeline itself:
 
-- `mask_tools/paint_mask.py` — interactive napari tool to paint an inclusion/exclusion mask or a guide-outline structure; paths are configured in the gitignored `paint_mask_local.yaml` (see `paint_mask_local.example.yaml`).
 - `scripts/project_outline.py` — warps a hand-painted sample-space guide outline into atlas space.
-- `scripts/edit_sample_labels.py` — interactive tool to hand-correct Allen/CCF region boundaries directly on a registered sample.
 - `scripts/relabel_cells.py` — rewrites per-cell region assignments using corrected labels.
-- `scripts/place_landmarks.py` — interactive tool to hand-place matching anatomical landmarks on a sample/atlas image.
+- `scripts/convert_devccf_ontology.py` — converts the DevCCF ontology spreadsheet into the nested JSON the atlas loader expects.
+- `scripts/relabel_labels_to_devccf.py` — translates CCFv3 label ids into DevCCF ids via the published voxel-overlap crosswalk.
 
 ## Config / project files
 
@@ -40,7 +44,6 @@ ANTs-based registration of LSFM brain samples to the Allen CCF atlas, plus tools
 - `test_pipeline_smoke.py` — end-to-end smoke test of the registration pipeline on synthetic data.
 - `test_brain_mask_smoke.py` — smoke test for brain mask generation.
 - `test_label_correction_smoke.py` — smoke test for the post-registration label-correction workflow.
-- `test_registration_eval_smoke.py` — smoke test for `registration_eval.py`'s metrics.
 - `test_new_features_smoke.py` — smoke tests for miscellaneous newer pipeline features.
 
 Full details for any script/module are in its own docstring.

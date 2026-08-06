@@ -1,6 +1,6 @@
 """Non-interactive helper: warp a hand-painted sample-space outline into
 atlas space using an existing registration's forward transforms, giving a
-starting "best guess" for mask_tools/paint_mask.py's `guide` kind (ROLE="atlas") --
+starting "best guess" for ../GT_tool_for_registration/paint_mask.py's `guide` kind (ROLE="atlas") --
 rather than asking a human to locate the corresponding un-deformed region
 in the atlas purely from anatomical memory. The guess only needs to be
 "roughly right" -- the human refines it afterward.

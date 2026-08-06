@@ -1,7 +1,7 @@
 # 图谱预设：把每个图谱的 template/annotation/resolution/ontology/orientation 集中定义一次，
 # 样本配置里 atlas.source 直接写预设名字就行（比如 devccf_p04），不用每个样本重复抄一遍
 # 完整路径。复制这份改成 configs/atlas_presets_local.yaml（gitignored，放真实机器路径），
-# 跟 mask_tools/paint_mask_local.yaml 是同一个约定。
+# 跟 ../GT_tool_for_registration/paint_mask_local.yaml 是同一个约定。
 #
 # 用法（样本配置里）：
 #   atlas:

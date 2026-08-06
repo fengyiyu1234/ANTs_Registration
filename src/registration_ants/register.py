@@ -32,7 +32,7 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     metric, 0 = excluded. Use for real structural mismatches the intensity
     metric shouldn't be forced to explain away (missing structures on the
     atlas side via atlas_utils.build_region_exclusion_mask, tears/damage on
-    the sample side via a hand-painted mask -- see mask_tools/paint_mask.py's `mask` kind --
+    the sample side via a hand-painted mask -- see ../GT_tool_for_registration/paint_mask.py's `mask` kind --
     or generated automatically via brain_mask.generate_brain_mask, wired in
     through config.yaml's mask.auto_brain_mask).
     Files produced by those two helpers are already in this "nonzero=use"
@@ -52,7 +52,7 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     opposite of mask/moving_mask: instead of excluding a region, it adds an
     extra term that actively pulls the deformation to make the two outlines
     overlap, on top of the normal intensity metric -- see
-    mask_tools/paint_mask.py's `guide` kind and scripts/project_outline.py
+    ../GT_tool_for_registration/paint_mask.py's `guide` kind and scripts/project_outline.py
     for how to produce the outline pair. When given, this forces a two-stage
     registration (plain Rigid+Affine, then SyNOnly + multivariate_extras)
     regardless of type_of_transform, because ANTs' multivariate_extras is

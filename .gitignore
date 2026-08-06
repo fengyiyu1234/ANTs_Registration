@@ -8,13 +8,9 @@ venv/
 .DS_Store
 configs/*.yaml
 !configs/config.example.yaml
-!configs/eval_config.example.yaml
 !configs/atlas_presets.example.yaml
 data/
 atlas/
-# per-script local path configs (see mask_tools/paint_mask_local.example.yaml) --
-# real paths live in *_local.yaml, gitignored so editing them isn't a git diff.
+# per-script local path configs -- real paths live in *_local.yaml, gitignored
+# so editing them isn't a git diff.
 *_local.yaml
-
-# scripts/_form_dialog.py's remembered last-used form values, per script
-scripts/.dialog_state/

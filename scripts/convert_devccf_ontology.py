@@ -1,8 +1,8 @@
 """Convert DevCCF's flat ontology table (DevCCFv1_OntologyStructure.xlsx) into the
 Allen-API-style nested {"msg": [...]} JSON tree that atlas_utils.load_ccf_ontology_json
 already parses, so every existing ontology consumer in this repo
-(mask.atlas_exclude_regions, scripts/edit_sample_labels.py, scripts/relabel_cells.py,
-src/eval/registration_eval.py) works against DevCCF completely unmodified.
+(mask.atlas_exclude_regions, ../GT_tool_for_registration/edit_sample_labels.py, scripts/relabel_cells.py,
+../GT_tool_for_registration/registration_eval.py) works against DevCCF completely unmodified.
 
 Keyed by ID16, not the plain ID/ADMBA ID column -- confirmed empirically that every
 DevCCF annotation volume's actual voxel values are ID16, not ID: some structures only

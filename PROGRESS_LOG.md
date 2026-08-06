@@ -500,3 +500,70 @@
 - 两处改动都只跑了合成数据，**没有跑真实 `tsc12t` 数据**——`sample.raw_tiff` 之前指向的路径已经不存在（用户已自行把 `s12t.yaml` 里改成 `raw_data/s12t/registration.tif`），且一次完整 SyN 配准要 4+ 小时，等用户自己核对完 `crop_for_registration` 的原始坐标数值、确认路径没问题后再跑。
 
 **下一步**：用户自己拿 `raw_tiff` 在图像查看器里核对组织实际边界，把原始体素坐标填进 `configs/s12t.yaml` 的 `registration.crop_for_registration`（当前是注释掉的，格式说明已经写在旁边），然后重跑 `./run_pipeline.sh configs/s12t.yaml`。跑完要做的 QC：`run.log` 里确认初始对齐不再是纯 "Center of mass alignment" 直接进 Affine/SyN（应该能看到新加的 Translation 预对齐这一步）、Rigid/Affine/SyN 的 metric 有实际收敛趋势；napari 里把 `tsc12t_in_atlas.nii.gz` 叠到裁剪后的 atlas 模板上、`tsc12t_labels_in_sample.nii.gz` 叠到原始样本上，确认这次 atlas 组织落在样本组织上而不是空白区，且形变不再是"贴图"式的刚性搬运。
+
+---
+
+## 2026-08-05：交互工具 + 评估整体搬到 `../GT_tool_for_registration`，新增两个脚本
+
+**动机**：这个仓库同时装着"跑配准的流水线"和"一堆 napari 交互工具"，后者已经长到 5 个脚本、跟配准本身没有代码耦合。用户要求把画 mask / 标 landmark / 改脑区标签 / 看结果这些**可视化脚本**全部挪出去，ants 项目只留配准。
+
+**搬走的东西**（新仓库 `/home/fyu7/My_project/GT_tool_for_registration`，已 `git init`，扁平结构）：
+
+| 原位置 | 新位置 |
+|---|---|
+| `mask_tools/paint_mask.py` + 两个 `paint_mask_local*.yaml` | `paint_mask.py` + 同名 yaml（仍与脚本同级，`Path(__file__).parent` 逻辑零改动） |
+| `scripts/edit_sample_labels.py` | `edit_sample_labels.py` |
+| `scripts/place_landmarks.py` | `place_landmarks.py` |
+| `scripts/single_sample.py` | `single_sample.py` |
+| `scripts/_form_dialog.py` | `_form_dialog.py` |
+| `src/eval/registration_eval.py` + `reg_metrics.csv` | `registration_eval.py` + `reg_metrics.csv` |
+| `configs/eval_config.example.yaml` | `configs/eval_config.example.yaml` |
+| `tests/test_registration_eval_smoke.py` | `tests/test_registration_eval_smoke.py` |
+
+`mask_tools/` 目录整个删掉；`scripts/` 只剩 4 个非交互脚本（`project_outline.py`/`relabel_cells.py`/`convert_devccf_ontology.py`/`relabel_labels_to_devccf.py`）。这些文件在上一个 commit（`8e28a32 edit`）里用户已经自己从 git 里删掉了，所以这次 `mv` 之后 `git status` 里不会出现 deletion。
+
+**依赖处理**（用户选的方案）：搬走的脚本继续 `from registration_ants import ...`，靠 `antsreg` 里已有的 `pip install -e`（`__editable__.registration_ants-0.1.0.pth`）解析——`paint_mask.py`/`edit_sample_labels.py` 顶部那两行 `sys.path.insert(..., "src")` 直接删掉。用到的 `mask_utils`（纯 numpy/scipy）和 `atlas_utils`（纯 json/numpy，`import ants` 是函数内延迟导入）都不需要 antspyx。**依赖只指向一个方向**：GT_tool 用 registration_ants，反过来没有。
+
+**顺手修好的旧 bug**：`tests/test_registration_eval_smoke.py` 里那行 `import registration_eval as ev` 早就失效了——`registration_eval.py` 之前从仓库根挪到 `src/eval/` 时这行没跟着改（实测 `ModuleNotFoundError`，只有 `from eval import registration_eval` 能成功）。新仓库把 `registration_eval.py` 放在根目录，这行重新成立，测试恢复可跑。
+
+**新增脚本 1：`annotate_gt_sam.py`**（napari + micro_sam 稀疏切片脑区 GT 标注）
+- 每个脑区只在配置里**预先锁定**的几层 z 上标（层位置逐脑区不同），其余层保持空；每个脑区单独一个 `{brain_id}_{region}.nii.gz`，值只有 0/1。
+- **清单写两份**：合并清单 `annotated_slices_manifest.json`（`{"brain01": {"ventricle": [...]}}`，权威来源）+ 每个 mask 旁边的 `{brain_id}_{region}.annotated_slices.json`。后者是 `edit_sample_labels.py` 早就在用、`registration_eval.py:350 load_region_annotation_hint()` 早就会自动读的 sidecar 格式——**这样新画的 GT 一行评估代码都不用改就能进 `eval_config.yaml` 的 `dice_region_masks`**。sidecar 每次从合并清单重新派生，两边不会跑偏。
+- **严禁 z 轴传播是结构性保证，不是"记得别点"**：只用 `micro_sam.sam_annotator.annotator_2d`（它的 `Annotator2d._get_widgets()` 只有 segment/autosegment/commit/clear；传播功能只存在于 `annotator_3d` 的 `segment_nd`/`segment_all_slices` 和 `multi_dimensional_segmentation`，本文件一次都没 import）；喂给 micro_sam 的永远是 `volume[z]` 一张 2D 数组，它根本看不到体数据；embedding 按 `(brain, z)` 分文件缓存，从不跨 z 复用。测试里有一条 grep 断言直接检查这些名字不出现在可执行代码里。
+- **多切片怎么复用同一个窗口**（这是最容易写错的地方）：第二张之后**不能**再调 `annotator_2d`——那会往同一个窗口再加一个 `image` 图层和第二个 widget dock。正确做法是走 `AnnotatorState`：`state.image_shape = plane.shape` → `state.initialize_predictor(plane, ..., predictor=state.predictor, decoder=state.decoder)`（传入已加载的 predictor，跳过重新加载 checkpoint，只重算这一层的 embedding）→ 换 `viewer.layers["image"].data` → `state.annotator._update_image(segmentation_result=...)`。另外 `_update_image` 在 `state.skip_recomputing_embeddings` 为 True 时会**提前 return**（该标志由 micro_sam 自己的 embedding widget 设置），所以调用前显式置 False，否则上一层的 `committed_objects` 会留在屏幕上。
+- 续标：已完成的层标 `[done]`、被 "Next unfinished" 跳过，不覆盖；要重画就选中该行点 "Redo slice"，已有 mask 通过 `segmentation_result=` 预填回 `committed_objects` 编辑，保存时覆盖并更新清单。
+- 导出用 `CopyInformation(reference)` 后**读回来再校验**（调 `align_masks.check_geometry`），不通过就报错而不是默默写出去。
+- 一个要提前说明的现实：SAM 点提示对**闭合、强度均匀**的物体最好用（脑室=暗 CSF 很合适）；`cortex_surface`/`cortex_wm` 本质是**界面**不是物体，实际会更依赖在 `committed_objects` 上手改。这是 SAM 的性质，不是脚本坏了。
+
+**新增脚本 2：`align_masks.py`**（mask 头信息校验/强制对齐 + 自检）
+- 功能一 `unify_headers()`：把源图像的 spacing/origin/direction 覆盖到一批 mask 上、**另存不原地改**；shape 不一致直接**报错停止**（说明是重采样/拿错文件这类更严重的问题，改头文件只会掩盖），且**先校验完所有 shape 再写第一个文件**，不会留下半成品输出目录；也拒绝会覆盖输入的 `--out-dir`。
+- 功能二 `check_geometry()`：size/spacing/origin/direction **逐项**报 pass/fail + 实际差值，不是一个笼统的布尔。
+- **表面距离必须以物理单位算**——坑在轴序：`np.argwhere` 出来的索引是 numpy 的 `(z,y,x)`，而 `GetSpacing()` 是 SimpleITK 的 `(x,y,z)`，**正好相反**。所以必须 `spacing_zyx = np.asarray(img.GetSpacing())[::-1]` 再相乘；进 KD-tree 的坐标已经是微米，下游再也不会出现"体素数"。
+- **自检设计**（`python align_masks.py --selftest`，全合成，两个 env 都能跑）：
+  1. identity：dice=1、距离=0。
+  2. known translation：用**单体素厚的平面**沿法线平移——这种形状下对称平均表面距离**精确**等于 `k × spacing[该轴]`（平面上每点的最近点就是正对面那个点），比立方体干净（平移后的立方体尾面会落进对方内部，没有解析解，只能做模糊断言）。**各向异性 spacing `(10,25,40)` + 非立方 shape + 三个轴各测一遍**——只测一个轴的话 spacing 转置了照样能蒙对。x 方向平移 10 体素必须报 100µm，轴序写反会报 400µm。每个各向异性 case 再拿 SimpleITK 自己的 `TransformIndexToPhysicalPoint` 当**独立预言机**交叉核对（它还顺带覆盖了非零 origin）。
+  3. shape 不一致：断言抛异常且**一个文件都没写**。
+  4. `unify_headers` 改完头信息后体素值逐位不变、原文件没被动过。
+  5. 跟 `registration_eval.dice`/`_surface_distances` 数值交叉核对（antspyx 不在时优雅跳过）。
+- **`dice`/表面距离是有意的独立最小实现**，不是直接 import `registration_eval`：后者 `from registration_ants import transforms` 会拉进 antspyx，而 `align_masks` 必须能在没有 antspyx 的 `gt_sam` env 里被 `annotate_gt_sam.py` import。第 5 条自检保证两份实现不会跑偏。
+
+**环境**：新建 `gt_sam`（`conda create -y -n gt_sam -c conda-forge -c pytorch python=3.11 micro_sam napari pyqt simpleitk pyyaml`），实测 micro_sam 1.8.8 / napari 0.8.0 / torch 2.10.0 / SimpleITK 2.5.6 / python 3.11。**没有装进 `antsreg`**——micro_sam 会拉 torch 和它自己钉的 napari/numpy，很可能把跑通配准的 numpy 2.3.5 / napari 0.8.0 / antspyx 降级。其余所有工具（含 `registration_eval.py`，它要 antspyx）仍在 `antsreg` 里跑。`nvidia-smi` 目前报 driver/library version mismatch，CPU 路线可用（配置里可以显式写 `device: cpu`）。
+
+**验证结果**：
+1. `align_masks.py --selftest`：`antsreg` 和 `gt_sam` **两个 env 都全过**（gt_sam 里第 5 条按预期跳过）。
+2. `tests/test_annotate_gt_sam_smoke.py`（新增，两个 env 都过）：配置校验、清单+sidecar 一致、导出几何、续标不丢工作、以及 `--verify` 的**四种失败**都能抓到（清单说标了某层但那层是空的 / mask 有清单没记的层 / 值不在 {0,1} / 标了锁定列表外的层）、禁止传播的 grep 断言。
+3. `tests/test_annotate_gt_sam_microsam_e2e.py`（新增）：**真的把 micro_sam 跑起来了**（xvfb + 软件 GL，`QT_QPA_PLATFORM=offscreen` 单独不够，napari 的 vispy canvas 要真 GL）——第一张切片建出全部 6 个图层和 1 个 dock，第二张走 state 复用路径后**没有多出重复的 image 图层和第二个 dock**、`committed_objects` 被正确清空、图像确实换成了另一层；已完成的层被跳过、redo 能把存下的 mask 读回来；`--verify` 通过；embedding 缓存正好一层一个文件。命令见该文件 docstring。
+4. `tests/test_registration_eval_smoke.py` 在新仓库跑通（同时验证了上面那个旧 import bug 修好了）。
+5. `Registration_ants/tests/` 剩下的 `test_pipeline_smoke.py`/`test_brain_mask_smoke.py`/`test_label_correction_smoke.py` 全过（`test_new_features_smoke.py` 有 7-31 就存在的失败，跟这次无关，没纳入判据）。
+6. GT_tool 下 11 个 .py 全部 `ast.parse` + **真实 import** 通过（含 napari/PyQt5/registration_ants 一起 import）。
+7. 全仓 grep：`Registration_ants` 里除 `PROGRESS_LOG.md`（历史条目按既有约定保留原文，不回填）外，已无指向搬走文件的路径。
+8. **真实数据实测 `align_masks.py`**（见下面"发现"）。
+
+**顺带发现的一件真实数据的事**（不是 bug，但会影响 GT 怎么做）：`DevCCF_ver2_0804/tsc12t_brain_mask.nii.gz` 的网格是 `(176,510,219)` origin `(1144,130,640)`，跟同目录的 `tsc12t_fine_20um.nii.gz`（`(295,517,251)`，origin 0）**对不上**，但跟 `tsc12t_fine_20um_cropped.nii.gz` **完全一致**。这是 8-04 那次改动的正常结果——`auto_brain_mask` 是在裁剪后的 `sample_fine_prep` 上算的。含义：以后要拿 brain mask 跟别的东西比 Dice，得先确认两边在同一个网格上。另一方面 `DevCCF_ver1_0801/tsc12t_labels_in_sample.nii.gz` 跟未裁剪的 `tsc12t_fine_20um.nii.gz` **完全同网格（PASS）**——所以 `annotate_gt_sam.py` 的 `volume:` 应该指向**未裁剪**的 `tsc12t_fine_20um.nii.gz`，这样画出来的 GT 跟 `labels_in_sample.nii.gz` 天然同网格，不用重采样。配置模板里已经按这个填了。
+
+**改动范围（本仓库侧，只改注释/文档，没碰任何执行逻辑）**：`README.md`（"Evaluation" + "Manual correction tools" 两节换成一段指向 GT_tool 的说明，`tests/` 列表去掉搬走的那份）、`src/registration_ants/` 下 `register.py`/`mask_utils.py`/`config.py`/`atlas_utils.py`/`transforms.py` 的 docstring 路径、`scripts/project_outline.py`/`relabel_cells.py`/`convert_devccf_ontology.py`、`configs/atlas_presets.example.yaml`、`tests/test_label_correction_smoke.py` 的注释、`.gitignore`（删掉 `!configs/eval_config.example.yaml` 白名单和 `scripts/.dialog_state/` 两条，都跟着搬走了）、`requirements.txt`（`napari[pyqt5]` **保留**——搬走的工具仍跑在 `antsreg` 里，注释改成说明这一点）。
+
+**下一步**：
+1. 用户在有显示的机器上手动过一遍 `annotate_gt_sam.py` 的交互部分（放点 → `s` 分割 → `c` commit → 手改 → Save slice），这部分自动化测不了，验收清单写在 GT_tool 的 README 里。
+2. 先在 `configs/gt_annotation.yaml` 里把 4 个脑区各自的 5 个 z 位置**定下来**（现在模板里是占位数字），定之前建议先用 `single_sample.py` 翻一遍 `tsc12t_fine_20um.nii.gz` 挑有代表性的层。
+3. 标完一版之后：`python annotate_gt_sam.py ... --verify` → 把 `{brain_id}_{region}.nii.gz` 填进 `configs/eval_config.yaml` 的 `dice_region_masks` → 跑 `registration_eval.py`，看 Dice/HD95 那组 metric 在真实标注下能不能跑通（之前一直因为没有标注被跳过）。

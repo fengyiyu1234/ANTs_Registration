@@ -257,7 +257,7 @@ def collapse_labels_to_level(label_arr, structures, level):
     Ids whose own path is already shorter than `level` (no descendant that
     deep) are left unchanged. Used to build a read-only reference view of a
     chosen level's regions without finer subdivisions cluttering it (see
-    scripts/edit_sample_labels.py's level-overview layer).
+    ../GT_tool_for_registration/edit_sample_labels.py's level-overview layer).
     """
     max_id = max(int(label_arr.max()) if label_arr.size else 0,
                  max(structures) if structures else 0)

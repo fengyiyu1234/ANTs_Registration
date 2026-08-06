@@ -6,7 +6,7 @@ import yaml
 # Named atlas shortcuts, e.g. atlas.source: devccf_p04 instead of spelling out
 # template_path/annotation_path/resolution_um/ontology_path/orientation every time --
 # see configs/atlas_presets.example.yaml for the format. Real file is gitignored
-# (machine-specific paths), same convention as mask_tools/paint_mask_local.yaml.
+# (machine-specific paths), same convention as ../GT_tool_for_registration/paint_mask_local.yaml.
 _ATLAS_PRESETS_PATH = Path(__file__).resolve().parents[2] / "configs" / "atlas_presets_local.yaml"
 
 

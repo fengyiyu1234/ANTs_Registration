@@ -1,11 +1,11 @@
 """Non-interactive helper: rewrite the mapped_id / region columns of every
 ClearMap-format `cell_registration.csv` under a sample's cell_registration/
 folder, using a hand-corrected label volume from
-scripts/edit_sample_labels.py instead of the original (uncorrected)
+../GT_tool_for_registration/edit_sample_labels.py instead of the original (uncorrected)
 labels_in_sample.nii.gz.
 
 This is the last step of the post-registration correction workflow: run
-registration once -> scripts/edit_sample_labels.py to hand-fix wrong
+registration once -> ../GT_tool_for_registration/edit_sample_labels.py to hand-fix wrong
 region boundaries in sample space -> this script, to push that correction
 into the per-cell region assignments ClearMap already computed.
 

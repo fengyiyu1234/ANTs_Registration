@@ -10,6 +10,8 @@ pystripe
 pandas
 pyyaml
 
-# Interactive napari tools (mask_tools/, scripts/*.py that open a viewer) --
-# consolidated into this same antsreg env, no separate env needed anymore.
+# The interactive annotation/QC tools now live in ../GT_tool_for_registration,
+# but they still run in this same antsreg env: they import registration_ants
+# (via its editable install) and registration_eval.py needs antspyx. Keep napari
+# here so rebuilding antsreg from this file leaves those tools runnable.
 napari[pyqt5]

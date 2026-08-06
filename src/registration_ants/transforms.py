@@ -61,7 +61,8 @@ def load_saved_transforms(transforms_prefix):
     """Reconstruct {'fwdtransforms': [...], 'invtransforms': [...]} from the
     transform files a previous register_to_atlas(outprefix=transforms_prefix)
     call already wrote to disk -- for a separate process that never held the
-    live `reg` dict (e.g. registration_eval.py), instead of re-running
+    live `reg` dict (e.g. ../GT_tool_for_registration/registration_eval.py),
+    instead of re-running
     registration just to get the transform lists back.
 
     Same file-naming assumption already relied on in

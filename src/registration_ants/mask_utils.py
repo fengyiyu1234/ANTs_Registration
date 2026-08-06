@@ -1,6 +1,6 @@
 """Registration masks: automated atlas-side region exclusion (see
 atlas_utils.build_region_exclusion_mask), and a sparse-plane-to-dense
-interpolation workflow used by mask_tools/paint_mask.py's `guide` kind for
+interpolation workflow used by ../GT_tool_for_registration/paint_mask.py's `guide` kind for
 turning a hand-painted outline into a full 3D mask.
 
 Both functions here are axis-order-agnostic: "axis 0" just means whichever
@@ -57,7 +57,7 @@ def interpolate_sparse_label_correction(keyframe_edits, original_labels):
     """Sparse per-plane hand corrections to a multi-label volume (e.g. Allen
     CCF region ids warped into sample space) -> a dense corrected volume,
     interpolating the correction itself between keyframes rather than
-    overwriting whole planes -- see scripts/edit_sample_labels.py, the
+    overwriting whole planes -- see ../GT_tool_for_registration/edit_sample_labels.py, the
     interactive tool that produces `keyframe_edits`.
 
     keyframe_edits: {z: (edit_mask_2d, edited_labels_2d)} -- edit_mask_2d is
