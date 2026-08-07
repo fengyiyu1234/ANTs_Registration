@@ -9,6 +9,33 @@ from pathlib import Path
 import ants
 
 
+def _mat_entries_to_invert(transformlist):
+    """[True for each .mat (linear) entry, False for warp/displacement
+    fields] -- built explicitly instead of trusting ants.apply_transforms's
+    own whichtoinvert=None auto-inference. Per that function's own
+    docstring, the auto default only special-cases the exact 2-element
+    [matrix, warp] pattern a compound SyN-style registration's invtransforms
+    happens to produce (e.g. [affine.mat, InverseWarp.nii.gz] ->
+    (True, False)); anything else -- including a bare single .mat, which is
+    exactly what invtransforms is for a plain
+    type_of_transform="Affine"/"Rigid"/"Translation"/... registration with
+    no deformable stage -- silently falls through to all-False ("don't
+    invert anything"), applying the forward matrix un-inverted.
+
+    Verified against a real run: warp_labels_to_sample against an
+    Affine-only registration's invtransforms came back 100% empty with the
+    default (every voxel mapped outside the atlas_annotation's bounds);
+    passing this explicit list instead recovers the expected ~30% nonzero.
+
+    Only ever needed for invtransforms -- every .mat in fwdtransforms is
+    already in the right (forward) direction and must stay un-inverted,
+    which is what ants.apply_transforms/apply_transforms_to_points already
+    default to regardless of list shape, so fwdtransforms callers below
+    don't need this.
+    """
+    return [str(t).endswith(".mat") for t in transformlist]
+
+
 def warp_sample_to_atlas(sample_img, reg, interpolator="linear"):
     """Warp a sample-space image (e.g. a signal channel) into Allen atlas space."""
     return ants.apply_transforms(
@@ -27,6 +54,7 @@ def warp_labels_to_sample(sample_reference_img, reg):
     return ants.apply_transforms(
         fixed=sample_reference_img, moving=reg["atlas_annotation"],
         transformlist=reg["invtransforms"], interpolator="genericLabel",
+        whichtoinvert=_mat_entries_to_invert(reg["invtransforms"]),
     )
 
 
@@ -54,7 +82,14 @@ def transform_cell_points(points_df, reg, direction="atlas_to_sample"):
     native resolution.
     """
     transformlist = reg["fwdtransforms"] if direction == "atlas_to_sample" else reg["invtransforms"]
-    return ants.apply_transforms_to_points(dim=3, points=points_df, transformlist=transformlist)
+    # See _mat_entries_to_invert's docstring -- same fragile ants
+    # whichtoinvert=None auto-inference applies here too (it's the same
+    # underlying C++ logic apply_transforms_to_points shares with
+    # apply_transforms). Only invtransforms (sample_to_atlas) needs this;
+    # fwdtransforms is already correct un-inverted regardless.
+    whichtoinvert = _mat_entries_to_invert(transformlist) if direction == "sample_to_atlas" else None
+    return ants.apply_transforms_to_points(dim=3, points=points_df, transformlist=transformlist,
+                                            whichtoinvert=whichtoinvert)
 
 
 def load_saved_transforms(transforms_prefix):

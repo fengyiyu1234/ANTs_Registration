@@ -64,6 +64,7 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
         reg_affine = ants.registration(
             fixed=atlas_template, moving=sample_img, type_of_transform="Affine",
             aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=moving_mask,
+            mask_all_stages=True,
         )
         extras = [("MeanSquares", atlas_outline, sample_outline, weight, 0)
                   for atlas_outline, sample_outline, weight in guide_regions]
@@ -77,6 +78,7 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             verbose=verbose,
             mask=mask,
             moving_mask=moving_mask,
+            mask_all_stages=True,
             multivariate_extras=extras,
         )
     else:
@@ -97,6 +99,7 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             reg_translation = ants.registration(
                 fixed=atlas_template, moving=sample_img, type_of_transform="Translation",
                 aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=moving_mask,
+                mask_all_stages=True,
             )
             initial_transform = reg_translation["fwdtransforms"][0]
 
@@ -111,6 +114,19 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             verbose=verbose,
             mask=mask,
             moving_mask=moving_mask,
+            # ants.registration() only applies mask/moving_mask to a
+            # transform's LAST internal stage unless this is set -- for a
+            # combined multi-stage preset like the default "SyNRA"
+            # (Rigid+Affine+SyN built as ONE antsRegistration call), that
+            # means the Rigid+Affine stages run completely UNMASKED by
+            # default (verified in a real run.log: `-x [NA,NA]` for the
+            # Rigid/Affine metric stages, real mask pointers only on SyN's).
+            # That silently undoes the whole point of passing mask/
+            # moving_mask in the first place -- the unmasked Affine stage
+            # can drag a good masked-Translation initial alignment (above)
+            # right back into a bad pose using the full unmasked buffer/atlas
+            # extent.
+            mask_all_stages=True,
         )
     reg["atlas_template"] = atlas_template
     reg["atlas_annotation"] = atlas_annotation

@@ -58,10 +58,11 @@ def _fmt_duration(seconds):
 
 
 def _preprocess(img, prep_cfg):
-    if prep_cfg["n4_bias_correction"]:
-        logger.info("Preprocessing: N4 bias correction, input shape=%s", img.shape)
-        return preprocess.preprocess_for_registration(img)
     lo, hi = prep_cfg["intensity_clip_percentiles"]
+    if prep_cfg["n4_bias_correction"]:
+        logger.info("Preprocessing: N4 bias correction + clip_and_normalize percentiles=(%s, %s), input shape=%s",
+                    lo, hi, img.shape)
+        return preprocess.preprocess_for_registration(img, lo, hi)
     logger.info("Preprocessing: intensity clip_and_normalize percentiles=(%s, %s), input shape=%s", lo, hi, img.shape)
     return preprocess.clip_and_normalize(img, lo, hi)
 

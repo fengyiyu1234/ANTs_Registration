@@ -567,3 +567,43 @@
 1. 用户在有显示的机器上手动过一遍 `annotate_gt_sam.py` 的交互部分（放点 → `s` 分割 → `c` commit → 手改 → Save slice），这部分自动化测不了，验收清单写在 GT_tool 的 README 里。
 2. 先在 `configs/gt_annotation.yaml` 里把 4 个脑区各自的 5 个 z 位置**定下来**（现在模板里是占位数字），定之前建议先用 `single_sample.py` 翻一遍 `tsc12t_fine_20um.nii.gz` 挑有代表性的层。
 3. 标完一版之后：`python annotate_gt_sam.py ... --verify` → 把 `{brain_id}_{region}.nii.gz` 填进 `configs/eval_config.yaml` 的 `dice_region_masks` → 跑 `registration_eval.py`，看 Dice/HD95 那组 metric 在真实标注下能不能跑通（之前一直因为没有标注被跳过）。
+
+---
+
+## 2026-08-07：接着 8-04 排查——又挖出三个真 bug + Affine-only 快速诊断验证半球思路是对的
+
+**背景**：8-04 那次加了 mask-aware Translation 预对齐 + `crop_for_registration` 改成原始 TIFF 坐标系，但没跑过真实数据验证。这次用户提议"先只跑 Affine（不等 SyN 那几小时）看看效果，Affine 都不行后面也白搭"，跑起来之后接连挖出三个之前没暴露过的真 bug。
+
+**Bug 3：`ants.registration()` 的 `mask_all_stages` 默认 `False`——`SyNRA` 的 Rigid/Affine 两个 stage 实际完全没用 mask**
+
+直接读真实 `run.log` 里 antsRegistration 落地的命令行发现的：`SyNRA` 是 Rigid+Affine+SyN 三个 metric stage 打包成一次调用，只有最后 SyN 那行 `-x` 是真的 mask 指针，Rigid/Affine 两行都是 `-x [NA,NA]`。查了 antspyx 源码确认：`ants.registration()` 只把 mask/moving_mask 传给一个变换的**最后一个** stage，除非显式传 `mask_all_stages=True`（默认 `False`），"早期" stage 一律拿 `[NA,NA]`。
+
+这解释了 8-04 那次加的 Translation 预对齐为什么没用——预对齐本身是单 stage、mask 正常生效，算出的初始位置是对的，但紧接着 `SyNRA` 里完全不受 mask 限制的 Rigid+Affine 又把这个好的初始对齐拽回了错误位置（用的是全图未裁剪范围，跟最开始那个 bug 是同一种机制，只是发生在配准中段而不是初始化）。
+
+**改动**：`register.py` 里所有涉及 mask 的 `ants.registration()` 调用（主配准、`guide_regions` 分支的 Affine/SyNOnly、新加的 Translation 预对齐）统一加 `mask_all_stages=True`。
+
+**Bug 4：`intensity_clip_percentiles` 配置项被静默忽略**
+
+`pipeline.py` 的 `_preprocess()`：`n4_bias_correction: true` 时直接调 `preprocess.preprocess_for_registration(img)`（不带参数），内部 `clip_and_normalize` 用的是硬编码默认值 `(0.5, 99.5)`，config 里配的 `intensity_clip_percentiles: [0.1, 99.9]` 只有 `n4_bias_correction: false` 才会读到——但用户一直开着 N4，这个字段实际从没生效过。`run.log` 也能对上：只打印了 "N4 bias correction" 一行，没有 "intensity clip_and_normalize percentiles=..." 那行。
+
+**改动**：`preprocess.preprocess_for_registration` 加 `lower_pct`/`upper_pct` 参数（默认值不变，向后兼容）；`pipeline.py` 的 `_preprocess` 不管走哪条分支都显式把 `intensity_clip_percentiles` 传进去。
+
+**Bug 5（Affine-only 测试直接测出来的）：`ants.apply_transforms`/`apply_transforms_to_points` 的 `whichtoinvert=None` 自动推断，对单一 `.mat` 的 `invtransforms` 不生效**
+
+第一次 Affine-only 真实跑完，`tsc12t_labels_in_sample.nii.gz` 文件只有 149KB（之前 SyNRA 那次 1200KB），一查是**整个体积全是 0**。根因是 ants 自己的文档写明的："若 transformlist 是 matrix 后面跟 warp field，`whichtoinvert` 默认 `(True, False)`；否则默认 `[False]*len(transformlist)`"。`SyNRA` 的 `invtransforms = [affine.mat, InverseWarp.nii.gz]` 正好命中"matrix+warp"这个特例，一直以来矩阵都被自动求逆、结果是对的；但纯 `Affine`（无形变场）的 `invtransforms` 只有 `[affine.mat]` 一个元素，不命中特例，矩阵没被求逆，方向整个反了，所有点都映射到样本网格外，输出全 0。**这个 bug 只在用单一线性变换类型（Affine/Rigid/Translation，没有 SyN 形变场）时才会触发，`SyNRA` 正式跑不受影响，之前所有真实结果都是对的**——纯粹是这次第一次真的跑 `type_of_transform: Affine` 才暴露出来。
+
+实测验证：同一个矩阵文件，默认 `whichtoinvert=None` 求出 0% 非零；显式传 `whichtoinvert=[True]` 求出 32.4% 非零、190 个不同 label，跟同一样本 SyNRA 那次的 31.7%/176 个量级吻合。
+
+**改动**：`transforms.py` 新增 `_mat_entries_to_invert(transformlist)`（按文件是不是 `.mat` 显式算 `whichtoinvert`，不再依赖 ants 那个只覆盖两元素特例的自动推断），`warp_labels_to_sample` 和 `transform_cell_points`（`sample_to_atlas` 方向）都改成显式传这个值。`fwdtransforms` 方向不用改——单个 `.mat` 在 fwdtransforms 里本来就不需要求逆，默认行为已经是对的。
+
+**顺带修的环境问题**：用户把 `/data/hdd12tb-1/fengyi/COMBINe/clearmap/` 顶层目录整个重命名成了 `Registration/`，`s12t.yaml` 里 `sample.raw_tiff`/`cells.cell_centroids_dir`/两处 `output_dir` 还指向旧路径，run 之前 `load_config` 就会直接报 `FileNotFoundError`，一并改成新路径。另外用户手改 config 时把 `mask.atlas_exclude_regions` 从 `["Olfactory bulb"]` 改成 `[""]`（想表示"不排除任何区域"），但 `build_region_exclusion_mask` 是子串匹配，空字符串是任何字符串的子串，会导致**几乎整个 atlas mask 变成全 0**（约等于把整张图谱都排除出配准相似度计算）——提醒后用户自己改成了正确的空列表 `[]`。
+
+**Affine-only 诊断结果（三处 bug 修完之后）**：
+1. **半球图谱**（`slicing: [[320,640],null,null]`，跟 8-04 之前一致）+ Affine：`tsc12t_in_atlas.nii.gz` 跟半球 atlas 叠加，整体位置/大小/形状对上了，明显好于修 bug 之前。用户目视核对："半脑还说得过去"。唯一问题：外侧皮层区域对上了，中线附近深部结构（丘脑等）基本没跟着动——分析是 Affine 只有一套全局线性参数，没法对不同区域分别拉伸，这部分差异性状不均匀，理论上要交给 SyN 的局部形变场处理，不算 Affine 阶段的异常。
+2. **完整双侧图谱**（`slicing: [null,null,null]`，用户临时改的对照组）+ Affine：用户目视核对后反馈"全脑atlas效果非常差"。印证了半球裁剪这个思路本身是对的、不该改成拿完整双侧图谱去配（跟用户此前确认的"ClearMap 当年也是配的半脑图谱"一致），不用再纠结要不要放弃半球裁剪。
+
+**用户提供的关键背景**：这份样本做过基因敲除 + iDISCO 清透处理，形变比较明显——长度上跟 atlas 差不多，但宽度大约是 atlas 的一半，且不是均匀缩放（结合上面"皮层对上、中线没动"的现象）。讨论结论：SyN 是微分同胚形变场，理论上能处理这种局部、非均匀的形状差异（这正是 SyN 存在的意义），但它有硬限制——如果某个结构是真的发育异常/缺失（不是被压缩，是真没有），SyN 没法凭空生成对应组织，那部分区域的 label 边界不会有意义，需要 `GT_tool_for_registration/edit_sample_labels.py` 之类的工具手动兜底，不能指望自动配准全解决。
+
+**验证方式**：三个 bug 都各自用真实数据/实际 run.log 核实过（不是纯代码审查猜的），`register_to_atlas` 合成数据烟雾测试仍过；`transform_cell_points`/`warp_sample_to_atlas`（fwdtransforms 方向）未受影响，没改。
+
+**下一步**：`configs/s12t.yaml` 改回 `type_of_transform: SyNRA`、`atlas_variants.devccf_p04.slicing` 改回半球裁剪 `[[320,640],null,null]`、`output_dir` 指到正式目录，跑一次完整 SyNRA（预计仍要小时级），重点看中线区域这次能不能被局部形变拉过去贴合样本。
