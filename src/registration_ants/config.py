@@ -24,6 +24,13 @@ _DEFAULTS = {
         "fine_target_um": 25,
         "atlas_res_um": 25,
         "type_of_transform": "SyNRA",
+        # CC neighborhood radius in voxels (NOT histogram bins -- see
+        # register.register_to_atlas's docstring for why antspyx's own
+        # default of 32 is wrong here).
+        "syn_sampling": 4,
+        # Max SyN iterations per resolution level, coarsest first; the
+        # length also sets the pyramid depth (3 entries = 4x/2x/full).
+        "reg_iterations": [100, 70, 50],
     },
     "preprocess": {
         "n4_bias_correction": True,
@@ -113,6 +120,14 @@ def load_config(path):
             raise ValueError(f"config.sample.{required} is required")
     if not Path(sample["raw_tiff"]).exists():
         raise FileNotFoundError(f"sample.raw_tiff not found: {sample['raw_tiff']}")
+
+    reg_iters = config["registration"]["reg_iterations"]
+    if not isinstance(reg_iters, (list, tuple)) or not reg_iters:
+        raise ValueError("registration.reg_iterations must be a non-empty list, coarsest level first")
+    if any(not isinstance(it, int) or it < 0 for it in reg_iters):
+        raise ValueError(f"registration.reg_iterations must be non-negative integers, got {reg_iters}")
+    if not isinstance(config["registration"]["syn_sampling"], int) or config["registration"]["syn_sampling"] < 1:
+        raise ValueError("registration.syn_sampling must be a positive integer (CC neighborhood radius in voxels)")
 
     crop_cfg = config["registration"].get("crop_for_registration")
     if crop_cfg:

@@ -6,7 +6,7 @@ from .atlas_utils import get_allen_atlas
 
 def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_structures=None,
                        type_of_transform="SyNRA", outprefix="", verbose=True, mask=None, moving_mask=None,
-                       guide_regions=None):
+                       guide_regions=None, syn_sampling=4, reg_iterations=(100, 70, 50)):
     """Register a preprocessed, isotropic sample image to an already-loaded
     atlas template/annotation (from either get_allen_atlas or
     atlas_utils.load_custom_atlas — this function doesn't care which).
@@ -59,6 +59,28 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     only supported for SyNOnly/antsRegistrationSyN* transforms. Validated on
     synthetic data before wiring in (see PROGRESS_LOG.md): pulled two
     deliberately-offset regions from Dice 0.18 to 0.92.
+
+    syn_sampling: ants.registration()'s syn_sampling means DIFFERENT things
+    depending on syn_metric -- histogram bins for mattes, but the local
+    neighborhood RADIUS (in voxels) for CC, which is what this function
+    always uses. Its antspyx default of 32 is the sensible bin count for
+    mattes and a disastrous radius for CC: a 65^3 = 275k-voxel correlation
+    window (1.3 mm across on a 20um grid) averages away exactly the local
+    structure SyN needs to see, so the deformation stays near-global while
+    each iteration costs minutes. 4 is what antsRegistrationSyN.sh and
+    antspyx's own SyNCC preset use. Only meaningful while syn_metric is CC.
+
+    reg_iterations: max iterations per SyN resolution level, coarsest
+    first. Its length also sets the pyramid depth (antspyx derives
+    smoothing sigmas len-1...0 and shrink factors 2^(len-1)...1 from it),
+    so three entries means 4x / 2x / full resolution. antspyx's default
+    (40, 20, 0) leaves the full-resolution level at zero iterations -- the
+    deformation is then only ever optimized on a 2x-downsampled grid and
+    upsampled -- and cuts the coarser levels off while the metric is still
+    descending. Fine for a sample already close to the atlas, not for one
+    needing large, spatially non-uniform deformation. These are caps, not
+    fixed costs: a level exits early once its convergence value drops
+    below ANTs' 1e-7 threshold.
     """
     if guide_regions:
         reg_affine = ants.registration(
@@ -74,6 +96,8 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             type_of_transform="SyNOnly",
             initial_transform=reg_affine["fwdtransforms"][0],
             syn_metric="CC",
+            syn_sampling=syn_sampling,
+            reg_iterations=reg_iterations,
             outprefix=outprefix,
             verbose=verbose,
             mask=mask,
@@ -110,6 +134,8 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             initial_transform=initial_transform,
             aff_metric="mattes",
             syn_metric="CC",
+            syn_sampling=syn_sampling,
+            reg_iterations=reg_iterations,
             outprefix=outprefix,
             verbose=verbose,
             mask=mask,
@@ -135,11 +161,12 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
 
 
 def register_to_allen(sample_img, atlas_res_um=25, type_of_transform="SyNRA", outprefix="", verbose=True,
-                       mask=None, moving_mask=None, guide_regions=None):
+                       mask=None, moving_mask=None, guide_regions=None,
+                       syn_sampling=4, reg_iterations=(100, 70, 50)):
     """Register to the Allen CCF, auto-fetched via BrainGlobe at atlas_res_um.
     See register_to_atlas() for what the returned dict contains and what
-    mask/moving_mask/guide_regions mean.
+    mask/moving_mask/guide_regions/syn_sampling/reg_iterations mean.
     """
     template, annotation, structures = get_allen_atlas(atlas_res_um)
     return register_to_atlas(sample_img, template, annotation, structures, type_of_transform, outprefix, verbose,
-                              mask, moving_mask, guide_regions)
+                              mask, moving_mask, guide_regions, syn_sampling, reg_iterations)

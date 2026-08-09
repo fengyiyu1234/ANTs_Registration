@@ -44,6 +44,20 @@ atlas_variants:
 registration:
   type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
 
+  # SyN 阶段 CC 相似度的【邻域半径】，单位是体素（不是直方图 bin 数——antspyx
+  # 的 syn_sampling 一个参数两种含义，默认值 32 是给 mattes 的 bin 数，当成
+  # CC 半径用就是 65^3 个体素的窗口，局部结构全被平均掉、SyN 只剩全局位移，
+  # 而且每次迭代要几十秒到几分钟）。4 是 antsRegistrationSyN.sh 的官方默认。
+  # 太小（1）会因为窗内样本太少而被噪声带偏，2~4 是实践区间。
+  syn_sampling: 4
+
+  # SyN 每个分辨率层级的最大迭代次数，从最粗到最细；列表【长度】同时决定金字塔
+  # 层数（3 项 = 4倍降采样 / 2倍 / 全分辨率）。这是上限不是固定开销——某层
+  # 收敛值跌破 1e-7 就会提前退出。antspyx 默认 (40,20,0) 的最后一项是 0，
+  # 意味着全分辨率层一次都不跑（形变场只在 2 倍降采样上估计再上采样），
+  # 对形变量大的样本明显不够。
+  reg_iterations: [100, 70, 50]
+
   # 配准前把样本图像四周多余的空白 buffer 裁掉——数值是【原始 TIFF 自己的】
   # 体素序号（x=列, y=行, z=第几张切片，顺序跟 sample.voxel_size_um 一致），
   # 直接在 ImageJ/Fiji 等工具里打开原始 raw_tiff 读出组织实际范围就行，不用

@@ -218,13 +218,16 @@ def run_pipeline(config_path):
                     [gr["sample_outline_path"] for gr in mask_cfg["guide_regions"]])
 
     logger.info("Registration params: type_of_transform=%s, atlas_mask=%s, "
-                "sample_mask=%s, guide_regions=%d, outprefix=%s",
+                "sample_mask=%s, guide_regions=%d, syn_sampling(CC radius)=%d, "
+                "reg_iterations=%s, outprefix=%s",
                 reg_cfg["type_of_transform"], atlas_mask is not None, sample_mask is not None,
-                len(guide_regions or []), transforms_prefix)
+                len(guide_regions or []), reg_cfg["syn_sampling"], reg_cfg["reg_iterations"],
+                transforms_prefix)
     reg = register.register_to_atlas(
         sample_fine_prep, atlas_template, atlas_annotation, atlas_structures,
         type_of_transform=reg_cfg["type_of_transform"], outprefix=transforms_prefix,
         mask=atlas_mask, moving_mask=sample_mask, guide_regions=guide_regions,
+        syn_sampling=reg_cfg["syn_sampling"], reg_iterations=reg_cfg["reg_iterations"],
     )
 
     logger.info("Registration complete: fwdtransforms=%s, invtransforms=%s",
