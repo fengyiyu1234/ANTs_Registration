@@ -164,6 +164,7 @@ def run_pipeline(config_path):
                     exclude_regions, int((~keep).sum()), keep.size)
 
     sample_mask = None
+    prealign_moving_mask = None
     if mask_cfg.get("sample_damage_mask_path"):
         sample_mask = ants.image_read(mask_cfg["sample_damage_mask_path"])
         logger.info("Loaded sample damage mask: %s", mask_cfg["sample_damage_mask_path"])
@@ -196,16 +197,15 @@ def run_pipeline(config_path):
                     "paste directly into config): x=%s y=%s z=%s",
                     raw_suggestion[0], raw_suggestion[1], raw_suggestion[2])
 
-        if sample_mask is None:
-            sample_mask = auto_mask_img
-        else:
-            # Combine with the hand-painted damage mask: a voxel must be
-            # both inside the auto brain silhouette AND not excluded by
-            # the damage mask to be used in the metric.
-            combined = (sample_mask.numpy() > 0) & (mask_arr > 0)
-            sample_mask = ants.from_numpy(combined.astype("float32"), spacing=sample_fine_prep.spacing,
-                                           origin=sample_fine_prep.origin, direction=sample_fine_prep.direction)
-            logger.info("Combined auto brain mask with sample_damage_mask_path")
+        # The silhouette is handed to register_to_atlas as the PRE-ALIGNMENT
+        # mask only, never as moving_mask -- see register_to_atlas's docstring
+        # for the measurements, but in short: a silhouette used as moving_mask
+        # hides every part of the atlas the sample does not cover yet, which
+        # removes the only signal that would make the sample grow to fill it.
+        # sample_damage_mask_path stays on moving_mask: it marks tissue that
+        # genuinely has no counterpart, and is 1 nearly everywhere else, so it
+        # does not hide un-covered atlas territory the way a silhouette does.
+        prealign_moving_mask = auto_mask_img
 
     guide_regions = None
     if mask_cfg.get("guide_regions"):
@@ -218,16 +218,17 @@ def run_pipeline(config_path):
                     [gr["sample_outline_path"] for gr in mask_cfg["guide_regions"]])
 
     logger.info("Registration params: type_of_transform=%s, atlas_mask=%s, "
-                "sample_mask=%s, guide_regions=%d, syn_sampling(CC radius)=%d, "
-                "reg_iterations=%s, outprefix=%s",
+                "sample_mask=%s, prealign_mask=%s, guide_regions=%d, "
+                "syn_sampling(CC radius)=%d, reg_iterations=%s, outprefix=%s",
                 reg_cfg["type_of_transform"], atlas_mask is not None, sample_mask is not None,
-                len(guide_regions or []), reg_cfg["syn_sampling"], reg_cfg["reg_iterations"],
-                transforms_prefix)
+                prealign_moving_mask is not None, len(guide_regions or []),
+                reg_cfg["syn_sampling"], reg_cfg["reg_iterations"], transforms_prefix)
     reg = register.register_to_atlas(
         sample_fine_prep, atlas_template, atlas_annotation, atlas_structures,
         type_of_transform=reg_cfg["type_of_transform"], outprefix=transforms_prefix,
         mask=atlas_mask, moving_mask=sample_mask, guide_regions=guide_regions,
         syn_sampling=reg_cfg["syn_sampling"], reg_iterations=reg_cfg["reg_iterations"],
+        prealign_moving_mask=prealign_moving_mask,
     )
 
     logger.info("Registration complete: fwdtransforms=%s, invtransforms=%s",

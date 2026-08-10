@@ -6,7 +6,8 @@ from .atlas_utils import get_allen_atlas
 
 def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_structures=None,
                        type_of_transform="SyNRA", outprefix="", verbose=True, mask=None, moving_mask=None,
-                       guide_regions=None, syn_sampling=4, reg_iterations=(100, 70, 50)):
+                       guide_regions=None, syn_sampling=4, reg_iterations=(100, 70, 50),
+                       prealign_moving_mask=None):
     """Register a preprocessed, isotropic sample image to an already-loaded
     atlas template/annotation (from either get_allen_atlas or
     atlas_utils.load_custom_atlas — this function doesn't care which).
@@ -37,9 +38,32 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     through config.yaml's mask.auto_brain_mask).
     Files produced by those two helpers are already in this "nonzero=use"
     convention, no inversion needed here.
-    Whenever either mask is given (outside the guide_regions branch), a
-    coarse mask-constrained Translation pass runs first and its result is
-    fed in as initial_transform for the main type_of_transform call below --
+    prealign_moving_mask: a sample-space mask used ONLY for the coarse
+    Translation pre-alignment described below, never for the main
+    registration. This is where a whole-brain silhouette mask belongs.
+    A silhouette passed as moving_mask instead actively PREVENTS the
+    sample from being stretched to fill the atlas: ANTs only evaluates
+    the metric at points that land inside the moving mask, so every bit
+    of atlas territory the sample does not cover yet is silently dropped
+    from the objective -- there is then no "expand to fill me" term at
+    all, and leaving the sample small and centered scores just as well as
+    growing it. Measured on a phantom matching a real failing case (sample
+    squashed to 61% of atlas height, hemisphere atlas flush against its
+    cut face, sample buffered on all sides): silhouette as moving_mask
+    recovered 9% of the missing extent, moving it to prealign_moving_mask
+    recovered 101%, with the initial alignment just as good (centre-of-mass
+    error 0.00 mm either way). Most of that difference is the Affine stage
+    rather than SyN -- a masked Affine will not scale up, which forces the
+    deformation field to do work a global scale factor should have done.
+    Reserve mask/moving_mask for genuine correspondence failures (missing
+    structures via atlas_utils.build_region_exclusion_mask, tears via a
+    hand-painted damage mask); those exclude a specific region rather than
+    hiding all not-yet-covered territory, so they do not have this effect.
+
+    Whenever mask or the pre-alignment mask is given (outside the
+    guide_regions branch), a coarse mask-constrained Translation pass runs
+    first and its result is fed in as initial_transform for the main
+    type_of_transform call below --
     see the inline comment where it's built for why (ANTs' own default
     initializer ignores these masks, which can land the optimizer nowhere
     near the true alignment for oddly-shaped mask pairs, e.g. a
@@ -107,7 +131,8 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
         )
     else:
         initial_transform = None
-        if mask is not None or moving_mask is not None:
+        prealign_mm = prealign_moving_mask if prealign_moving_mask is not None else moving_mask
+        if mask is not None or prealign_mm is not None:
             # ANTs' own default initializer (used whenever initial_transform
             # is left unset) aligns whole-image intensity centroids WITHOUT
             # respecting mask/moving_mask -- fine when sample and atlas have
@@ -122,7 +147,7 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             # in config, so translation alone is what's left to correct.
             reg_translation = ants.registration(
                 fixed=atlas_template, moving=sample_img, type_of_transform="Translation",
-                aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=moving_mask,
+                aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=prealign_mm,
                 mask_all_stages=True,
             )
             initial_transform = reg_translation["fwdtransforms"][0]

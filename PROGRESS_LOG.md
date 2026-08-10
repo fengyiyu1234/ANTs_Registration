@@ -607,3 +607,155 @@
 **验证方式**：三个 bug 都各自用真实数据/实际 run.log 核实过（不是纯代码审查猜的），`register_to_atlas` 合成数据烟雾测试仍过；`transform_cell_points`/`warp_sample_to_atlas`（fwdtransforms 方向）未受影响，没改。
 
 **下一步**：`configs/s12t.yaml` 改回 `type_of_transform: SyNRA`、`atlas_variants.devccf_p04.slicing` 改回半球裁剪 `[[320,640],null,null]`、`output_dir` 指到正式目录，跑一次完整 SyNRA（预计仍要小时级），重点看中线区域这次能不能被局部形变拉过去贴合样本。
+
+---
+
+## 2026-08-08：SyN"只位移不形变"的真正原因——CC 半径被默认值设成 32 + 最细层 0 次迭代
+
+**背景**：8-07 那三个 bug 修完后，用户跑了一次完整 SyNRA（`DevCCF_0807/run.log`，register 步骤 2:55:24），目视核对发现**结果跟 affine-only 那次几乎一样**——atlas 只是整体位移了一下，没有实质形变。用户已经知道自己的样本因为基因敲除 + iDISCO 清透跟正常脑差别大（宽度约为 atlas 一半且非均匀），但这个结果依然不合理。读 `run.log` 落地的 antsRegistration 命令行 + 收敛轨迹，查出两个参数问题，都不是样本的锅。
+
+**问题 1：CC 的邻域半径是 32,应该是 4**
+
+`run.log` 里 SyN 阶段是 `--metric CC[...,1,32]`。这是 antspyx 的参数重载陷阱，读源码确认（`ants/registration/registration.py:111-112` 的 docstring 原文）：
+
+```
+syn_sampling : scalar
+    the nbins or radius parameter for the syn metric
+```
+
+**同一个参数两种含义**——`syn_metric="mattes"` 时是直方图 bin 数（32 是标准值），`syn_metric="CC"` 时是**局部邻域半径（体素）**。而函数默认值写死 `syn_sampling=32`（`registration.py:36`），是按 mattes 定的。`register.py` 里一直只传了 `syn_metric="CC"` 没传 `syn_sampling`，于是 CC 拿到了半径 32。
+
+半径 32 意味着每个体素用 65³ = 274,625 体素的窗口算局部相关，在 20µm 网格上是**边长 1.3mm 的立方体**——而裁剪后的样本才 3.5 × 10.2 × 4.4 mm，这个"局部"窗口边长超过样本宽度的三分之一。后果：局部结构被平均掉，梯度只反映大尺度强度分布（而那部分 affine 已经做完了），所以 SyN 每步更新极小、形变场基本是全局性的；同时慢得离谱（shrink=4 层 47 秒/次迭代，shrink=2 层 420 秒/次，2小时55分基本全花在这）。
+
+同一份 antspyx 源码 `registration.py:670-671` 他们自己的 `SyNCC` 预设注释里写着 `# syn_sampling = 4`——作者自己用 CC 时是配 4 的，只是这个配对关系没做成自动的。4 也是 `antsRegistrationSyN.sh` 的官方默认。
+
+**问题 2：`reg_iterations` 默认 `(40, 20, 0)`，最细层一次都不跑**
+
+命令行 `--convergence [40x20x0,1e-7,8]` 配 `--shrink-factors 4x2x1`：全分辨率那层 **0 次迭代**，形变场最细只在 2 倍降采样（等效 40µm）上估计然后上采样输出。跟半径无关，是独立的第二个问题。
+
+另外两个非零层**都是跑满上限被切断的，不是收敛退出**：第一层 40 次跑完时 convergenceValue 还有 7.6e-4，第二层 20 次跑完 5.5e-4，阈值是 1e-7，差四个数量级，metric 全程单调下降没走平。
+
+（诚实的补充：上次每步走得少，部分原因就是半径 32 把梯度抹平了；半径修好后同样 40 次可能走得远很多。但最细层的 `0` 无论如何都得改，而且 `reg_iterations` 是**上限不是固定开销**——某层收敛值跌破 1e-7 会提前退出，所以调高的主要代价是给足时间预算而不是无条件多跑。用户问过这一条，讨论后决定两个一起改。）
+
+**改动**（两个参数都做成 config 可调，不写死）：
+- `register.py`：`register_to_atlas` / `register_to_allen` 新增 `syn_sampling=4` / `reg_iterations=(100,70,50)` 参数，**两个** `ants.registration()` 调用点都传（主配准分支 + `guide_regions` 的 SyNOnly 分支——后者同样是 `syn_metric="CC"` 不传 sampling，有一模一样的 bug）。docstring 里写清 syn_sampling 一参两义、以及 reg_iterations 的长度会决定金字塔层数。
+- `config.py`：`_DEFAULTS["registration"]` 加 `syn_sampling: 4` / `reg_iterations: [100, 70, 50]`，并加校验（reg_iterations 必须是非空、非负整数列表——长度错了会静默改变金字塔深度；syn_sampling 必须是正整数）。
+- `pipeline.py`：透传两个参数，并把它们打进 `Registration params:` 那行 log（下次看 run.log 能直接确认生效，不用再去读命令行）。
+- `configs/config.example.yaml` / `configs/s12t.yaml`：补中文注释说明两个参数是什么、为什么不能用默认值。
+
+**验证结果**：
+1. 合成小体积实跑 `register_to_atlas`，抓 antspyx 落地的 antsRegistration 命令行确认：`--metric CC[...,1,4] --transform SyN[0.2,3,0] --convergence [100x70x50,1e-7,8] --smoothing-sigmas 2x1x0 --shrink-factors 4x2x1`——半径变 4、三层金字塔、**最细层是全分辨率且有 50 次迭代**。函数默认值和从 `configs/s12t.yaml` 读出来的值两条路径都验过。
+2. `load_config('configs/s12t.yaml')` 解析出 `{type_of_transform: SyNRA, syn_sampling: 4, reg_iterations: [100,70,50]}`。
+3. `tests/` 下 `test_pipeline_smoke.py` / `test_brain_mask_smoke.py` / `test_label_correction_smoke.py` 全过（`test_new_features_smoke.py` 的失败是 7-31 就存在的，跟这次无关）。
+4. **没有跑真实数据**——真实跑一次是小时级，留给用户。
+
+**顺带发现（不是这次改的）**：`DevCCF_0807` 那次是 `atlas_mask=False`，而 8-06 的 affine 测试是 `atlas_mask=True`——应该是 `mask.atlas_exclude_regions` 从 `[""]` 改成 `[]` 之后图谱侧 mask 就没有了（`[]` 是正确写法，`[""]` 那个才是 bug，见 8-07 记录）。sample mask 还在，影响不大，但要注意这两次运行不是完全同条件。
+
+**下一步**：用户重跑 `./run_pipeline.sh configs/s12t.yaml`。跑起来后的**早期判断点**：看第一层（shrink=4）的 `SINCE_LAST`，如果远低于上次的 47 秒说明半径修对了，再按实测速度外推总时长决定要不要调 `reg_iterations`，不用等三小时才知道。跑完的 QC 重点仍是中线区域的深部结构（丘脑等）这次有没有被局部形变拉过去——8-07 的 affine 诊断显示外侧皮层能对上、中线附近不动，那部分正是要靠 SyN 的局部形变场解决的。
+
+---
+
+## 2026-08-10：找到"atlas 几乎不形变"的真正根因——脑轮廓 mask 抑制了撑开（8-08 的判断是次要因素）
+
+**背景**：8-08 改完 `syn_sampling=4` / `reg_iterations=[100,70,50]` 后，用户跑了 `DevCCF_0809`（register 步骤 1:43:38，比 0807 的 2:55 快很多），但目视核对**结果和调参前几乎一样**，atlas 仍然只是位移、没有实质形变。
+
+**先确认参数确实生效了**（不是又一次静默失效）：`run.log` 里 `Registration params: ... syn_sampling(CC radius)=4, reg_iterations=[100, 70, 50]`，落地命令行 `--metric CC[...,1,4] --convergence [100x70x50,1e-7,8] --smoothing-sigmas 2x1x0 --shrink-factors 4x2x1`，三层金字塔真的都跑了（100 次 / 51 次【收敛退出】/ 50 次），metric 从 -0.09 单调优化到 -0.22。**参数没问题，是别的地方不对。**
+
+**量化"到底动了多少"**（这一步是关键，比目视可靠）：直接读两次的 `1Warp.nii.gz` 比较位移大小——
+
+| | 0807(半径32) | 0809(半径4) |
+|---|---|---|
+| 位移中位数 | 20µm | 19µm |
+| 90 分位 | 103µm | 100µm |
+| 最大位移 | 393µm | 392µm |
+
+**两次几乎逐项相同**。而 warp 后样本 vs atlas 的包围盒缺口：上下 2.3mm、前后 1.5mm、左右 0.6mm，**图谱有组织的体素里 35% 底下是空的**。0.39mm 的形变对 2.3mm 的缺口杯水车薪。
+
+**样本实测尺寸**（用 brain mask 量的真实组织范围，对比 DevCCF P04 右半脑）：前后 10.08mm vs 11.66mm（86%）、上下 **4.34mm vs 7.08mm（61%）**、左右 3.32mm vs 4.38mm（76%）、体积 65.9 vs 117.2 mm³（56%）。用户确认**组织是完整的**，压扁是 iDISCO 清透 + 半脑平放成像导致的，不是缺失。（嗅球确实没有，但那是处理过程中脱落的，属于另一回事。）
+
+**根因（合成实验查出来的，不是推理）**：造了个和真实情况同构的幻影——结构完整、沿一轴压扁到 61%、高度用真实同量级的体素数（360）——跑四种组合：
+
+| 配置 | 补上缺口 |
+|---|---|
+| 3层 + 轮廓mask（= 当时的配置） | **16%**（撑开 +0.38mm） |
+| 4层 + 轮廓mask | 35% |
+| 3层 + 无mask | **100%** |
+| 4层 + 无mask | 100% |
+
+合成的"3层+mask"撑开 **+0.38mm**，真实数据是 **+0.36mm**（4.34→4.7mm）——几乎一样，说明幻影准确复现了失败模式，结论可以外推。
+
+**机制**：`auto_brain_mask` 产出的全脑轮廓被当成 `moving_mask`。ANTs 的 `-x` 是"limit voxels considered by the metric"，一个采样点要计入必须映射后落在 moving mask 内。于是**图谱中样本尚未覆盖的那 35%，在目标函数里根本不存在**——没有任何一项要求样本长大，"缩在中间"和"撑开填满"得分一样好。
+
+**第二轮实验（更严苛的幻影：半脑图谱内侧切平贴边 + 样本压扁 + 人为偏移 + 四周 buffer，复刻 8-04 那个几何）**：
+
+| 配置 | 补缺口 | 质心偏差 |
+|---|---|---|
+| A. 全程有mask（现状） | **9%** | 0.14mm |
+| B. 全程无mask | 101% | 0.00mm |
+| C. 线性阶段有mask + SyN无mask | 64% | 0.06mm |
+| D. **带mask的Translation预对齐 + 主配准无mask** | **101%** | **0.00mm** |
+
+**C 只有 64% 这一条最有信息量**：说明受害的主要是 **Affine 阶段**而不是 SyN。Affine 自带缩放参数，61%→100% 的撑开本该由它一步完成；戴上 mask 后它不会去放大，全部工作被推给形变场——用形变场干缩放该干的活，事倍功半。这也回头解释了 8-07 那次纯 Affine 诊断为什么始终没撑开（那次也是全程带 mask）。
+
+**改动（采用 D）——把两种 mask 的角色分开**：
+- `register.py`：`register_to_atlas` 新增 `prealign_moving_mask` 参数，**只**喂给 Translation 预对齐，不进主配准；预对齐的触发条件相应改成 `mask is not None or prealign_mm is not None`。docstring 里写清了机制、实测数字，以及为什么"轮廓 mask"和"排除 mask"必须区别对待。
+- `pipeline.py`：`auto_brain_mask` 的产物不再并进 `sample_mask`，改走 `prealign_moving_mask`；日志新增 `prealign_mask=` 字段。
+- **有意保留的**：`sample_damage_mask_path`（手画裂缝）和 `atlas_exclude_regions`（缺失结构）仍走 `moving_mask`/`mask` 进主配准——它们排除的是**具体一小块**（damage mask 是"全 1 里擦掉一块"），不会像轮廓那样把未覆盖的图谱区域整片藏起来。**注意**：如果用户拿 `auto_brain_mask` 产物当 `paint_mask.py` 的 `EXISTING_MASK_PATH` 起点去画 damage mask，产出的又会是个轮廓，会重新触发这个问题。
+
+**验证结果**：
+1. 改后的 `register_to_atlas` 在严苛幻影上复跑：轮廓当 `moving_mask` 补缺口 12%/质心偏差 0.11mm → 当 `prealign_moving_mask` 补缺口 **101%**/质心偏差 **0.01mm**。
+2. `load_config('configs/s12t.yaml')` 正常；`test_pipeline_smoke.py` / `test_brain_mask_smoke.py` 通过。
+3. **没跑真实数据**（一次 1.5~3 小时），留给用户。
+
+**关于 `reg_iterations`**：加一层（`[200,100,70,50]`）在实验里把有 mask 的情况从 16% 提到 35%，有帮助但不解决问题；去掉 mask 后 3 层已经 100%。**建议下次真实跑先只改 mask 这一处、保持 `[100,70,50]`**，这样变量干净——好了就确知是 mask 的锅，还差再加层数。
+
+**顺带查实的事（用户本轮决定暂不处理）**：`atlas_exclude_regions: ["Olfactory bulb"]` 在 DevCCF 本体里命中 6 个 label（5 个嗅球分层规矩待在最前端 118~230，第 6 个 "OB olfactory fiber layer" 拖到 468——嗅束沿腹侧后行，解剖学上真实），共 3.69% 体素。**更重要的发现**：嗅球在图谱里占 118~230（2.2mm），而实测前端缺口只有 0.74mm，说明**配准已经把样本往前拽去填嗅球的空位**——warp 后样本前端边缘落在 142，正盖在嗅球地盘上约 1.8mm，即额叶皮层正在被贴上嗅球标签。形变问题解决后需要回来处理这个。
+
+**待修（本轮没动）**：`guide_regions` 分支的 Affine 调用仍然没有 Translation 预对齐、也没做这次的 mask 角色分离；真要用 guide_regions 之前得先补。
+
+**下一步**：用户把 `output_dir` 换个新目录（保住 0809 做对比），重跑 `./run_pipeline.sh configs/s12t.yaml`。跑完的 QC：`run.log` 里确认 `prealign_mask=True` 且 `sample_mask=False`；量 `1Warp.nii.gz` 的位移分位数（这次应该远超 0.4mm）；量 warp 后样本 vs atlas 的包围盒缺口（上下那 2.3mm 应该基本消失）。
+
+**追加（同日）：启用 `atlas_exclude_regions: ["Olfactory bulb"]` + 验证图谱侧排除 mask 的行为**
+
+用户决定把嗅球加进排除列表。改 `configs/s12t.yaml` 时发现文件里当时是 `atlas_exclude_regions: [""]` —— 又是 8-07 记录过的那个坑（空字符串是任何名字的子串，会把**整个图谱**排除掉、配准完全没有相似度信号）。一并改成 `["Olfactory bulb"]`，并在配置注释里显式标注这个坑（"不排除任何区域" 要写 `[]`）。
+
+**验证（合成幻影：图谱前端多一个"嗅球"、样本没有且压扁到 61%）**：
+
+| | 补缺口 | 样本前缘落点（图谱本体前缘 0.62mm） |
+|---|---|---|
+| 不排除嗅球 | 91% | 0.34mm |
+| 排除嗅球（atlas mask） | **95%** | 0.24mm |
+
+1. **主要风险已排除**：图谱侧的排除 mask **不会**像轮廓 mask 那样抑制撑开（91%→95%，反而略好）。机制上说得通——它排除的是一小块具体区域，不会把"未覆盖的图谱territory"整片藏起来。**配置可以放心用。**
+2. 顺带印证：这个幻影用 `[100,70,50]` 三层就撑开了 91~95%，支持"去掉轮廓 mask 后 `reg_iterations` 保持不动"的判断。
+3. **但排除嗅球并没有阻止样本被推进嗅球地盘**（前缘 0.34→0.24mm，反而更靠前）。**mask 的语义是"这块不计分"，不是"这块不许进"**——被排除的区域没有数据项，SyN 的形变场只是从邻近（正在扩张的）区域平滑外推过去，没有力量把组织推回来。排除真正买到的是"额叶皮层的强度不再被拿去和嗅球强度做匹配"，改善的是内部对应关系，不是外轮廓边界。
+4. **这个测试没能回答"标签错配改善了多少"**：幻影的嗅球只有 0.62mm（真实是 2.2mm），且"前缘位置"测的是外轮廓、测不出内部对应关系。留给真实跑完看。
+
+**真实跑完新增一条 QC**：打开 `labels_in_sample.nii.gz` 看额叶最前端还挂不挂着嗅球标签。如果还有，说明仅"排除出计分"不够，需要更强手段（比如用 `atlas.slicing` 把图谱在嗅球处直接裁掉，而不只是 mask 掉）。
+
+**追加（同日）：0810 正式跑之前的配置定版 + 预检**
+
+改完代码后做了一次跑前预检（一次真实跑 1.5~3 小时，可检查的东西不该留到运行时才炸）。查出唯一的拦路项：`output_dir` 还指着 `DevCCF_0809`（已有 8 个文件），直接跑会覆盖掉上一次的结果——而那正是这次要对比的基线（位移中位数 19µm / 上下缺口 2.3mm）；`run.log` 又是 tee 追加写的，新旧日志还会混在同一个文件里。用户已把 `output_dir` 改成 `DevCCF_0810`，0809 保留作基线。
+
+**这次跑的配置定版**（`configs/s12t.yaml`，其余项预检全绿：raw_tiff / 三个图谱文件都在，cells 已配置所以步骤 6 会跑）：
+
+| 项 | 值 | 备注 |
+|---|---|---|
+| `type_of_transform` | `SyNRA` | |
+| `syn_sampling` | 4 | CC 邻域半径，8-08 改的 |
+| `reg_iterations` | `[100, 70, 50]` | **有意保持三层不变**——去掉轮廓 mask 后三层已够（幻影 91~95%），这样变量干净 |
+| `mask.auto_brain_mask` | `true` | 配置不用改，代码侧已自动改走 `prealign_moving_mask` 通道 |
+| `mask.atlas_exclude_regions` | `["Olfactory bulb"]` | 本轮新启用 |
+| `mask.sample_damage_mask_path` | 未配置 | |
+| `crop_for_registration` | x[440,1790] y[50,3977] z[20,157] | 原始 TIFF 体素序号 |
+| atlas | DevCCF P04 20µm, orientation `[1,-3,2]`, slicing `[[320,640],null,null]` | 右半球 |
+
+**本轮同时改了两处**（mask 角色分离 + 嗅球排除）。前者是决定性的、幻影验证充分（12%→101%）；后者影响较小且方向明确。**如果结果仍不理想，主要怀疑对象是形变量本身，不是嗅球那一项。**
+
+**跑完的 QC 清单**：
+1. `run.log` 里确认 `prealign_mask=True, sample_mask=False, atlas_mask=True`（这是本次改动是否生效的直接证据）
+2. 量 `1Warp.nii.gz` 的位移分位数 —— 0809 是中位数 19µm / 90分位 100µm / 最大 392µm，这次应有数量级变化
+3. 量 warp 后样本 vs 图谱的包围盒 —— 上下那 2.3mm 缺口应基本消失
+4. `labels_in_sample.nii.gz` 里额叶最前端还挂不挂着嗅球标签（见上一条追加里 "mask 不是一堵墙" 的说明）
+
+**顺带发现（没动）**：`configs/s12t.yaml` 里 `atlas_variants.devccf_p04` 上方那段注释还停留在 8-06 跑 Affine-only 诊断的时期（"确认 Affine 效果之后把 type_of_transform 改回 SyNRA、output_dir 改回 DevCCF_ver2_0804 再正式跑"），跟现在的状态已经对不上了，容易误导以后翻配置的人。没有替用户改，留作提醒。
