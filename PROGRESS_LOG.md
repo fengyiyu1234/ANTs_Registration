@@ -759,3 +759,48 @@ syn_sampling : scalar
 4. `labels_in_sample.nii.gz` 里额叶最前端还挂不挂着嗅球标签（见上一条追加里 "mask 不是一堵墙" 的说明）
 
 **顺带发现（没动）**：`configs/s12t.yaml` 里 `atlas_variants.devccf_p04` 上方那段注释还停留在 8-06 跑 Affine-only 诊断的时期（"确认 Affine 效果之后把 type_of_transform 改回 SyNRA、output_dir 改回 DevCCF_ver2_0804 再正式跑"），跟现在的状态已经对不上了，容易误导以后翻配置的人。没有替用户改，留作提醒。
+
+---
+
+## 2026-08-10（续）：0810 真实结果 QC —— mask 修复救回了 Affine，SyN 仍不动；接入 landmark 初始形变场
+
+**0810 QC 结果**（对比 0809，两次唯一差别是 mask 角色分离 + 嗅球排除）：
+
+改动确认生效：`run.log` 里 `atlas_mask=True, sample_mask=False, prealign_mask=True`，嗅球排除 482734 体素，命令行 `CC[...,1,4] --convergence [100x70x50,...]` 全对。register 步骤 2:13:05。
+
+| 指标 | 0809 | 0810 |
+|---|---|---|
+| 图谱悬空占比 | 34.9% | **25.0%** ✓ |
+| 左右缺口(内侧) | +0.66mm | **+0.14mm** ✓ |
+| 前后缺口 | 0.74 / 0.72mm | 0.46 / 0.76mm |
+| 上下缺口(腹侧) | +1.66mm | +1.56mm ✗ |
+| **SyN 位移** 中位/90分位/最大 | 19/100/392µm | **20/95/380µm** ✗ |
+
+**结论：全局对齐（Affine）明显改善，SyN 的局部形变量一字未动。** 用户目视也确认"中线挪过来了"，但图 3 那种扭曲区域、海马边缘仍然没对齐。
+
+这跟幻影实验的差异说明了问题的性质：幻影里两边强度纹理完全对应，去掉 mask 后 SyN 能补完剩余缺口；真实数据在扭曲区/海马边缘**强度信息本身就建立不起对应关系**。参数只能让优化器"看得见、走得快"，不能替它回答"这块该对到哪"。**参数路线的收益已经吃完**（CC 半径、金字塔、mask 角色、嗅球排除四项全部生效且验证过），符合之前定的判据：升级到 landmark。
+
+（用户猜测中线附近可能有半球切割损失。数据部分支持：内侧缺口已降到 0.14mm，说明整体切割损失不大；但局部扭曲区完全可能是局部缺损+扭曲叠加，全局数字看不出来——而这正是 landmark 能编码的信息。）
+
+**分工**：交互式标点工具归 `/home/fyu7/My_project/Registration_toolkit`（用户在那边用 Claude Code 写 `fit_initial_transform.py`，prompt 已给，含本轮实测出的方向语义/双向场/坑）；本仓库负责 pipeline 侧接入。
+
+**新增代码（本仓库）**：
+- `register.py`：`register_to_atlas` 加 `initial_transform` / `initial_inverse` 参数。给了 `initial_transform` 就**跳过** Translation 预对齐（`ants.registration` 只接受一个 initial_transform，且 landmark 场已经同时确定了位姿和粗形变）。
+- `register.py` 新增 `_repair_invtransforms_for_initial()`，修**两个都是静默的**问题：
+  1. **ANTs 无法给 `-r` 传入的形变场求逆**，初始形变在 `invtransforms` 里直接缺席 → 所有 atlas→sample 产物系统性偏移。实测：缺这一环 atlas→sample Dice 0.86，补上（用同一批点交换角色再拟合的反向场，放在列表**最前面**，因为 ANTs 的变换列表是从后往前作用的）0.99。
+  2. **antspyx 自己的列表构建对这种文件布局是错的**：它 glob 后只丢弃**一个**正向 warp（`idx != findfwd[0]`），而有初始变换时磁盘上有两个（`0Warp` 初始场 + `2Warp` SyN 结果），于是 **SyN 的正向 warp 被留在了 invtransforms 里**。复现 antspyx 的 glob 逻辑验证过：返回的是 `[1GenericAffine.mat, 2InverseWarp.nii.gz, 2Warp.nii.gz]`。`fwdtransforms` 不受影响（重放对比 `warpedmovout` 最大差 0.0，已验证正确）。
+  - 同时把反向场复制成 `{prefix}0InverseWarp.nii.gz`（**在 registration 返回之后才复制**——调用期间多一个 `*InverseWarp` 文件会改变 antspyx 自己的 glob 结果）。
+- `transforms.load_saved_transforms()`：认两种文件布局（有无初始变换时 ANTs 的 stage 编号整体后移一位），否则 `registration_eval.py` 会静默拿错变换。
+- `config.py`：`registration.initial_transform` 块校验，**`inverse_path` 强制必填**（缺了不是报错而是静默算错，所以挡在配置阶段）。
+- `pipeline.py`：透传 + 日志新增 `initial_transform=` 字段。
+- `configs/config.example.yaml`：补配置示例和说明（默认注释掉）。
+
+**验证结果**（合成幻影，样本沿一轴压到 0.65，27 个点对按解析映射生成）：
+1. `fwdtransforms = [2Warp, 1GenericAffine, 0Warp]`、`invtransforms = [0InverseWarp, 1GenericAffine, 2InverseWarp]`（修复后）。
+2. 正向 sample→atlas Dice **0.993**（未配准 0.785）；反向 atlas→sample Dice **0.990**。
+3. `load_saved_transforms` 重建的两个列表与 live 返回**完全一致**，用它重放反向 Dice 同为 0.990。
+4. `test_pipeline_smoke` / `test_brain_mask_smoke` / `test_label_correction_smoke` 全过；`load_config('configs/s12t.yaml')` 正常且 `initial_transform=None`（未启用的样本完全不受影响）。
+
+**已实测记录的关键事实**（给上游脚本用）：`ants.fit_transform_to_paired_points(moving_pts, fixed_pts)` 返回的是**重采样方向**（apply 到 fixed 空间点得到 moving 空间对应点；已知形变幻影上 apply(fixed点) 距 moving 对应点 5.8µm、距原点 106µm），可直接当 `initial_transform`，**不需要反转**。
+
+**下一步**：用户在 Registration_toolkit 写完 `fit_initial_transform.py` → 用 `place_landmarks.py` 标两份 CSV（样本侧 + 图谱侧，**同一批解剖位置同一顺序**；图谱侧必须标在转向裁剪后的缓存图谱 `P04_LSFM_20um_1_-3_2__320-640_full_full.nii.gz` 上，不能用原始 DevCCF 文件）→ 跑脚本出两个场 → config 填 `registration.initial_transform` 两行 → 重跑。标点重点覆盖：扭曲区、海马轮廓、腹侧（1.56mm 缺口所在）、疑似中线缺损区；另留 5~8 个点**不参与驱动**，只给 `registration_eval.py` 算 TRE（拿驱动点评估自己是循环论证）。

@@ -129,6 +129,20 @@ def load_config(path):
     if not isinstance(config["registration"]["syn_sampling"], int) or config["registration"]["syn_sampling"] < 1:
         raise ValueError("registration.syn_sampling must be a positive integer (CC neighborhood radius in voxels)")
 
+    init_cfg = config["registration"].get("initial_transform")
+    if init_cfg:
+        for key in ("path", "inverse_path"):
+            # inverse_path is NOT optional: ANTs cannot invert a displacement
+            # field it was handed, so an initial transform without its matching
+            # inverse silently corrupts every atlas->sample product
+            # (labels_in_sample, cell region assignment) rather than failing.
+            if not init_cfg.get(key):
+                raise ValueError(
+                    f"registration.initial_transform.{key} is required when initial_transform is set "
+                    "(scripts/fit_initial_transform.py writes both files)")
+            if not Path(init_cfg[key]).exists():
+                raise FileNotFoundError(f"registration.initial_transform.{key} not found: {init_cfg[key]}")
+
     crop_cfg = config["registration"].get("crop_for_registration")
     if crop_cfg:
         for axis in ("x", "y", "z"):

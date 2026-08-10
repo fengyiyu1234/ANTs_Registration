@@ -110,13 +110,29 @@ def load_saved_transforms(transforms_prefix):
     guide_regions branch) -- check the actual files written for that
     outprefix before trusting this helper for such a sample.
     """
-    affine = f"{transforms_prefix}0GenericAffine.mat"
-    warp = f"{transforms_prefix}1Warp.nii.gz"
-    inverse_warp = f"{transforms_prefix}1InverseWarp.nii.gz"
-    for f in (affine, warp, inverse_warp):
+    # Two possible layouts, distinguished by whether registration ran with a
+    # landmark-derived initial_transform (registration.initial_transform in
+    # config). With one, ANTs shifts every stage index up by one and writes
+    # the initial field as stage 0; register_to_atlas additionally stages the
+    # matching inverse field as {prefix}0InverseWarp.nii.gz precisely so this
+    # function can rebuild the same chain it returned live.
+    init_fwd = f"{transforms_prefix}0Warp.nii.gz"
+    init_inv = f"{transforms_prefix}0InverseWarp.nii.gz"
+    if Path(init_fwd).exists():
+        affine = f"{transforms_prefix}1GenericAffine.mat"
+        warp = f"{transforms_prefix}2Warp.nii.gz"
+        inverse_warp = f"{transforms_prefix}2InverseWarp.nii.gz"
+        required = (init_fwd, init_inv, affine, warp, inverse_warp)
+        fwd = [warp, affine, init_fwd]
+        inv = [init_inv, affine, inverse_warp]
+    else:
+        affine = f"{transforms_prefix}0GenericAffine.mat"
+        warp = f"{transforms_prefix}1Warp.nii.gz"
+        inverse_warp = f"{transforms_prefix}1InverseWarp.nii.gz"
+        required = (affine, warp, inverse_warp)
+        fwd = [warp, affine]
+        inv = [affine, inverse_warp]
+    for f in required:
         if not Path(f).exists():
             raise FileNotFoundError(f"Expected transform file not found: {f}")
-    return {
-        "fwdtransforms": [warp, affine],
-        "invtransforms": [affine, inverse_warp],
-    }
+    return {"fwdtransforms": fwd, "invtransforms": inv}

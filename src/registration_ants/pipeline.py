@@ -217,11 +217,15 @@ def run_pipeline(config_path):
         logger.info("Loaded %d guide region(s): %s", len(guide_regions),
                     [gr["sample_outline_path"] for gr in mask_cfg["guide_regions"]])
 
+    init_cfg = reg_cfg.get("initial_transform") or {}
+    initial_transform = init_cfg.get("path")
+    initial_inverse = init_cfg.get("inverse_path")
     logger.info("Registration params: type_of_transform=%s, atlas_mask=%s, "
-                "sample_mask=%s, prealign_mask=%s, guide_regions=%d, "
-                "syn_sampling(CC radius)=%d, reg_iterations=%s, outprefix=%s",
+                "sample_mask=%s, prealign_mask=%s, initial_transform=%s, "
+                "guide_regions=%d, syn_sampling(CC radius)=%d, reg_iterations=%s, outprefix=%s",
                 reg_cfg["type_of_transform"], atlas_mask is not None, sample_mask is not None,
-                prealign_moving_mask is not None, len(guide_regions or []),
+                prealign_moving_mask is not None, initial_transform or "none(auto prealign)",
+                len(guide_regions or []),
                 reg_cfg["syn_sampling"], reg_cfg["reg_iterations"], transforms_prefix)
     reg = register.register_to_atlas(
         sample_fine_prep, atlas_template, atlas_annotation, atlas_structures,
@@ -229,6 +233,7 @@ def run_pipeline(config_path):
         mask=atlas_mask, moving_mask=sample_mask, guide_regions=guide_regions,
         syn_sampling=reg_cfg["syn_sampling"], reg_iterations=reg_cfg["reg_iterations"],
         prealign_moving_mask=prealign_moving_mask,
+        initial_transform=initial_transform, initial_inverse=initial_inverse,
     )
 
     logger.info("Registration complete: fwdtransforms=%s, invtransforms=%s",

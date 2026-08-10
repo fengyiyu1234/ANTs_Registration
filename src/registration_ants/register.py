@@ -1,13 +1,62 @@
 """Registration to the Allen CCF: one-shot SyNRA."""
+import re
+import shutil
+from pathlib import Path
+
 import ants
 
 from .atlas_utils import get_allen_atlas
+
+_FWD_WARP_RE = re.compile(r"\d+Warp\.nii\.gz$")
+
+
+def _repair_invtransforms_for_initial(reg, initial_inverse, outprefix):
+    """Rebuild reg['invtransforms'] when an external initial_transform field
+    was used. Mutates reg in place.
+
+    Two separate problems, both silent:
+
+    1. ANTs cannot invert a displacement field handed to it via -r, so the
+       initial deformation is simply absent from invtransforms. Everything
+       atlas->sample (labels_in_sample, cell region assignment) would then
+       apply only the Affine+SyN part and land systematically off. Measured
+       on a phantom: atlas->sample Dice 0.86 with the link missing vs 0.99
+       with the separately-fitted inverse field in front. Hence
+       fit_initial_transform.py always emits a matching inverse field, and
+       it belongs at the FRONT of invtransforms (ANTs applies a transform
+       list back-to-front, so the initial deformation must be undone last).
+
+    2. antspyx's own list-building is wrong for this file layout. It globs
+       the outprefix and drops exactly ONE forward-warp entry from
+       invtransforms (`idx != findfwd[0]`), but with an initial transform
+       there are two forward warps on disk -- {prefix}0Warp.nii.gz (the
+       initial field, which ANTs re-writes as stage 0) and
+       {prefix}2Warp.nii.gz (the SyN result). Only the first is dropped, so
+       the SyN FORWARD warp is left sitting in invtransforms. Verified by
+       replaying antspyx's glob logic on a real 3-transform output:
+       invtransforms came back as [1GenericAffine.mat, 2InverseWarp.nii.gz,
+       2Warp.nii.gz]. fwdtransforms is unaffected and was verified correct
+       by exact replay against warpedmovout (max diff 0.0).
+
+    Also copies the inverse field next to the other transforms as
+    {prefix}0InverseWarp.nii.gz so transforms.load_saved_transforms() can
+    reconstruct the same chain later from disk alone. Done after
+    ants.registration() returns, never before -- an extra *InverseWarp file
+    present during the call would change antspyx's own glob result.
+    """
+    kept = [t for t in reg["invtransforms"] if not _FWD_WARP_RE.search(str(t))]
+    if outprefix:
+        staged = f"{outprefix}0InverseWarp.nii.gz"
+        if Path(initial_inverse).resolve() != Path(staged).resolve():
+            shutil.copyfile(initial_inverse, staged)
+        initial_inverse = staged
+    reg["invtransforms"] = [initial_inverse] + kept
 
 
 def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_structures=None,
                        type_of_transform="SyNRA", outprefix="", verbose=True, mask=None, moving_mask=None,
                        guide_regions=None, syn_sampling=4, reg_iterations=(100, 70, 50),
-                       prealign_moving_mask=None):
+                       prealign_moving_mask=None, initial_transform=None, initial_inverse=None):
     """Register a preprocessed, isotropic sample image to an already-loaded
     atlas template/annotation (from either get_allen_atlas or
     atlas_utils.load_custom_atlas — this function doesn't care which).
@@ -59,6 +108,19 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     structures via atlas_utils.build_region_exclusion_mask, tears via a
     hand-painted damage mask); those exclude a specific region rather than
     hiding all not-yet-covered territory, so they do not have this effect.
+
+    initial_transform / initial_inverse: paths to a matched pair of
+    displacement fields produced by scripts/fit_initial_transform.py from
+    hand-placed landmark pairs -- for the case parameter tuning cannot
+    reach, where the intensity metric has no way to establish
+    correspondence at all (tissue distorted past recognition, a structure's
+    boundary that simply is not visible in the sample). The forward field
+    replaces the Translation pre-alignment as the starting pose AND
+    starting deformation, so Affine/SyN refine from something anatomically
+    informed rather than from a rigid guess. initial_inverse is not
+    optional when initial_transform is used: ANTs cannot invert a field it
+    was handed, so without it every atlas->sample product is silently wrong
+    -- see _repair_invtransforms_for_initial for the measurements.
 
     Whenever mask or the pre-alignment mask is given (outside the
     guide_regions branch), a coarse mask-constrained Translation pass runs
@@ -130,9 +192,14 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             multivariate_extras=extras,
         )
     else:
-        initial_transform = None
         prealign_mm = prealign_moving_mask if prealign_moving_mask is not None else moving_mask
-        if mask is not None or prealign_mm is not None:
+        if initial_transform is not None:
+            # A landmark-derived field already fixes both position and gross
+            # shape, and ants.registration() takes only one initial_transform,
+            # so the Translation pre-alignment below would have nothing to add
+            # and nowhere to go.
+            pass
+        elif mask is not None or prealign_mm is not None:
             # ANTs' own default initializer (used whenever initial_transform
             # is left unset) aligns whole-image intensity centroids WITHOUT
             # respecting mask/moving_mask -- fine when sample and atlas have
@@ -179,6 +246,8 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             # extent.
             mask_all_stages=True,
         )
+        if initial_inverse is not None:
+            _repair_invtransforms_for_initial(reg, initial_inverse, outprefix)
     reg["atlas_template"] = atlas_template
     reg["atlas_annotation"] = atlas_annotation
     reg["atlas_structures"] = atlas_structures

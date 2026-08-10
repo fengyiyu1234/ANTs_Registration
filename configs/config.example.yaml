@@ -44,6 +44,17 @@ atlas_variants:
 registration:
   type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
 
+  # 【可选】手动 landmark 生成的初始形变场 —— 参数调不动的情况才用：样本形变
+  # 到强度 metric 根本建立不起对应关系时（组织扭曲、结构边界在样本里看不出来）。
+  # 两个文件由 Registration_toolkit/fit_initial_transform.py 从两份 landmark
+  # CSV（样本侧+图谱侧，同一批位置同一顺序）生成。
+  # 给了之后：跳过自动的 Translation 预对齐，Affine/SyN 从这个形变场接着优化。
+  # inverse_path 【必填】不是可选 —— ANTs 无法给外部传入的形变场求逆，缺了它
+  # 所有 atlas→sample 的产物（labels_in_sample、细胞脑区分配）会静默算错而不报错。
+  # initial_transform:
+  #   path: /path/to/transforms/tsc12t_landmark_init_fwd.nii.gz
+  #   inverse_path: /path/to/transforms/tsc12t_landmark_init_inv.nii.gz
+
   # SyN 阶段 CC 相似度的【邻域半径】，单位是体素（不是直方图 bin 数——antspyx
   # 的 syn_sampling 一个参数两种含义，默认值 32 是给 mattes 的 bin 数，当成
   # CC 半径用就是 65^3 个体素的窗口，局部结构全被平均掉、SyN 只剩全局位移，
