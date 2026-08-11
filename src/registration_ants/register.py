@@ -122,10 +122,9 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     was handed, so without it every atlas->sample product is silently wrong
     -- see _repair_invtransforms_for_initial for the measurements.
 
-    Whenever mask or the pre-alignment mask is given (outside the
-    guide_regions branch), a coarse mask-constrained Translation pass runs
-    first and its result is fed in as initial_transform for the main
-    type_of_transform call below --
+    Whenever mask or the pre-alignment mask is given, a coarse
+    mask-constrained Translation pass runs first and its result is fed in as
+    initial_transform for the main registration (both branches) --
     see the inline comment where it's built for why (ANTs' own default
     initializer ignores these masks, which can land the optimizer nowhere
     near the true alignment for oddly-shaped mask pairs, e.g. a
@@ -169,8 +168,25 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     below ANTs' 1e-7 threshold.
     """
     if guide_regions:
+        # Same initialization story as the plain branch below: without an
+        # explicit starting transform ANTs falls back to a centre-of-mass
+        # guess that ignores masks entirely, which lands badly for a
+        # hemisphere atlas against a buffered sample. And the silhouette mask
+        # belongs on this pre-alignment only, never on the Affine -- a masked
+        # Affine will not scale the sample up to fill the atlas (measured:
+        # 9% of the missing extent recovered vs 101%), which for a squashed
+        # sample is exactly the work the Affine should be doing.
+        prealign_mm = prealign_moving_mask if prealign_moving_mask is not None else moving_mask
+        affine_init = initial_transform
+        if affine_init is None and (mask is not None or prealign_mm is not None):
+            affine_init = ants.registration(
+                fixed=atlas_template, moving=sample_img, type_of_transform="Translation",
+                aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=prealign_mm,
+                mask_all_stages=True,
+            )["fwdtransforms"][0]
         reg_affine = ants.registration(
             fixed=atlas_template, moving=sample_img, type_of_transform="Affine",
+            initial_transform=affine_init,
             aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=moving_mask,
             mask_all_stages=True,
         )
