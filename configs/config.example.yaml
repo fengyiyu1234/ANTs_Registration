@@ -82,6 +82,40 @@ mask:
   # atlas_exclude_regions: ["Olfactory bulb"]
   atlas_exclude_regions: []
 
+  # 【可选】区域引导：主动把样本上某几块组织拉去和图谱对应区域重合。跟上面的
+  # exclude 相反 —— exclude 是"这块别管了"，guide 是"这块给我拉过去"。用于
+  # 组织确实存在、但形变大到强度 metric 找不到对应关系的地方。
+  #
+  # 【只画样本侧】：图谱侧按名字从标注文件自动抠出来，不用画第二遍。
+  # regions_mask 是 Registration_toolkit/paint_mask.py（kind=guide）画出的
+  # 多 label 文件 —— 一个文件里若干脑区，用不同画笔数字区分。
+  # guide_regions:
+  #   regions_mask: /path/to/s12t_regions.nii.gz
+  #   # 必填：在原始 TIFF 上画的 mask，文件头里【没有】体素尺寸（读回来是
+  #   # 1,1,1），必须在这里显式给，顺序同 sample.voxel_size_um。
+  #   voxel_size_um: [2.6, 2.6, 32.0]
+  #   # 画笔 label -> 图谱区域名。子串匹配、大小写不敏感、子结构自动包含、
+  #   # 多个名字取并集（DevCCF 没有单一的 "cortex"，只有 36 个分层，所以
+  #   # 必须这样并起来）。一个名字都匹配不到会【直接报错】，不会静默跳过。
+  #   atlas_names:
+  #     1: ["layer 1 of", "layer 2 of", "layer 3 of",
+  #         "layer 4 of", "layer 5 of", "layer 6 of"]   # cortex
+  #     2: ["cerebellar hemisphere", "cerebellar vermis"]
+  #     3: ["corpus callosum"]
+  #   weight: 1.0        # 单值，或 {1: 1.0, 2: 0.5} 按 label 分别给
+  #
+  # 关键层间隔按结构选（实测 Dice：形状连续的大结构每 20 层够用，细长/弯曲的
+  # 会崩）：cortex 每 20 层 0.82、cerebellum 每 20 层 0.90，但 corpus callosum
+  # 每 20 层只有 0.40、dentate gyrus 0.36 —— 后两者要每 10 层。
+  # 小于 1mm^3 的结构不建议用作引导：手圈的边界误差占比太大，而系统性偏大/
+  # 偏小会主动把形变往错误方向拽，比不加引导更糟。
+  #
+  # 旧的一区一对文件写法仍然支持（图谱侧也手画，用于没有对应本体名字的区域）：
+  # guide_regions:
+  #   - atlas_outline_path: /path/to/atlas_side.nii.gz
+  #     sample_outline_path: /path/to/sample_side.nii.gz
+  #     weight: 1.0
+
   # potential mask for samples:
 
   # auto_brain_mask:

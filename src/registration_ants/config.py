@@ -196,8 +196,76 @@ def load_config(path):
         raise ValueError("mask.auto_brain_mask must be true/false or a dict of generate_brain_mask overrides "
                           "(sigma/closing_radius/dilate_radius/slice_axis)")
 
-    if mask_cfg.get("guide_regions"):
-        for i, gr in enumerate(mask_cfg["guide_regions"]):
+    guide_cfg = mask_cfg.get("guide_regions")
+    if isinstance(guide_cfg, dict):
+        # Multi-region form: one hand-painted multi-label volume for the
+        # sample side, atlas side pulled from the annotation by ontology id
+        # (atlas_ids, what paint_mask.py's region picker exports) or by name
+        # (atlas_names). The older list form (one hand-painted file per side)
+        # is still accepted below for regions no ontology entry can express.
+        for required in ("regions_mask", "voxel_size_um"):
+            if required not in guide_cfg:
+                raise ValueError(f"mask.guide_regions.{required} is required")
+        if not guide_cfg.get("atlas_ids") and not guide_cfg.get("atlas_names"):
+            raise ValueError("mask.guide_regions needs atlas_ids or atlas_names (atlas_ids preferred -- "
+                             "ids are matched exactly, names are substring-matched and can pull in "
+                             "unrelated structures; paint_mask.py writes ids into <output>.regions.json)")
+        if not Path(guide_cfg["regions_mask"]).exists():
+            raise FileNotFoundError(f"mask.guide_regions.regions_mask not found: {guide_cfg['regions_mask']}")
+        if len(guide_cfg["voxel_size_um"]) != 3:
+            raise ValueError("mask.guide_regions.voxel_size_um must be [x, y, z] in microns "
+                             "-- required because a mask painted on a raw TIFF carries no "
+                             "spacing in its header (it reads back as 1,1,1)")
+
+        def _normalize_label_map(key, coerce, describe):
+            """{label: [entry, ...]} with int labels, or {} if the key is absent.
+            A bare scalar value is accepted as a one-element list -- writing
+            `1: cortex` instead of `1: [cortex]` is the obvious spelling and
+            both YAML forms look identical at a glance."""
+            raw = guide_cfg.get(key)
+            if not raw:
+                return {}
+            if not isinstance(raw, dict):
+                raise ValueError(f"mask.guide_regions.{key} must be a non-empty {{label: {describe}}} map")
+            normalized = {}
+            for raw_label, entries in raw.items():
+                try:
+                    label = int(raw_label)
+                except (TypeError, ValueError):
+                    raise ValueError(f"mask.guide_regions.{key} key must be a paint label (integer), "
+                                     f"got {raw_label!r}") from None
+                if label < 1:
+                    raise ValueError(f"mask.guide_regions.{key} label must be >= 1 (0 is background), "
+                                     f"got {label}")
+                if isinstance(entries, (str, int)):
+                    entries = [entries]
+                try:
+                    entries = [coerce(e) for e in entries]
+                except (TypeError, ValueError):
+                    raise ValueError(f"mask.guide_regions.{key}[{label}] must be a non-empty list of "
+                                     f"{describe}") from None
+                if not entries:
+                    raise ValueError(f"mask.guide_regions.{key}[{label}] must be a non-empty list of "
+                                     f"{describe}")
+                normalized[label] = entries
+            return normalized
+
+        def _region_name(value):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(value)
+            return value
+
+        guide_cfg["atlas_ids"] = _normalize_label_map(
+            "atlas_ids", int, "ontology structure ids (integers, descendants included)")
+        guide_cfg["atlas_names"] = _normalize_label_map(
+            "atlas_names", _region_name, "atlas region names (substring-matched against the ontology)")
+        weight = guide_cfg.get("weight", 1.0)
+        if isinstance(weight, dict):
+            guide_cfg["weight"] = {int(k): float(v) for k, v in weight.items()}
+        else:
+            guide_cfg["weight"] = float(weight)
+    elif guide_cfg:
+        for i, gr in enumerate(guide_cfg):
             for required in ("atlas_outline_path", "sample_outline_path"):
                 if required not in gr:
                     raise ValueError(f"mask.guide_regions[{i}].{required} is required")

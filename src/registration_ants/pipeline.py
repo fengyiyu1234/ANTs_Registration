@@ -24,6 +24,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import ants
+import numpy as np
 
 from . import atlas_utils, brain_mask, cell_points, io_utils, preprocess, register, transforms
 from .config import load_config
@@ -65,6 +66,98 @@ def _preprocess(img, prep_cfg):
         return preprocess.preprocess_for_registration(img, lo, hi)
     logger.info("Preprocessing: intensity clip_and_normalize percentiles=(%s, %s), input shape=%s", lo, hi, img.shape)
     return preprocess.clip_and_normalize(img, lo, hi)
+
+
+def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, atlas_structures):
+    """(atlas_region_img, sample_region_img, weight) triples from ONE
+    hand-painted multi-label volume plus atlas region names.
+
+    Only the sample side is drawn by hand; the atlas side comes out of the
+    annotation, so a region never has to be painted twice.
+
+    The atlas side is resolved by structure ID when `atlas_ids` is given
+    (what paint_mask.py's ontology picker writes, alongside the names, into
+    <output>.regions.json), and by substring-matched NAME otherwise. Prefer
+    ids: name matching is a substring match, so it can quietly pull in an
+    unrelated structure that merely contains the target as a substring --
+    "Cerebellum" also matches "cerebellum related fiber tracts", a different
+    top-level branch worth ~22% of Cerebellum's true descendant-voxel count
+    (measured; see atlas_utils.region_mask_by_exact_name). With ids, the
+    region paired here is exactly the one that was highlighted in the GUI
+    while painting. `atlas_names` stays supported for hand-written configs
+    and is the only option when there is no ontology id to hand.
+
+    The painted volume lives on the RAW tiff's grid (that is the only grid
+    where the structures are still resolvable by eye -- the isotropic
+    resample throws away ~8x of the in-plane detail), and it carries no
+    spacing in its header, so spacing is rebuilt from config and the volume
+    is resampled onto whatever grid registration actually runs on. Physical
+    space is shared across all of these (origin 0, spacing = microns,
+    cropping only shifts origin), so the resample is a pure regrid.
+    """
+    regions = io_utils.load_nifti_stack_as_ants(guide_cfg["regions_mask"], guide_cfg["voxel_size_um"])
+    if regions.shape != sample_ref.shape:
+        regions = ants.resample_image_to_target(regions, sample_ref, interp_type="genericLabel")
+    regions_arr = np.rint(regions.numpy()).astype(np.int32)
+    painted = {int(v) for v in np.unique(regions_arr) if v != 0}
+
+    # atlas_ids wins per-label where both are given, so a config can carry the
+    # ids paint_mask.py exported for the regions it painted and still fall back
+    # to hand-written names for anything added by hand afterwards.
+    ids_cfg = guide_cfg.get("atlas_ids") or {}
+    names_cfg = guide_cfg.get("atlas_names") or {}
+    configured = sorted(set(ids_cfg) | set(names_cfg))
+
+    unconfigured = painted - set(configured)
+    if unconfigured:
+        raise ValueError(
+            f"mask.guide_regions.regions_mask contains painted label(s) {sorted(unconfigured)} with no "
+            "atlas_ids/atlas_names entry -- they would be silently ignored. Add them, or remove them "
+            "from the mask.")
+
+    annotation_arr = atlas_annotation.numpy()
+    weight_cfg = guide_cfg["weight"]
+    out = []
+    for label in configured:
+        if label in ids_cfg:
+            source = f"atlas_ids[{label}] = {ids_cfg[label]}"
+            atlas_arr, matched = atlas_utils.build_region_inclusion_mask_by_ids(
+                annotation_arr, atlas_structures, ids_cfg[label])
+        else:
+            source = f"atlas_names[{label}] = {names_cfg[label]}"
+            atlas_arr, matched = atlas_utils.build_region_inclusion_mask(
+                annotation_arr, atlas_structures, names_cfg[label])
+        if not matched:
+            # Matching that hits nothing yields an all-False mask and no error;
+            # the registration would then run with a guide term that can never
+            # be satisfied. Refuse instead. (An unknown *id* has already raised
+            # inside descendant_ids_of by this point -- this is the case where
+            # the structure is real but simply has no voxels in this
+            # annotation, which is common: the DevCCF P04 annotation carries
+            # 193 of the ontology's 2552 structures.)
+            raise ValueError(
+                f"mask.guide_regions.{source} matched no structure present in this atlas annotation. "
+                "Names are case-insensitive substrings of ontology names (descendants included); ids "
+                "are matched exactly, descendants included -- check against the atlas ontology.")
+        sample_arr = regions_arr == label
+        if not sample_arr.any():
+            raise ValueError(
+                f"mask.guide_regions.{source} is configured but nothing is painted with "
+                f"label {label} in {guide_cfg['regions_mask']}.")
+        weight = weight_cfg.get(label, 1.0) if isinstance(weight_cfg, dict) else weight_cfg
+        logger.info("Guide region label %d (%s): sample %d voxels, atlas %d voxels from %d structure(s) "
+                    "(%s), weight=%.2f",
+                    label, source, int(sample_arr.sum()), int(atlas_arr.sum()), len(matched),
+                    ", ".join(f"{n} ({c})" for n, c in sorted(matched.items(), key=lambda kv: -kv[1])[:6]),
+                    weight)
+        out.append((
+            ants.from_numpy(atlas_arr.astype("float32"), spacing=atlas_annotation.spacing,
+                            origin=atlas_annotation.origin, direction=atlas_annotation.direction),
+            ants.from_numpy(sample_arr.astype("float32"), spacing=sample_ref.spacing,
+                            origin=sample_ref.origin, direction=sample_ref.direction),
+            weight,
+        ))
+    return out
 
 
 def run_pipeline(config_path):
@@ -208,14 +301,18 @@ def run_pipeline(config_path):
         prealign_moving_mask = auto_mask_img
 
     guide_regions = None
-    if mask_cfg.get("guide_regions"):
+    guide_cfg = mask_cfg.get("guide_regions")
+    if isinstance(guide_cfg, dict):
+        guide_regions = _build_guide_regions_from_labels(
+            guide_cfg, sample_fine_prep, atlas_annotation, atlas_structures)
+    elif guide_cfg:
         guide_regions = []
-        for gr in mask_cfg["guide_regions"]:
+        for gr in guide_cfg:
             atlas_outline = ants.image_read(gr["atlas_outline_path"])
             sample_outline = ants.image_read(gr["sample_outline_path"])
             guide_regions.append((atlas_outline, sample_outline, gr.get("weight", 1.0)))
         logger.info("Loaded %d guide region(s): %s", len(guide_regions),
-                    [gr["sample_outline_path"] for gr in mask_cfg["guide_regions"]])
+                    [gr["sample_outline_path"] for gr in guide_cfg])
 
     init_cfg = reg_cfg.get("initial_transform") or {}
     initial_transform = init_cfg.get("path")

@@ -804,3 +804,74 @@ syn_sampling : scalar
 **已实测记录的关键事实**（给上游脚本用）：`ants.fit_transform_to_paired_points(moving_pts, fixed_pts)` 返回的是**重采样方向**（apply 到 fixed 空间点得到 moving 空间对应点；已知形变幻影上 apply(fixed点) 距 moving 对应点 5.8µm、距原点 106µm），可直接当 `initial_transform`，**不需要反转**。
 
 **下一步**：用户在 Registration_toolkit 写完 `fit_initial_transform.py` → 用 `place_landmarks.py` 标两份 CSV（样本侧 + 图谱侧，**同一批解剖位置同一顺序**；图谱侧必须标在转向裁剪后的缓存图谱 `P04_LSFM_20um_1_-3_2__320-640_full_full.nii.gz` 上，不能用原始 DevCCF 文件）→ 跑脚本出两个场 → config 填 `registration.initial_transform` 两行 → 重跑。标点重点覆盖：扭曲区、海马轮廓、腹侧（1.56mm 缺口所在）、疑似中线缺损区；另留 5~8 个点**不参与驱动**，只给 `registration_eval.py` 算 TRE（拿驱动点评估自己是循环论证）。
+
+---
+
+## 2026-08-11：转向区域引导（guide_regions）——修 guide 分支 + 一个失败的基准实验 + 三条被纠正的错误说法
+
+**方向变化**：用户否掉了 landmark 驱动路线（两侧手标点、靠行号配对，工作量大），改成**区域引导**：在样本上圈 3~5 个脑区，图谱侧**不用画**——图谱自带完整标注，按名字取 label 即可。这正是 `guide_regions`（`multivariate_extras`）的机制，antspyx 也有现成的 `ants.label_image_registration()`（内部就是算两侧区域质心拟合初始变换 + 每个区域当 MSQ 额外项）。`place_landmarks.py` 不作废，但用途退回**评估**（TRE），不再做驱动。
+
+**调研：DevCCF 本体里没有用户想画的那两个区**（决定了可选区域清单）。实测 192 个真实出现的 label：
+- **没有 hippocampus 标签**，只有碎片：dentate gyrus 0.73mm³、subiculum 1.15mm³、presubiculum 0.31mm³、fimbria 0.23mm³、perihippocampal cortex 0.77mm³。CA1/CA2/CA3 完全没有。
+- **cortex 没有单一标签**，是 36 个分层（`layer N of FCx/PCx/OCx/...`），合计 30.1mm³，可以并起来用。
+- 可用的大块：alar plate of m1 (7.1)、cerebellar hemisphere (4.2)、alar plate of p2/alar thalamus (3.8)、corpus callosum (2.8)、cerebellar vermis (1.7)。
+- 备选路线（未采纳）：切回 `demba_p5`，它配的是成年 CCFv3 本体，有干净的 `Hippocampal formation`/`Isocortex`。代价是整条配准路线分叉。
+
+**改动：修 `guide_regions` 分支**（它停留在 8-04 之后所有修复之前的状态，用户一打开就会绕过全部修复）：
+- 之前**没有 mask 预对齐** → 用 ANTs 默认质心初始化，正是 8-04 查出会把半球图谱配歪的那个。
+- 之前 Affine 直接吃 `moving_mask` → 若那是脑轮廓，就是 8-10 查出的"Affine 不肯放大、只补 9% 缺口"的坑。
+- 现在：Translation 预对齐（用 `prealign_moving_mask`）→ Affine（不吃轮廓 mask）→ SyNOnly + 引导项，与主分支一致；并支持 `initial_transform` 覆盖预对齐。docstring 里"（outside the guide_regions branch）"那句限定去掉了。
+
+**一个失败的基准实验（记下来是为了别再犯）**：想量化"3~5 个粗糙手圈区域能帮多少"，跑了两版幻影，**两版都无效**：
+1. 第一版：给整个体积加了噪声后用 `>0.1` 阈值量尺寸，背景噪声被算成组织 → 两边都报满长度、"需撑开 0.00mm"、后续百分比全 nan。
+2. 第二版（噪声只进强度图、尺寸用无噪声 body mask 量）：**基线太容易**——无引导就已补上 98% 缺口、全脑 Dice 0.972，说明该幻影里强度信息完全够用，**和真实数据的困境正好相反**。在这个前提下粗糙引导只会把结果往回拽（0.972→0.940→0.933）。而且 roughen 的腐蚀把小区域弄没了（样本侧 dors 0.00mm³、cc 只剩图谱侧的 20%），喂了垃圾进去。
+
+**从失败实验里仍然站得住的两点**：
+- 引导确实能在特定区域产生大幅改善：cbl 0.68→0.96、dors 0.06→0.46。与当初接入时那个**为"强度提供零信息"设计的**验证一致（两张完全相同的强度图 + 位置不同的球体，Dice 0.185→0.924）——那个实验才对得上真实场景。
+- **系统性尺寸偏差是真正的杀手，对小结构致命**：cc 样本侧只有图谱侧 20%，引导直接起反作用（Dice 0.46→0.15）。随机抖动会互相抵消，**始终画大/画小不会**。
+
+**给用户的实操建议**（从机制推的，不是从那组无效数字推的）：优先大结构（1mm³ 以下的别选）；画之前叠着 `labels_in_sample` 确认自己对边界的定义和图谱标签语义一致（这比画得精细重要得多）；只在真正对不上的地方加引导，强度已经配得好的地方别加。**决定不再跑第三版幻影**——构造得出"强度失效"，但那是我设计的失效方式，不是真实样本的失效方式；真实数据本身就是最好的测试。
+
+**三条我在给 toolkit 的 prompt 里写错、被对方实测纠正的说法（这里记下正确版本，避免以后翻记录时把错的当事实）**：
+1. **sidecar 格式我援引错了**。仓库真实约定是 `edit_sample_labels.py` 写、`registration_eval.py:366 load_region_annotation_hint()` 读的 `<mask>.annotated_slices.json`，内容是 `{"hand_drawn_slices": [...]}`，**针对单个二值 mask**，结构里没有 per-label 分解也没有 label→区域名映射（我错误地说它已支持，还错误地把 `annotate_gt_sam.py` 一并援引为同一约定）。对方的解法是写两份：`.regions.json`（新格式，带 label→名字和逐 label 的层号）+ `.annotated_slices.json`（所有 label painted planes 的并集），这样产物能原样落进现有 eval 路径。
+2. **合并插值的失效模式是"湮灭"不是"边界渗透"**。我说的"多 label 混在一起插值会在边界互相污染"是想当然。实际：符号距离场在两个**不相交**截面之间插值，`{½·d_A + ½·d_B < 0}` 在两块距离超过各自尺度时是**空集** —— 夹在异区域关键层之间的层**整段消失**。合成用例实测 700 体素静默丢失，逐 label 插值后为 0。**结论（必须逐 label 插值）不变，理由换成这个。**
+3. **重叠只可能来自插值，不可能来自关键层**。单个 napari Labels 图层每个体素只有一个整数，关键层上物理上无法重叠。我原来建议的测试构造（"故意让两个 label 重叠"）不可实现；唯一能触发的路径是把一个 label 的关键层**夹在**另一个的关键层之间，让插值出的实体穿过彼此（实测 125 个争夺体素，精确可算）。
+
+**另一个决定**：`display_scale_zyx`（各向异性显示，原始 TIFF 是 2.6/2.6/32µm，12:1，不设的话 napari 里 z 压扁 12 倍）**两条 kind 路径都要加**，放进共享的 `_launch_viewer`。我原先说"不要动 `_run_mask`"指的是**导出语义**（密集编辑/不插值/不取反 —— 那些是 mask 与 guide 之间真实存在的差异，不该合并掉）；显示比例是**图像的属性不是 kind 的属性**，且只影响显示、不改变导出的体素索引。
+
+**下一步**：用户按 prompt 在 Registration_toolkit 改好 `paint_mask.py` 的多脑区支持 → 在原始 `registration.tif` 上给 3~5 个脑区各画 5 层左右 → Registration_ants 这边还需要实现「图谱侧按脑区名自动生成区域」（现在 `mask.guide_regions` 要求两侧都给文件路径，得改成图谱侧只写名字）→ 跑一次带引导的配准。
+
+**追加（同日）：实现「图谱侧按名字自动生成引导区域」——只画样本侧**
+
+用户决定 label→脑区名的权威映射放在 ANTs 侧 config、不放画图工具里。这不只是偏好问题，**结构上也只能这样**：画图工具的 `region_labels` 是 `{label: 一个名字}`，而真实需求是一对多（DevCCF 里 cortex 是 36 个分层、cerebellum 是 hemisphere+vermis 两个）。画图工具那份降级成人类可读的备忘（napari 窗口显示、落进 `.regions.json`），下游不读。
+
+**新增/改动**：
+- `atlas_utils.py`：抽出 `_structure_ids_matching(structures, names)`（子串匹配 + 经 structure_id_path 带上所有子结构），`build_region_exclusion_mask` 改为复用它（行为不变，已回归验证仍是 482734 体素）；新增 `build_region_inclusion_mask(annotation_arr, structures, include_names)`，返回 `(mask, matched)`，`matched` 是 `{结构名: 体素数}`。**返回 matched 是刻意的**——子串匹配不中会给出全 False 的 mask 且不报错，下游看起来就是"这个引导什么也没做"。
+- `config.py`：`mask.guide_regions` 支持**两种形式**，按类型区分：dict = 新的多区域形式（`regions_mask`/`voxel_size_um`/`atlas_names`/`weight`），list = 旧的一区一对文件形式（保留，用于没有对应本体名字、必须手画图谱侧的区域）。`voxel_size_um` 必填（在原始 TIFF 上画的 mask 头里没有 spacing，读回来是 1,1,1）；`atlas_names` 的 key 归一成 int、value 归一成 list（允许写单个字符串）；`weight` 可以是单值或 `{label: 权重}`。
+- `pipeline.py`：新增 `_build_guide_regions_from_labels()`。读多 label 文件（用 `io_utils.load_nifti_stack_as_ants` 显式重建 spacing、丢弃文件头）→ 若网格与 `sample_fine_prep` 不同则 `resample_image_to_target(interp_type="genericLabel")` 重采样（物理空间一致：origin 0、spacing 即微米、裁剪只平移 origin，所以是纯粹的 regrid）→ 逐 label 抠图谱侧 → 组装三元组。日志逐 label 打印样本/图谱体素数和命中的结构名。
+- `configs/config.example.yaml`：补完整配置示例 + 关键层间隔的实测数据。
+
+**三条刻意做成报错而非静默的检查**（今天已经因为静默失效吃过两次亏）：
+1. `atlas_names` 里某个 label 一个结构都没匹配到 → 报错（否则引导项永远无法被满足）
+2. `regions_mask` 里画了、但 `atlas_names` 没配的 label → 报错（画了却用不上，肯定是配漏了）
+3. 配了 `atlas_names`、但 mask 里没有该 label → 报错
+
+**验证结果**：
+1. `build_region_inclusion_mask` 对真实 DevCCF：`["layer 1 of","layer 5 of"]` 命中 16 个结构 17.50mm³，名字全部核对正确；不存在的名字给出空 mask + 空 matched。`build_region_exclusion_mask` 回归检查仍是 482734 体素（重构没改行为）。
+2. `_build_guide_regions_from_labels` 端到端：合成的"原始 TIFF 网格多 label 文件"（各向异性 spacing）+ 真实图谱，正确产出 2 个三元组，**图谱侧在图谱网格 (320,800,560)、样本侧被重采样到配准网格**，断言通过。
+3. 三条错误路径逐条断言报错信息正确。
+4. `test_pipeline_smoke` / `test_brain_mask_smoke` / `test_label_correction_smoke` 全过；`load_config('configs/s12t.yaml')` 正常且 `guide_regions=None`（未启用不受影响）。
+5. **没跑真实数据**——等用户画完区域。
+
+**关键层间隔的实测数据**（用真实 DevCCF 结构按用户实际画的切面方向采样后插值，与真形状比 Dice；原始 TIFF z 间距 32µm，"每 20 层" = 640µm）：
+
+| 结构 | 体积 | 每5层 | 每10层 | 每20层 | 每40层 |
+|---|---|---|---|---|---|
+| cortex（36分层并集） | 27.5mm³ | 0.966 | 0.902 | **0.816** | 0.629 |
+| cerebellum | 6.0mm³ | 0.988 | 0.972 | **0.901** | 0.541 |
+| corpus callosum | 2.8mm³ | 0.933 | 0.762 | **0.396** | 0.145 |
+| dentate gyrus | 0.73mm³ | 0.938 | 0.778 | **0.360** | 0.104 |
+
+结论：形状连续的大结构每 20 层够用（cortex 10 层、cerebellum 5 层的工作量）；细长/弯曲的结构每 20 层直接废掉（0.36~0.40 已经是形状错了，考虑到"系统性偏差比随机抖动危险"，这种引导比不加更糟），要画就每 10 层。**首尾层必须画**——`interpolate_sparse_mask` 只在关键层之间插值，`[min,max]` 之外一律留空。
+
+**下一步**：用户用改好的 `paint_mask.py`（多 label 已落地，commit `22494cb`）在原始 `registration.tif` 上画 3~5 个区 → 填 `mask.guide_regions` → 跑。建议先只画 cortex 一个区试手、导出后拖回 napari 核对插值层形状，走通再一次画完。

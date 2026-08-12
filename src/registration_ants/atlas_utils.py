@@ -278,15 +278,90 @@ def build_region_exclusion_mask(annotation_arr, structures, exclude_names):
     too (via structure_id_path), so passing "Olfactory bulb" also excludes
     its subregions, not just the top-level structure itself.
     """
-    exclude_root_ids = {
+    return ~np.isin(annotation_arr, list(_structure_ids_matching(structures, exclude_names)))
+
+
+def _structure_ids_matching(structures, names):
+    """ids of every structure whose name substring-matches any of `names`
+    (case-insensitive), plus all of their descendants via structure_id_path."""
+    root_ids = {
         sid for sid, info in structures.items()
-        if any(name.lower() in info["name"].lower() for name in exclude_names)
+        if any(name.lower() in info["name"].lower() for name in names)
     }
-    exclude_ids = {
+    return {
         sid for sid, info in structures.items()
-        if set(info["structure_id_path"]) & exclude_root_ids
+        if set(info["structure_id_path"]) & root_ids
     }
-    return ~np.isin(annotation_arr, list(exclude_ids))
+
+
+def descendant_ids_of(structures, root_ids):
+    """Every structure id at or below any of `root_ids` in the ontology tree.
+
+    Membership is decided by structure_id_path containment, never by name, so
+    this cannot conflate two structures whose names merely share a substring
+    (the "Cerebellum" / "cerebellum related fiber tracts" trap measured in
+    region_mask_by_exact_name's docstring). Unknown ids raise rather than
+    contributing nothing: an id that isn't in this ontology is a config typo
+    or an id from a different atlas, and silently yielding an empty mask for
+    it is exactly the failure mode ids were chosen to avoid.
+    """
+    root_ids = {int(r) for r in root_ids}
+    unknown = sorted(root_ids - set(structures))
+    if unknown:
+        raise ValueError(
+            f"structure id(s) {unknown} are not in this ontology -- wrong atlas, or a typo. "
+            f"(This ontology has {len(structures)} structures.)")
+    return {sid for sid, info in structures.items()
+            if set(info["structure_id_path"]) & root_ids}
+
+
+def _mask_and_matched(annotation_arr, structures, ids):
+    """(binary mask, {structure name: voxel count}) for a set of structure
+    ids -- the shared tail of the name- and id-based inclusion builders. Only
+    structures actually PRESENT in this annotation appear in `matched`, which
+    is what lets callers tell "resolved to nothing" apart from "resolved fine"."""
+    mask = np.isin(annotation_arr, list(ids))
+    present, counts = np.unique(annotation_arr[mask], return_counts=True)
+    matched = {
+        structures.get(int(sid), {}).get("name", f"<unknown id {int(sid)}>"): int(count)
+        for sid, count in zip(present, counts)
+    }
+    return mask, matched
+
+
+def build_region_inclusion_mask_by_ids(annotation_arr, structures, include_ids):
+    """Binary inclusion mask from ontology structure IDS (plus descendants),
+    the unambiguous counterpart of build_region_inclusion_mask's substring
+    name matching. Returns (mask, matched) in the same shape, so callers can
+    swap between the two without branching on the result.
+
+    This is what paint_mask.py's region picker writes into its
+    <output>.regions.json sidecar: the GUI highlights a region by id, so
+    resolving by that same id downstream is the only way to guarantee the
+    region used in registration is the one that was actually looked at while
+    painting.
+    """
+    return _mask_and_matched(annotation_arr, structures, descendant_ids_of(structures, include_ids))
+
+
+def build_region_inclusion_mask(annotation_arr, structures, include_names):
+    """Binary mask over an annotation array: True = inside one of the named
+    regions. The complement of build_region_exclusion_mask's convention --
+    used to pull the atlas-side half of a guide region straight out of the
+    annotation, so only the sample side has to be drawn by hand.
+
+    include_names are matched the same way build_region_exclusion_mask
+    matches: case-insensitive substring, descendants included. Several names
+    are unioned, which is what real use needs -- e.g. DevCCF has no single
+    "cortex" label, only 36 separate `layer N of <area>` structures.
+
+    Returns (mask, matched) where matched is {structure name: voxel count}
+    for every named structure actually present in this annotation. Callers
+    must check it: substring matching that hits nothing produces an
+    all-False mask and no error, which downstream looks like "the guide
+    region simply did nothing".
+    """
+    return _mask_and_matched(annotation_arr, structures, _structure_ids_matching(structures, include_names))
 
 
 def region_mask_by_exact_name(annotation_arr, structures, exact_name):
