@@ -108,12 +108,27 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
     names_cfg = guide_cfg.get("atlas_names") or {}
     configured = sorted(set(ids_cfg) | set(names_cfg))
 
-    unconfigured = painted - set(configured)
+    # A painted label with no atlas pairing is normally a config omission, and
+    # skipping it silently would mean hours of registration quietly ignoring
+    # work that was drawn by hand. ignore_labels is the way to say "yes, that
+    # one is deliberate" -- keeping the error for everything not named, so a
+    # forgotten label still stops the run. Common reason to skip one: the
+    # drawn extent is systematically off from the atlas structure's (e.g. a
+    # thin sheet drawn over only part of its length), which pulls the
+    # deformation the wrong way rather than helping.
+    ignored = {int(v) for v in (guide_cfg.get("ignore_labels") or [])}
+    unconfigured = painted - set(configured) - ignored
     if unconfigured:
         raise ValueError(
             f"mask.guide_regions.regions_mask contains painted label(s) {sorted(unconfigured)} with no "
-            "atlas_ids/atlas_names entry -- they would be silently ignored. Add them, or remove them "
-            "from the mask.")
+            "atlas_ids/atlas_names entry -- they would be silently ignored. Add them, list them under "
+            "ignore_labels if that is deliberate, or remove them from the mask.")
+    if ignored & painted:
+        logger.info("Guide regions: ignoring painted label(s) %s by config", sorted(ignored & painted))
+    stale = ignored - painted
+    if stale:
+        raise ValueError(f"mask.guide_regions.ignore_labels lists label(s) {sorted(stale)} that are not "
+                         "painted in regions_mask -- stale config, or the wrong mask file.")
 
     annotation_arr = atlas_annotation.numpy()
     weight_cfg = guide_cfg["weight"]
