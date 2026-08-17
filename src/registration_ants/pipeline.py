@@ -274,8 +274,63 @@ def run_pipeline(config_path):
     sample_mask = None
     prealign_moving_mask = None
     if mask_cfg.get("sample_damage_mask_path"):
-        sample_mask = ants.image_read(mask_cfg["sample_damage_mask_path"])
-        logger.info("Loaded sample damage mask: %s", mask_cfg["sample_damage_mask_path"])
+        damage_path = mask_cfg["sample_damage_mask_path"]
+        damage_um = mask_cfg.get("sample_damage_mask_voxel_size_um")
+        # Same grid story as guide_regions' regions_mask, and it matters more
+        # here: the void is only identifiable on the RAW tiff (that is the
+        # only grid where you can see what is tissue and what is nothing), but
+        # paint_mask.py's export copies the source's header verbatim, so the
+        # file claims spacing (1,1,1) and covers the UNCROPPED volume.
+        # ants.image_read alone would hand ANTs a mask in the wrong physical
+        # space on the wrong grid -- and a wrong mask is applied silently,
+        # there is no shape check inside ants.registration to catch it.
+        # Rebuild spacing from config and regrid onto whatever registration
+        # actually runs on; physical space is shared (origin 0, spacing in
+        # microns, cropping only shifts origin), so this is a pure regrid.
+        if damage_um:
+            sample_mask = io_utils.load_nifti_stack_as_ants(damage_path, damage_um)
+        else:
+            sample_mask = ants.image_read(damage_path)
+        if sample_mask.shape != sample_fine_prep.shape:
+            if not damage_um:
+                raise ValueError(
+                    f"mask.sample_damage_mask_path is {sample_mask.shape} but registration runs on "
+                    f"{sample_fine_prep.shape}. Add mask.sample_damage_mask_voxel_size_um (the voxel size "
+                    "of the grid it was painted on, e.g. the raw tiff's [2.6, 2.6, 32.0]) so it can be "
+                    "regridded -- without it the file's own header is trusted, and a damage mask in the "
+                    "wrong physical space silently excludes the wrong voxels.")
+            # Resample the HOLE, not the mask. resample_image_to_target fills
+            # anything outside the source's extent with 0, and the registration
+            # grid does stick out past the raw grid by a fraction of a voxel
+            # (the crop's last plane sits at 4992um while the 20um grid's does
+            # at 5000um, and likewise in x), so regridding the mask directly
+            # comes back with a thin shell of 0 = EXCLUDED around the edges
+            # -- measured 0.2% of the volume, all of it at the boundary, and
+            # silent. Inverted, that same fill value reads as "not a hole",
+            # which is the right default for territory the painted volume
+            # never covered.
+            hole = ants.from_numpy((sample_mask.numpy() == 0).astype("float32"),
+                                    spacing=sample_mask.spacing, origin=sample_mask.origin,
+                                    direction=sample_mask.direction)
+            hole = ants.resample_image_to_target(hole, sample_fine_prep, interp_type="genericLabel")
+            sample_mask = ants.from_numpy((hole.numpy() == 0).astype("float32"),
+                                           spacing=sample_fine_prep.spacing,
+                                           origin=sample_fine_prep.origin,
+                                           direction=sample_fine_prep.direction)
+        coverage = float((sample_mask.numpy() > 0).mean())
+        logger.info("Loaded sample damage mask: %s (%.1f%% of the registration grid participates)",
+                    damage_path, 100 * coverage)
+        # A damage mask is a hole in an otherwise all-1 canvas. Anything near
+        # the ~40% a tissue silhouette scores means the polarity is flipped,
+        # which is the one mistake here that makes registration worse rather
+        # than erroring -- see register_to_atlas's docstring for the measured
+        # cost (a silhouette on moving_mask recovered 9% of a squashed
+        # sample's missing extent; the same mask on the pre-alignment, 101%).
+        if coverage < 0.8:
+            logger.warning("Sample damage mask covers only %.1f%% -- a damage mask should be 1 nearly "
+                            "everywhere with a hole in it. This is close to a tissue-silhouette mask, "
+                            "which as moving_mask stops the Affine from scaling the sample up. Check the "
+                            "polarity (nonzero = USED in the metric).", 100 * coverage)
 
     auto_brain_mask_cfg = mask_cfg.get("auto_brain_mask")
     if auto_brain_mask_cfg:

@@ -190,6 +190,14 @@ def load_config(path):
         raise ValueError("mask.atlas_exclude_regions requires atlas.ontology_path when atlas.source is 'custom'")
     if mask_cfg.get("sample_damage_mask_path") and not Path(mask_cfg["sample_damage_mask_path"]).exists():
         raise FileNotFoundError(f"mask.sample_damage_mask_path not found: {mask_cfg['sample_damage_mask_path']}")
+    damage_um = mask_cfg.get("sample_damage_mask_voxel_size_um")
+    if damage_um is not None:
+        if not mask_cfg.get("sample_damage_mask_path"):
+            raise ValueError("mask.sample_damage_mask_voxel_size_um is set but mask.sample_damage_mask_path "
+                              "is not -- it describes the grid that mask was painted on")
+        if len(damage_um) != 3:
+            raise ValueError("mask.sample_damage_mask_voxel_size_um must have exactly 3 entries (x, y, z), "
+                              "same order as sample.voxel_size_um")
 
     auto_brain_mask = mask_cfg.get("auto_brain_mask")
     if auto_brain_mask and not isinstance(auto_brain_mask, (bool, dict)):

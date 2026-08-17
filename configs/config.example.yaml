@@ -116,6 +116,24 @@ mask:
   #     sample_outline_path: /path/to/sample_side.nii.gz
   #     weight: 1.0
 
+  # 【可选】样本侧缺损 mask：标出样本里【组织根本不存在】的地方（清透过程中
+  # 丢失的结构、撕裂），让 metric 别在那儿算分。约定是【非零 = 参与配准】，
+  # 所以这张图应该是"整体全 1、只挖几个洞"。
+  #
+  # 别画成组织轮廓（tissue=1 / background=0）：那会把样本还没覆盖到的图谱区域
+  # 全部移出目标函数，Affine 就不再放大样本了（实测缺失范围只找回 9%，而同一张
+  # mask 只用在预对齐上是 101%，见 register.register_to_atlas 的 docstring）。
+  # 覆盖率低于 80% 会打 warning。
+  #
+  # 用 Registration_toolkit/paint_mask.py（kind=mask）画。空腔往往跨几十层，
+  # 建议在那份 config 里设 interpolate: true —— 改成画【要排除的区域】的
+  # 稀疏关键帧、层间自动插值，不用一层层擦。
+  # sample_damage_mask_path: /path/to/s12t_damage.nii.gz
+  # # 画在原始 TIFF 上时必填（那份文件头里没有体素尺寸，读回来是 1,1,1），
+  # # 顺序同 sample.voxel_size_um。给了就会自动重采样到配准网格；
+  # # 不给、而且 shape 又对不上配准网格的话会直接报错，不会静默用错。
+  # sample_damage_mask_voxel_size_um: [2.6, 2.6, 32.0]
+
   # potential mask for samples:
 
   # auto_brain_mask:
