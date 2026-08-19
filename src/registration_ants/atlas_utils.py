@@ -128,12 +128,13 @@ def _parse_slicing(slicing_spec):
     return tuple(slice(None) if s is None else slice(s[0], s[1]) for s in slicing_spec)
 
 
-def _atlas_prep_postfix(orientation, slicing_spec):
+def _atlas_prep_postfix(orientation, slicing_spec, background_margin_voxels=None):
     """Short, deterministic filename postfix derived from orientation/slicing
     (mirrors ClearMap.Alignment.Annotation.format_annotation_filename) -- so
     multiple sample configs sharing the same raw atlas + prep params reuse the
     same cached oriented/cropped file instead of redoing the permute/crop on
-    every pipeline run."""
+    every pipeline run. The margin is appended only when actually requested, so
+    caches written before it existed keep their names and stay valid."""
     orient_part = '_'.join(str(o) for o in orientation) if orientation else 'orig'
     if slicing_spec is None:
         slicing_part = 'full'
@@ -142,11 +143,89 @@ def _atlas_prep_postfix(orientation, slicing_spec):
         for s in slicing_spec:
             parts.append('full' if s is None else f'{s[0] if s[0] is not None else 0}-{s[1]}')
         slicing_part = '_'.join(parts)
-    return f'{orient_part}__{slicing_part}'
+    margin_part = f'__pad{int(background_margin_voxels)}' if background_margin_voxels else ''
+    return f'{orient_part}__{slicing_part}{margin_part}'
+
+
+def _read_atlas_array_xyz(src_path):
+    """Raw atlas file -> (x,y,z)-ordered array, per format -- the read half of
+    prepare_custom_atlas, split out so template and annotation can be loaded
+    together (padding couples them: both must get the identical pad width)."""
+    src_path = Path(src_path)
+    if _is_nifti(src_path):
+        import ants
+        # Already (x,y,z) on disk (see io_utils.load_nifti_stack_as_ants) --
+        # no transpose needed before reorienting, unlike the TIFF branch below.
+        return ants.image_read(str(src_path)).numpy()
+    import tifffile
+    return np.transpose(tifffile.imread(str(src_path)), (2, 1, 0))
+
+
+def _write_atlas_array_xyz(arr_xyz, out_path, resolution_um):
+    """Write a prepared (x,y,z)-ordered array back out in the same format its
+    source came in as -- the write half of prepare_custom_atlas."""
+    if _is_nifti(out_path):
+        import ants
+        # Spacing here is only what this cache file's own header claims;
+        # load_custom_atlas always overrides it from config.atlas.resolution_um
+        # when this cache is loaded back, same as for the TIFF branch.
+        ants.image_write(ants.from_numpy(arr_xyz.astype(np.float32),
+                                         spacing=(float(resolution_um),) * 3), str(out_path))
+    else:
+        # Write back out in (z,y,x) on-disk order, matching how every other
+        # raw TIFF in this codebase is stored/read.
+        import tifffile
+        tifffile.imwrite(str(out_path), np.ascontiguousarray(np.transpose(arr_xyz, (2, 1, 0))))
+
+
+def background_pad_width(annotation_xyz, margin_voxels):
+    """Per-axis ((lo, hi), ...) zero-padding that leaves at least
+    `margin_voxels` of all-background voxels between tissue and every face of
+    the array. Faces that already have that much clearance get 0 -- this is a
+    "pad UP TO this margin", not "add this much", so re-preparing an atlas
+    that already has the margin is a no-op rather than growing it every time.
+
+    Why this exists at all: ANTs/ITK's SyN holds the displacement field at
+    EXACTLY zero on every face of the fixed image's grid (measured on a real
+    run's 1Warp.nii.gz and 1InverseWarp.nii.gz -- max |displacement| was
+    0.000000 on all six faces, against an interior median of 110um). Any
+    tissue flush against a face is therefore frozen: no metric, no guide
+    region, and no amount of weight or iterations can move it, because the
+    constraint is imposed on the field itself rather than on the objective.
+
+    That is exactly what a hemisphere crop does to the midline. Cropping the
+    atlas at the anatomical midline (e.g. slicing [[320, 640], ...] on a
+    640-voxel left-right axis whose midline is 320) puts the whole medial
+    cut face -- 105259 tissue voxels in the measured case -- on the pinned
+    boundary, so the atlas midline stays perfectly straight no matter how
+    tilted the sample's own midline is, while the interior deforms normally.
+
+    Padding with BACKGROUND is what fixes it, and it is strictly better than
+    the obvious alternative of widening the crop to include contralateral
+    tissue: the tissue/background step at the medial surface is the very
+    edge the intensity metric locks onto, and real tissue on the far side
+    erases that step. Zero padding moves the pinned face away from the
+    midline while leaving the step intact and now free to move.
+
+    Tissue extent is read off the ANNOTATION (>0 is unambiguous) and the same
+    pad width is then applied to the template too -- an intensity template's
+    own background is not reliably zero (LSFM noise, bias field).
+    """
+    tissue = annotation_xyz > 0
+    if not tissue.any():
+        raise ValueError("atlas annotation has no nonzero voxels -- cannot locate tissue to pad around "
+                         "(wrong file, or an orientation/slicing that cropped the brain away entirely)")
+    margin = int(margin_voxels)
+    pad = []
+    for axis in range(tissue.ndim):
+        present = np.where(tissue.any(axis=tuple(a for a in range(tissue.ndim) if a != axis)))[0]
+        lo_gap, hi_gap = int(present[0]), int(tissue.shape[axis] - 1 - int(present[-1]))
+        pad.append((max(0, margin - lo_gap), max(0, margin - hi_gap)))
+    return tuple(pad)
 
 
 def prepare_custom_atlas(template_path, annotation_path, resolution_um, orientation=None, slicing=None,
-                          cache_dir=None, overwrite=False):
+                          background_margin_voxels=None, cache_dir=None, overwrite=False):
     """Reorient + crop a raw (not-yet-prepared) atlas template/annotation pair,
     then load them as ANTs images -- the in-house equivalent of ClearMap's
     Annotation.prepare_annotation_files, so a fresh atlas source (e.g. a raw
@@ -160,57 +239,58 @@ def prepare_custom_atlas(template_path, annotation_path, resolution_um, orientat
     io_utils.load_nifti_stack_as_ants) before any reorienting.
     orientation: see reorient_volume; None keeps the source's native axes.
     slicing: see _parse_slicing, applied after reorientation; None = no crop.
+    background_margin_voxels: pad the prepared volumes with zero background so
+    at least this many all-background voxels separate tissue from every face
+    of the array -- see background_pad_width, which is where the measured
+    reason lives. Short version: SyN pins its displacement field to exactly
+    zero on the fixed image's faces, so tissue flush against a face cannot
+    move at all, which is precisely what cropping a hemisphere atlas at the
+    anatomical midline does to the midline. None/0 = no padding.
 
-    If both are None this is equivalent to load_custom_atlas (no prep
+    If all three are None this is equivalent to load_custom_atlas (no prep
     needed -- e.g. files already pre-oriented, like the current DeMBA P5
     trimmed files). Otherwise, results are cached next to the source file (or
-    under cache_dir if given) with a postfix derived from orientation/slicing,
-    and reused across runs/samples unless overwrite=True -- same
-    skip-if-exists caching cellMap.py relies on to avoid redoing this every
-    run.
+    under cache_dir if given) with a postfix derived from
+    orientation/slicing/margin, and reused across runs/samples unless
+    overwrite=True -- same skip-if-exists caching cellMap.py relies on to
+    avoid redoing this every run. Template and annotation are prepared
+    TOGETHER (rather than one file at a time as before) because padding
+    couples them: the pad width is measured on the annotation and must be
+    applied identically to the template, or the two would no longer share a
+    grid.
 
     Returns (template_img, annotation_img) as ANTs images, same as
     load_custom_atlas.
     """
-    if orientation is None and slicing is None:
+    if orientation is None and slicing is None and not background_margin_voxels:
         return load_custom_atlas(template_path, annotation_path, resolution_um)
 
-    postfix = _atlas_prep_postfix(orientation, slicing)
+    postfix = _atlas_prep_postfix(orientation, slicing, background_margin_voxels)
     slicing_tuple = _parse_slicing(slicing)
 
-    prepared_paths = []
-    for src_path in (template_path, annotation_path):
-        src_path = Path(src_path)
-        nifti = _is_nifti(src_path)
+    src_paths = [Path(template_path), Path(annotation_path)]
+    out_paths = []
+    for src_path in src_paths:
         stem, suffix = _split_stem_suffix(src_path)
         out_dir = Path(cache_dir) if cache_dir else src_path.parent
-        out_path = out_dir / f"{stem}_{postfix}{suffix}"
-        if overwrite or not out_path.exists():
-            out_dir.mkdir(parents=True, exist_ok=True)
-            if nifti:
-                import ants
-                # Already (x,y,z) on disk (see io_utils.load_nifti_stack_as_ants) --
-                # no transpose needed before reorienting, unlike the TIFF branch below.
-                arr_xyz = ants.image_read(str(src_path)).numpy()
-            else:
-                import tifffile
-                arr_xyz = np.transpose(tifffile.imread(str(src_path)), (2, 1, 0))
-            arr_xyz = reorient_volume(arr_xyz, orientation)
-            if slicing_tuple is not None:
-                arr_xyz = arr_xyz[slicing_tuple]
-            if nifti:
-                # Spacing here is only what this cache file's own header claims;
-                # load_custom_atlas always overrides it from config.atlas.resolution_um
-                # when this cache is loaded back, same as for the TIFF branch.
-                out_img = ants.from_numpy(arr_xyz.astype(np.float32), spacing=(float(resolution_um),) * 3)
-                ants.image_write(out_img, str(out_path))
-            else:
-                # Write back out in (z,y,x) on-disk order, matching how every
-                # other raw TIFF in this codebase is stored/read.
-                tifffile.imwrite(str(out_path), np.ascontiguousarray(np.transpose(arr_xyz, (2, 1, 0))))
-        prepared_paths.append(out_path)
+        out_paths.append(out_dir / f"{stem}_{postfix}{suffix}")
 
-    return load_custom_atlas(str(prepared_paths[0]), str(prepared_paths[1]), resolution_um)
+    # All-or-nothing on the cache: the two files are only meaningful as a pair
+    # on a shared grid, and with padding one cannot be rebuilt without the
+    # other (the pad width comes from the annotation).
+    if overwrite or not all(p.exists() for p in out_paths):
+        arrays = [_read_atlas_array_xyz(p) for p in src_paths]
+        arrays = [reorient_volume(a, orientation) for a in arrays]
+        if slicing_tuple is not None:
+            arrays = [a[slicing_tuple] for a in arrays]
+        if background_margin_voxels:
+            pad_width = background_pad_width(arrays[1], background_margin_voxels)
+            arrays = [np.pad(a, pad_width, mode="constant", constant_values=0) for a in arrays]
+        for arr_xyz, out_path in zip(arrays, out_paths):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_atlas_array_xyz(arr_xyz, out_path, resolution_um)
+
+    return load_custom_atlas(str(out_paths[0]), str(out_paths[1]), resolution_um)
 
 
 def load_ccf_ontology_json(path):

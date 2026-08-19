@@ -88,6 +88,51 @@ def test_prepare_custom_atlas(tmp_dir):
     print("   OK (reorient+crop matches manual computation, caching skips recompute, plain passthrough works)")
 
 
+def test_atlas_background_margin(tmp_dir):
+    print("2b. atlas_utils background_margin_voxels (unfreezing a flush face)...")
+    atlas_dir = tmp_dir / "margin_atlas"
+    atlas_dir.mkdir(parents=True, exist_ok=True)
+
+    # Tissue flush against the axis-0 low face and the axis-2 high face, with 2
+    # voxels of clearance elsewhere -- the shape a hemisphere crop produces at
+    # the midline, which is what the margin exists to fix (SyN pins its
+    # displacement field to exactly zero on a grid face, so flush tissue cannot
+    # move at all; see atlas_utils.background_pad_width).
+    arr_xyz = np.zeros((10, 12, 14), dtype=np.float32)
+    arr_xyz[0:6, 2:10, 4:14] = 7.0
+    template_path = atlas_dir / "template.tif"
+    annotation_path = atlas_dir / "annotation.tif"
+    for p in (template_path, annotation_path):
+        tifffile.imwrite(str(p), np.transpose(arr_xyz, (2, 1, 0)))
+
+    pad = atlas_utils.background_pad_width(arr_xyz, 3)
+    assert pad == ((3, 0), (1, 1), (0, 3)), pad          # only what each face is short of
+
+    _, annotation_img = atlas_utils.prepare_custom_atlas(
+        str(template_path), str(annotation_path), resolution_um=25, background_margin_voxels=3)
+    padded = annotation_img.numpy()
+    assert padded.shape == (13, 14, 17), padded.shape
+
+    for axis in range(3):
+        present = np.where((padded > 0).any(axis=tuple(a for a in range(3) if a != axis)))[0]
+        lo, hi = int(present[0]), padded.shape[axis] - 1 - int(present[-1])
+        assert lo >= 3 and hi >= 3, f"axis{axis} clearance {lo}/{hi} < 3"
+    assert padded.sum() == arr_xyz.sum(), "padding must not alter tissue values"
+
+    # "Pad UP TO", not "add": re-preparing an already-margined volume is a
+    # no-op rather than growing it every run.
+    assert atlas_utils.background_pad_width(padded, 3) == ((0, 0),) * 3
+
+    # Margin participates in the cache key, so changing it rebuilds rather than
+    # silently reusing a differently-padded atlas...
+    assert (atlas_utils._atlas_prep_postfix(None, None, 3)
+            != atlas_utils._atlas_prep_postfix(None, None, 20))
+    # ...while caches written before the margin existed keep their old names.
+    assert (atlas_utils._atlas_prep_postfix((1, 3, 2), [[1, 3], None, None], None)
+            == atlas_utils._atlas_prep_postfix((1, 3, 2), [[1, 3], None, None]))
+    print("   OK (pads only short faces, preserves tissue, idempotent, cache key back-compatible)")
+
+
 def test_crop_to_bounds():
     print("3. io_utils.crop_to_bounds (origin-preserving crop)...")
     import ants
@@ -249,6 +294,7 @@ def main():
 
     test_reorient_volume()
     test_prepare_custom_atlas(tmp_dir)
+    test_atlas_background_margin(tmp_dir)
     test_crop_to_bounds()
     test_read_centroid_csv(tmp_dir)
     test_assign_cell_regions(tmp_dir)

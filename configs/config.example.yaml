@@ -41,6 +41,31 @@ atlas_variants:
     #   右半球 [[320, 640], null, null] / 左半球 [[0, 320], null, null] / 全脑：整行删掉
     # slicing: [[320, 640], null, null]
 
+    # 【半脑样本几乎必配】给裁好的图谱四周补零背景，保证组织和数组的六个面之间
+    # 至少隔这么多个空体素。padding 在 orientation + slicing 【之后】生效，
+    # 语义是"补到至少这么宽"而不是"再加这么多"——已经够宽的面不动，重复跑不会
+    # 越补越大。
+    #
+    # 为什么必须有：ANTs/ITK 的 SyN 把形变场在 fixed（图谱）网格的【六个面上
+    # 强制为精确的 0】。实测一次真实跑的 1Warp.nii.gz 和 1InverseWarp.nii.gz，
+    # 六个面的 max|位移| 全部是 0.000000，而内部中位数是 110µm。这意味着
+    # 【贴着面的组织根本动不了】——这是加在形变场上的约束，不是目标函数里的一项，
+    # 所以换 metric、加迭代、加 guide_regions 引导项、把权重调到多大都没有用。
+    #
+    # 而按中线裁半脑，正好把整个内侧切面（实测 105259 个组织体素）放在了这个
+    # 被钉死的面上：不管样本的中线多偏斜，图谱中线永远笔直不动，内部却在正常
+    # 形变——这个现象非常好认。合成幻影验证：pad=0 时切面位移恒为 0.000、
+    # 倾斜量永远是 0；pad>=5 就跳到均值 41µm、倾斜量精确复现真值，
+    # atlas→sample 的 Dice 0.982 → 1.000。
+    #
+    # 注意【不要】改成"把 slicing 放宽、把多出来的对侧组织 mask 掉"：内侧面那个
+    # 组织/背景的强度台阶正是 metric 唯一能咬住的边，放进真实对侧组织就把这个台阶
+    # 抹掉了。补零是把被钉死的面挪开、同时把台阶原样留下。
+    #
+    # 取值：幻影里 5 就够，20 是留了 4 倍余量的稳妥值（20µm 分辨率下 = 0.4mm）。
+    # 代价是体积变大：216x582x353 -> 246x602x373，约 +24% 显存和时间。
+    background_margin_voxels: 20
+
 registration:
   type_of_transform: SyNRA    # 单次配准的变换类型：Rigid+Affine+SyN 一体
 
@@ -103,6 +128,20 @@ mask:
   #     2: ["cerebellar hemisphere", "cerebellar vermis"]
   #     3: ["corpus callosum"]
   #   weight: 1.0        # 单值，或 {1: 1.0, 2: 0.5} 按 label 分别给
+  #
+  #   # 【可选】atlas_ids/atlas_names 是按子结构【全部并入】展开的（同一个
+  #   # label 下可以并多个），并不支持"减去"某个子结构 —— 但本体里子结构常常
+  #   # 互相包含，比如 DevCCF 的 olfactory bulb 就是 pallium 的后代。如果
+  #   # pallium 画成 label 1、又想单独给形变严重的嗅球开一个 label（比如
+  #   # label 6）单独引导，label 1 的图谱侧会【自动】把嗅球的体素也包含
+  #   # 进去 —— 这样同一批图谱体素同时被两个 guide pair 拉向不同的样本
+  #   # 目标（粗糙的 pallium 轮廓 vs 精细的嗅球轮廓），是冲突/冗余的引导项，
+  #   # 而不是真正的分层。样本侧画的时候不用管这个：napari 的 Labels 层是
+  #   # 单值光栅，后画的嗅球 label 自然把该区域从 pallium 的 label 里挖空。
+  #   # 用 atlas_exclude_ids 从某个 label 的图谱侧减掉指定结构（含其后代），
+  #   # key 必须是 atlas_ids/atlas_names 里已经配过的 label：
+  #   atlas_exclude_ids:
+  #     1: [15905]   # 把 label 1 (pallium) 的图谱轮廓里减掉 olfactory bulb
   #
   # 关键层间隔按结构选（实测 Dice：形状连续的大结构每 20 层够用，细长/弯曲的
   # 会崩）：cortex 每 20 层 0.82、cerebellum 每 20 层 0.90，但 corpus callosum

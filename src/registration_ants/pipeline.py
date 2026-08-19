@@ -132,6 +132,7 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
 
     annotation_arr = atlas_annotation.numpy()
     weight_cfg = guide_cfg["weight"]
+    exclude_ids_cfg = guide_cfg.get("atlas_exclude_ids") or {}
     out = []
     for label in configured:
         if label in ids_cfg:
@@ -154,6 +155,31 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
                 f"mask.guide_regions.{source} matched no structure present in this atlas annotation. "
                 "Names are case-insensitive substrings of ontology names (descendants included); ids "
                 "are matched exactly, descendants included -- check against the atlas ontology.")
+
+        if label in exclude_ids_cfg:
+            # A label's atlas_ids/atlas_names match already pulled in every
+            # descendant -- e.g. pallium's match includes the olfactory bulb,
+            # since OB is a pallium descendant in DevCCF. If OB is ALSO guided
+            # under its own label, the same atlas voxels would be pulled
+            # toward two different sample outlines at once; subtracting here
+            # is what keeps the two guide pairs disjoint.
+            exclude_mask = np.isin(
+                annotation_arr,
+                list(atlas_utils.descendant_ids_of(atlas_structures, exclude_ids_cfg[label])))
+            removed = int((atlas_arr & exclude_mask).sum())
+            atlas_arr = atlas_arr & ~exclude_mask
+            present, counts = np.unique(annotation_arr[atlas_arr], return_counts=True)
+            matched = {
+                atlas_structures.get(int(sid), {}).get("name", f"<unknown id {int(sid)}>"): int(count)
+                for sid, count in zip(present, counts)
+            }
+            logger.info("Guide region label %d: atlas_exclude_ids=%s removed %d voxel(s)",
+                        label, exclude_ids_cfg[label], removed)
+            if not atlas_arr.any():
+                raise ValueError(
+                    f"mask.guide_regions.atlas_exclude_ids[{label}] removed every voxel {source} "
+                    "matched -- the exclusion covers the whole region, leaving nothing to guide.")
+
         sample_arr = regions_arr == label
         if not sample_arr.any():
             raise ValueError(
@@ -173,6 +199,39 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
             weight,
         ))
     return out
+
+
+def _log_atlas_face_clearance(atlas_annotation, configured_margin):
+    """Log how many background voxels sit between atlas tissue and each face of
+    the atlas grid, and warn about any face tissue is flush against.
+
+    Worth its own check because the failure it catches is both silent and
+    unbounded: SyN holds its displacement field at exactly zero on the fixed
+    image's faces (measured -- see atlas_utils.background_pad_width), so tissue
+    touching a face simply cannot move, and nothing in the run log would
+    otherwise say so. The registration converges, the metric improves, and the
+    frozen surface just quietly stays where it started.
+    """
+    tissue = atlas_annotation.numpy() > 0
+    if not tissue.any():
+        logger.warning("Atlas annotation has no nonzero voxels -- cannot check face clearance.")
+        return
+    clearances = []
+    for axis in range(tissue.ndim):
+        present = np.where(tissue.any(axis=tuple(a for a in range(tissue.ndim) if a != axis)))[0]
+        clearances.append((int(present[0]), int(tissue.shape[axis] - 1 - int(present[-1]))))
+    logger.info("Atlas face clearance (background voxels between tissue and each grid face), "
+                "background_margin_voxels=%s: %s",
+                configured_margin if configured_margin else "unset",
+                ", ".join(f"axis{a}: lo={lo} hi={hi}" for a, (lo, hi) in enumerate(clearances)))
+    flush = [f"axis{a} {'lo' if side == 0 else 'hi'}"
+             for a, pair in enumerate(clearances) for side, gap in enumerate(pair) if gap == 0]
+    if flush:
+        logger.warning("Atlas tissue is FLUSH against grid face(s) %s -- SyN pins its displacement field to "
+                        "exactly zero there, so that surface cannot deform at all (a hemisphere atlas cropped "
+                        "at the midline hits this on the medial face, freezing the atlas midline no matter how "
+                        "tilted the sample's is). Set atlas.background_margin_voxels to pad it away.",
+                        ", ".join(flush))
 
 
 def run_pipeline(config_path):
@@ -253,7 +312,15 @@ def run_pipeline(config_path):
         atlas_template, atlas_annotation = atlas_utils.prepare_custom_atlas(
             atlas_cfg["template_path"], atlas_cfg["annotation_path"], atlas_cfg["resolution_um"],
             orientation=atlas_cfg.get("orientation"), slicing=atlas_cfg.get("slicing"),
+            background_margin_voxels=atlas_cfg.get("background_margin_voxels"),
         )
+        # SyN pins its displacement field to exactly zero on every face of the
+        # fixed (atlas) grid, so any tissue flush against a face is frozen no
+        # matter what the metric wants -- see atlas_utils.background_pad_width.
+        # A hemisphere crop puts the whole midline on such a face, which is the
+        # one case where this is silent AND large, so report the real clearance
+        # rather than just echoing what was configured.
+        _log_atlas_face_clearance(atlas_annotation, atlas_cfg.get("background_margin_voxels"))
         atlas_structures = (
             atlas_utils.load_ccf_ontology_json(atlas_cfg["ontology_path"])
             if "ontology_path" in atlas_cfg else None
@@ -416,14 +483,38 @@ def run_pipeline(config_path):
     # Reference = the UNCROPPED sample_fine grid, not sample_fine_prep --
     # apply_transforms only uses its `fixed` argument as an output-grid
     # template (pixel values don't matter for a label warp), so this is free
-    # to differ from whatever grid was actually registered against, and doing
-    # so gives full-brain label coverage even when crop_for_registration only
-    # registered a sub-region. This also keeps labels_in_sample.nii.gz on the
-    # exact same grid as cell_registration.csv's "resample space" columns
-    # (see cell_points.py) -- a constraint scripts/relabel_cells.py
-    # already depends on (it looks up corrected labels via those columns with
-    # no rescaling).
+    # to differ from whatever grid was actually registered against. Kept as
+    # the full grid (rather than cropped) so labels_in_sample.nii.gz stays on
+    # the exact same grid as cell_registration.csv's "resample space" columns
+    # (see cell_points.py) -- a constraint scripts/relabel_cells.py already
+    # depends on (it looks up corrected labels via those columns with no
+    # rescaling). The part of this full grid outside crop_for_registration is
+    # cleared below -- see the comment there for why it can't be trusted.
     labels_in_sample = transforms.warp_labels_to_sample(sample_fine, reg)
+    if crop_cfg:
+        # apply_transforms fills EVERY voxel of the (uncropped) reference grid
+        # above, including the part outside crop_for_registration -- the
+        # affine there is just evaluated past where it was fit (it has no
+        # bounds), and the SyN field falls back to its boundary value once a
+        # sample voxel maps outside the field's own support. Neither is backed
+        # by real correspondence, so it's not a registration result out there,
+        # just the fitted parameters extended past the region that fit them.
+        # crop_for_registration exists specifically to say "don't register
+        # this region" -- zeroing it out here is what makes that mean "don't
+        # label it either" instead of "label it with an unconstrained
+        # extrapolation and don't say so".
+        (xlo, xhi), (ylo, yhi), (zlo, zhi) = io_utils.crop_bounds_to_grid(
+            crop_cfg, sample["voxel_size_um"], reg_cfg["fine_target_um"], labels_in_sample.shape)
+        arr = labels_in_sample.numpy()
+        keep = np.zeros(arr.shape, dtype=bool)
+        keep[xlo:xhi, ylo:yhi, zlo:zhi] = True
+        cleared = int((arr != 0).sum() - (arr[keep] != 0).sum())
+        arr[~keep] = 0
+        labels_in_sample = ants.from_numpy(arr, spacing=labels_in_sample.spacing,
+                                            origin=labels_in_sample.origin, direction=labels_in_sample.direction)
+        logger.info("Cleared %d labeled voxel(s) outside crop_for_registration bounds "
+                    "(fine-grid indices x=[%d,%d) y=[%d,%d) z=[%d,%d) kept)",
+                    cleared, xlo, xhi, ylo, yhi, zlo, zhi)
     labels_in_sample_path = output_dir / f"{sample['name']}_labels_in_sample.nii.gz"
     ants.image_write(labels_in_sample, str(labels_in_sample_path))
     logger.info("Wrote labels_in_sample: shape=%s -> %s", labels_in_sample.shape, labels_in_sample_path)

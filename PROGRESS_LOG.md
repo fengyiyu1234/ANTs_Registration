@@ -875,3 +875,49 @@ syn_sampling : scalar
 结论：形状连续的大结构每 20 层够用（cortex 10 层、cerebellum 5 层的工作量）；细长/弯曲的结构每 20 层直接废掉（0.36~0.40 已经是形状错了，考虑到"系统性偏差比随机抖动危险"，这种引导比不加更糟），要画就每 10 层。**首尾层必须画**——`interpolate_sparse_mask` 只在关键层之间插值，`[min,max]` 之外一律留空。
 
 **下一步**：用户用改好的 `paint_mask.py`（多 label 已落地，commit `22494cb`）在原始 `registration.tif` 上画 3~5 个区 → 填 `mask.guide_regions` → 跑。建议先只画 cortex 一个区试手、导出后拖回 napari 核对插值层形状，走通再一次画完。
+
+---
+
+## 2026-08-18：图谱中线"永远笔直"的真正原因 —— SyN 形变场的零边界条件（实测确诊）
+
+**现象**（用户报告）：配准后图谱半脑的中线依然笔直，完全不贴合样本那条偏斜的中线；图谱其他位置**有**正常形变。此外图谱整体偏大、没有按画的 mask 范围收缩。
+
+**诊断（先量后改，没有靠猜）**。拿 `DevCCF_0818` 那次跑的变换直接量：
+
+1. **六个面全部精确为零**。`tsc12t_1Warp.nii.gz` 和 `tsc12t_1InverseWarp.nii.gz` 两个场，六个面的 `max|位移|` 都是 **0.000000**，而内部中位数是 110µm（组织内）。这是 ANTs/ITK 在 fixed（图谱）网格边界上对形变场施加的 **Dirichlet 零边界条件**。
+2. **中线正好落在那个被钉死的面上**。`slicing: [[320, 536], ...]` 的下界 320 就是解剖中线，裁完之后 axis0 的 lo 面上有 **105259 个组织体素**，间隙 0。其余五个面各有 10 体素间隙。
+3. **位移沿 x 轴从 0 线性爬升**：x=0 是 0.0000，x=1 是 11.9µm，x=2 是 21.8µm……到 x≈25~30 才接近内部中位数。爬升段就是正则化从被钉死的边界往内平滑的结果。
+
+**结论**：这**不是**引导不够、metric 不行、迭代不足。约束加在**形变场本身**上，不在目标函数里，所以换 metric、加迭代、加 `guide_regions` 引导项、把 weight 调到天上去，**全都不可能移动那个面**。之前讨论的"给中线加 guide outline"如果不先解决这个，做了也是白做。
+
+**幻影验证**（`hemisphere` 方块，内侧切面平直 vs 样本侧倾斜 10 体素，SyNOnly + CC(4) + [100,70,50]）：
+
+| pad | 切面 \|d\| max | 切面 \|d\| mean | Dice(atlas→sample) 前→后 | warp 后切面倾斜量 vs 真值 |
+|---|---|---|---|---|
+| 0 | **0.000** | **0.000** | 0.989 → 0.990 | **0** vs 4 |
+| 5 | — | — | 0.982 → **1.000** | **7** vs 7 |
+| 10 | 83.8 | 41.3 | 0.982 → **1.000** | 7 vs 7 |
+| 20 | 85.7 | 41.2 | 0.982 → **1.000** | 7 vs 7 |
+| 40 | 84.5 | 41.1 | 0.982 → **1.000** | 7 vs 7 |
+
+pad=0 时切面位移恒为 0、倾斜量永远是 0（内部却有 64.6µm 形变）；**只要有 padding 就完全解决**，5 就够，再大没有额外收益。
+
+**修法：补零背景，不是放宽 slicing**。新增 `atlas.background_margin_voxels`（走 `atlas_variants`），语义是"补到组织与六个面之间至少隔这么多空体素"，**不是**"再加这么多"——已经够宽的面不动，重复跑不会越补越大。
+
+**为什么不能改成"slicing 放宽 + 把对侧组织 mask 掉"**（我最初给用户的建议，被这次测量推翻）：内侧面那个**组织/背景的强度台阶**正是 metric 唯一能咬住的边；放进真实对侧组织就把台阶抹掉了，mask 只是"不计分"、并不会重建那个边。补零是把被钉死的面挪开、同时把台阶原样留下 —— 严格更优。
+
+**改动**：
+- `atlas_utils.py`：新增 `background_pad_width()`（测量逻辑 + 完整原因写在 docstring 里）；`_atlas_prep_postfix` 加 margin 段，**margin 为空时输出不变**，所以此前写好的缓存文件名照旧有效；抽出 `_read_atlas_array_xyz`/`_write_atlas_array_xyz`；`prepare_custom_atlas` 改为**两个文件一起处理**（padding 把它们耦合了：pad 宽度从 annotation 量出来，必须原样应用到 template，否则两者不再共享网格），缓存改成"两个都在才复用"。
+- `pipeline.py`：新增 `_log_atlas_face_clearance()`，每次跑都打印六个面的实际间隙；**只要有面是 0 就 WARNING**。这个失效模式静默且巨大（配准照样收敛、metric 照样下降，那个面只是悄悄不动），日志里不写出来根本看不见。
+- `config.py`：`atlas.background_margin_voxels` 校验（非负整数、拒绝 bool/float/字符串），并入 `_ATLAS_VARIANT_FIELDS`；非 custom 图谱用它会报错。
+- `tests/test_new_features_smoke.py`：新增 `test_atlas_background_margin`（只补不足的面、组织值不变、幂等、缓存 key 向后兼容）。
+
+**真实图谱验证**：DevCCF P04 + 现有 orientation/slicing + margin=20 → 形状 `(216,582,353)` → `(246,602,373)`，六个面间隙全部 =20，192 个 label 一个不少。体积 +24%。
+
+**测试**：`test_pipeline_smoke` / `test_brain_mask_smoke` / `test_label_correction_smoke` 全过；`test_new_features_smoke` 新增项通过，**该文件第 5 项 `test_assign_cell_regions` 失败是既有问题**（`KeyError: 'invtransforms'`，测试里构造的合成 `reg` dict 缺这个键），改动前后完全一致，本次没动。
+
+**下一步 / 跑完的 QC**：
+1. `run.log` 里确认六个面的 clearance 都是 20、没有 FLUSH 警告。
+2. 量新 `1Warp.nii.gz` 在中线那一层的位移 —— 0818 是恒为 0，这次必须显著非零。
+3. 目视 `labels_in_sample.nii.gz` 的中线是否跟着样本偏斜了。
+4. **注意**：本轮只解决了"中线被钉死"。用户报的另外两条（图谱整体偏大、没按 mask 范围收缩）是**全局尺度**问题，归 Affine 阶段管，padding 不会修好它 —— 而 `register.py` 的 guide 分支里 Affine 是**完全不吃 guide_regions 的**（引导项只进 SyNOnly），手画区域携带的尺度信息在 Affine 阶段被整个丢掉了。如果这次跑完中线对了但整体尺度还是不对，下一个要查的就是这里（`ants.label_image_registration` 的做法是用两侧区域质心先拟合初始变换）。

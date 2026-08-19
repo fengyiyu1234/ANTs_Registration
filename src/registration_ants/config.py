@@ -59,6 +59,7 @@ _ATLAS_VARIANT_FIELDS = {
     "atlas_res_um": ("registration", "atlas_res_um"),
     "orientation": ("atlas", "orientation"),
     "slicing": ("atlas", "slicing"),
+    "background_margin_voxels": ("atlas", "background_margin_voxels"),
 }
 
 
@@ -180,10 +181,16 @@ def load_config(path):
             raise ValueError("config.atlas.orientation must have exactly 3 entries")
         if atlas_cfg.get("slicing") is not None and len(atlas_cfg["slicing"]) != 3:
             raise ValueError("config.atlas.slicing must have exactly 3 entries (x,y,z), each [start,end] or null")
+        margin = atlas_cfg.get("background_margin_voxels")
+        if margin is not None and (not isinstance(margin, int) or isinstance(margin, bool) or margin < 0):
+            raise ValueError("config.atlas.background_margin_voxels must be a non-negative integer "
+                             "(voxels of zero background to keep between tissue and every array face)")
     elif atlas_cfg["source"] != "brainglobe":
         raise ValueError(f"config.atlas.source must be 'brainglobe' or 'custom', got {atlas_cfg['source']!r}")
-    elif atlas_cfg.get("orientation") is not None or atlas_cfg.get("slicing") is not None:
-        raise ValueError("atlas.orientation/slicing only apply when atlas.source is 'custom'")
+    elif (atlas_cfg.get("orientation") is not None or atlas_cfg.get("slicing") is not None
+            or atlas_cfg.get("background_margin_voxels") is not None):
+        raise ValueError("atlas.orientation/slicing/background_margin_voxels only apply when "
+                         "atlas.source is 'custom'")
 
     mask_cfg = config["mask"]
     if mask_cfg.get("atlas_exclude_regions") and atlas_cfg["source"] == "custom" and "ontology_path" not in atlas_cfg:
@@ -267,6 +274,19 @@ def load_config(path):
             "atlas_ids", int, "ontology structure ids (integers, descendants included)")
         guide_cfg["atlas_names"] = _normalize_label_map(
             "atlas_names", _region_name, "atlas region names (substring-matched against the ontology)")
+        # Optional per-label subtraction: e.g. pallium's atlas_ids descendant
+        # expansion also pulls in the olfactory bulb (a pallium descendant in
+        # DevCCF), so a label that guides the OB separately needs pallium's
+        # side to exclude it or the same atlas voxels get pulled toward two
+        # different sample outlines at once. Keyed by the SAME painted label
+        # atlas_ids/atlas_names describes, not by the label being subtracted.
+        guide_cfg["atlas_exclude_ids"] = _normalize_label_map(
+            "atlas_exclude_ids", int, "ontology structure ids to subtract (integers, descendants included)")
+        stray = set(guide_cfg["atlas_exclude_ids"]) - (set(guide_cfg["atlas_ids"]) | set(guide_cfg["atlas_names"]))
+        if stray:
+            raise ValueError(
+                f"mask.guide_regions.atlas_exclude_ids has label(s) {sorted(stray)} with no matching "
+                "atlas_ids/atlas_names entry to exclude from")
         weight = guide_cfg.get("weight", 1.0)
         if isinstance(weight, dict):
             guide_cfg["weight"] = {int(k): float(v) for k, v in weight.items()}

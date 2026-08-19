@@ -76,6 +76,30 @@ def convert_to_isotropic_nifti(raw_path, voxel_size_xyz, target_um, out_path):
     return img_iso
 
 
+def crop_bounds_to_grid(crop_cfg, raw_voxel_size_um, grid_spacing_um, grid_shape):
+    """registration.crop_for_registration bounds (raw-tiff voxel-index space,
+    x/y/z keys, each [start,end] or None/missing) -> [(lo,hi), ...] voxel-index
+    bounds (half-open, clipped to grid_shape) on a DIFFERENT grid that shares
+    the same physical origin (0) -- e.g. the full uncropped sample_fine grid,
+    which crop_for_registration's own indices are never expressed in.
+
+    Both grids start at physical origin 0 (raw_img and sample_fine both do --
+    see load_tiff_stack_as_ants / resample_to_isotropic, neither ever passes a
+    nonzero origin), so converting is a plain unit change: voxel_index *
+    this_grid's_spacing = physical position = other_grid's_voxel_index *
+    other_grid's_spacing.
+    """
+    bounds = []
+    for axis, key in enumerate(("x", "y", "z")):
+        spec = crop_cfg.get(key)
+        lo_raw = 0 if not spec or spec[0] is None else spec[0]
+        hi_raw = None if not spec or spec[1] is None else spec[1]
+        lo = int(round(lo_raw * raw_voxel_size_um[axis] / grid_spacing_um))
+        hi = grid_shape[axis] if hi_raw is None else int(round(hi_raw * raw_voxel_size_um[axis] / grid_spacing_um))
+        bounds.append((max(0, lo), min(grid_shape[axis], hi)))
+    return bounds
+
+
 def crop_to_bounds(img, x=None, y=None, z=None):
     """Crop an ANTs image to explicit voxel index ranges per axis (any axis
     left as None keeps its full extent), shifting the cropped image's origin
