@@ -3,6 +3,8 @@ from pathlib import Path
 
 import yaml
 
+from . import atlas_utils
+
 # Named atlas shortcuts, e.g. atlas.source: devccf_p04 instead of spelling out
 # template_path/annotation_path/resolution_um/ontology_path/orientation every time --
 # see configs/atlas_presets.example.yaml for the format. Real file is gitignored
@@ -221,12 +223,22 @@ def load_config(path):
         for required in ("regions_mask", "voxel_size_um"):
             if required not in guide_cfg:
                 raise ValueError(f"mask.guide_regions.{required} is required")
-        if not guide_cfg.get("atlas_ids") and not guide_cfg.get("atlas_names"):
-            raise ValueError("mask.guide_regions needs atlas_ids or atlas_names (atlas_ids preferred -- "
-                             "ids are matched exactly, names are substring-matched and can pull in "
-                             "unrelated structures; paint_mask.py writes ids into <output>.regions.json)")
         if not Path(guide_cfg["regions_mask"]).exists():
             raise FileNotFoundError(f"mask.guide_regions.regions_mask not found: {guide_cfg['regions_mask']}")
+        if not guide_cfg.get("atlas_ids") and not guide_cfg.get("atlas_names"):
+            # Neither is required by itself any more: a label with no entry
+            # here falls back to <regions_mask>.regions.json's own region_ids
+            # (see pipeline._build_guide_regions_from_labels) -- the ids
+            # paint_mask.py's ontology picker recorded when the label was
+            # actually painted, read straight from the mask instead of a
+            # hand copy of it that can drift out of sync across repaints.
+            sidecar = atlas_utils.regions_sidecar_path(guide_cfg["regions_mask"])
+            if not sidecar.exists():
+                raise ValueError(
+                    "mask.guide_regions needs atlas_ids or atlas_names (atlas_ids preferred -- ids are "
+                    "matched exactly, names are substring-matched and can pull in unrelated structures), "
+                    f"or a {sidecar.name} sidecar next to regions_mask (paint_mask.py writes one "
+                    f"automatically) -- found neither, and no sidecar at {sidecar}")
         if len(guide_cfg["voxel_size_um"]) != 3:
             raise ValueError("mask.guide_regions.voxel_size_um must be [x, y, z] in microns "
                              "-- required because a mask painted on a raw TIFF carries no "
@@ -282,11 +294,16 @@ def load_config(path):
         # atlas_ids/atlas_names describes, not by the label being subtracted.
         guide_cfg["atlas_exclude_ids"] = _normalize_label_map(
             "atlas_exclude_ids", int, "ontology structure ids to subtract (integers, descendants included)")
-        stray = set(guide_cfg["atlas_exclude_ids"]) - (set(guide_cfg["atlas_ids"]) | set(guide_cfg["atlas_names"]))
+        # A label can be configured here without ever appearing in atlas_ids/
+        # atlas_names (it falls back to the regions_mask sidecar instead --
+        # see above), so the stray check has to know about sidecar labels too.
+        sidecar_labels = set(atlas_utils.load_regions_sidecar_ids(guide_cfg["regions_mask"]))
+        stray = (set(guide_cfg["atlas_exclude_ids"])
+                 - (set(guide_cfg["atlas_ids"]) | set(guide_cfg["atlas_names"]) | sidecar_labels))
         if stray:
             raise ValueError(
                 f"mask.guide_regions.atlas_exclude_ids has label(s) {sorted(stray)} with no matching "
-                "atlas_ids/atlas_names entry to exclude from")
+                "atlas_ids/atlas_names/regions_mask-sidecar entry to exclude from")
         weight = guide_cfg.get("weight", 1.0)
         if isinstance(weight, dict):
             guide_cfg["weight"] = {int(k): float(v) for k, v in weight.items()}

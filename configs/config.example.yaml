@@ -129,6 +129,17 @@ mask:
   #     3: ["corpus callosum"]
   #   weight: 1.0        # 单值，或 {1: 1.0, 2: 0.5} 按 label 分别给
   #
+  #   # 【atlas_ids/atlas_names 都可以整个不写】：某个 label 在这两个字典里都
+  #   # 没有的话，会自动去 regions_mask 旁边同名的 <stem>.regions.json 里按
+  #   # label 读 region_ids —— 那是 paint_mask.py 画完导出时自动写的，记录的
+  #   # 是画那个 label 时在 GUI 本体树里【实际选中】的 id。好处是不用再手抄
+  #   # 一份 atlas_ids 到这份 config 里、并在每次重画/改选之后手动保持同步
+  #   # （手抄这件事本身就是问题的来源：改画之后配置文件很容易忘记跟着改，
+  #   # 而且不会报错——两边都能通过校验，只是配的和实际画的对不上）。
+  #   # 如果某个 label 在这里显式给了 atlas_ids，会优先用这份、不看 sidecar，
+  #   # 但如果两者不一致，运行时会打一条 WARNING 提醒（可能是忘了同步，也
+  #   # 可能是故意手动纠正 GUI 选错的节点）。
+  #
   #   # 【可选】atlas_ids/atlas_names 是按子结构【全部并入】展开的（同一个
   #   # label 下可以并多个），并不支持"减去"某个子结构 —— 但本体里子结构常常
   #   # 互相包含，比如 DevCCF 的 olfactory bulb 就是 pallium 的后代。如果
@@ -139,7 +150,8 @@ mask:
   #   # 而不是真正的分层。样本侧画的时候不用管这个：napari 的 Labels 层是
   #   # 单值光栅，后画的嗅球 label 自然把该区域从 pallium 的 label 里挖空。
   #   # 用 atlas_exclude_ids 从某个 label 的图谱侧减掉指定结构（含其后代），
-  #   # key 必须是 atlas_ids/atlas_names 里已经配过的 label：
+  #   # key 必须是 atlas_ids/atlas_names/regions_mask 的 sidecar 三者之一
+  #   # 配过的 label（哪怕 atlas_ids/atlas_names 都没写、完全靠 sidecar 也算）：
   #   atlas_exclude_ids:
   #     1: [15905]   # 把 label 1 (pallium) 的图谱轮廓里减掉 olfactory bulb
   #

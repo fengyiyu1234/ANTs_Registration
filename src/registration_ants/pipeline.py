@@ -18,6 +18,7 @@ directly (skipping the wrapper) still works but only prints to the console --
 nothing is written to run.log.
 """
 import logging
+import shutil
 import sys
 import time
 from datetime import timedelta
@@ -106,7 +107,22 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
     # to hand-written names for anything added by hand afterwards.
     ids_cfg = guide_cfg.get("atlas_ids") or {}
     names_cfg = guide_cfg.get("atlas_names") or {}
-    configured = sorted(set(ids_cfg) | set(names_cfg))
+
+    # Third, lowest-priority source: the ids paint_mask.py itself recorded in
+    # <regions_mask>.regions.json when this label was painted. A label absent
+    # from both atlas_ids and atlas_names falls back to this instead of
+    # erroring, so a config only has to spell out atlas_ids for the labels it
+    # wants to hand-override -- everything else is read straight from the
+    # mask's own sidecar instead of a copy of it that can drift out of sync.
+    sidecar_path = atlas_utils.regions_sidecar_path(guide_cfg["regions_mask"])
+    sidecar_ids = atlas_utils.load_regions_sidecar_ids(guide_cfg["regions_mask"])
+    for label, ids in sidecar_ids.items():
+        if label in ids_cfg and set(ids_cfg[label]) != set(ids):
+            logger.warning(
+                "Guide region label %d: mask.guide_regions.atlas_ids=%s does not match "
+                "%s's region_ids=%s for this label -- the mask was repainted/re-picked after "
+                "the config was written, or the override is deliberate. Using the config value.",
+                label, ids_cfg[label], sidecar_path.name, ids)
 
     # A painted label with no atlas pairing is normally a config omission, and
     # skipping it silently would mean hours of registration quietly ignoring
@@ -116,13 +132,21 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
     # drawn extent is systematically off from the atlas structure's (e.g. a
     # thin sheet drawn over only part of its length), which pulls the
     # deformation the wrong way rather than helping.
+    #
+    # Subtracted out of `configured` too, not just used to excuse it from the
+    # unconfigured check below: the sidecar now supplies a fallback id for
+    # EVERY painted label (including ones ignore_labels deliberately opts
+    # out of), so without this an ignored label would still get built into a
+    # guide pair.
     ignored = {int(v) for v in (guide_cfg.get("ignore_labels") or [])}
+    configured = sorted((set(ids_cfg) | set(names_cfg) | set(sidecar_ids)) - ignored)
     unconfigured = painted - set(configured) - ignored
     if unconfigured:
         raise ValueError(
             f"mask.guide_regions.regions_mask contains painted label(s) {sorted(unconfigured)} with no "
-            "atlas_ids/atlas_names entry -- they would be silently ignored. Add them, list them under "
-            "ignore_labels if that is deliberate, or remove them from the mask.")
+            f"atlas_ids/atlas_names entry and no matching region_ids in {sidecar_path} -- they would be "
+            "silently ignored. Add them, list them under ignore_labels if that is deliberate, or "
+            "re-export the mask from paint_mask.py so its sidecar covers them.")
     if ignored & painted:
         logger.info("Guide regions: ignoring painted label(s) %s by config", sorted(ignored & painted))
     stale = ignored - painted
@@ -139,10 +163,14 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
             source = f"atlas_ids[{label}] = {ids_cfg[label]}"
             atlas_arr, matched = atlas_utils.build_region_inclusion_mask_by_ids(
                 annotation_arr, atlas_structures, ids_cfg[label])
-        else:
+        elif label in names_cfg:
             source = f"atlas_names[{label}] = {names_cfg[label]}"
             atlas_arr, matched = atlas_utils.build_region_inclusion_mask(
                 annotation_arr, atlas_structures, names_cfg[label])
+        else:
+            source = f"{sidecar_path.name}.region_ids[{label}] = {sidecar_ids[label]}"
+            atlas_arr, matched = atlas_utils.build_region_inclusion_mask_by_ids(
+                annotation_arr, atlas_structures, sidecar_ids[label])
         if not matched:
             # Matching that hits nothing yields an all-False mask and no error;
             # the registration would then run with a guide term that can never
@@ -244,6 +272,12 @@ def run_pipeline(config_path):
     output_dir.mkdir(parents=True, exist_ok=True)
     transforms_prefix = str(output_dir / "transforms" / f"{sample['name']}_")
     Path(transforms_prefix).parent.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot the exact config this run used, next to its outputs -- config
+    # values (crop bounds, guide region ids, atlas variant...) otherwise live
+    # only in whatever the caller's working copy of the yaml says, which
+    # keeps changing as the next run's edits land on the same file.
+    shutil.copy2(config_path, output_dir / Path(config_path).name)
 
     _setup_logging()
     logger.info("Starting pipeline for sample '%s', config=%s", sample["name"], config_path)

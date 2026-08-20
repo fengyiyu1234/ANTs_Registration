@@ -320,6 +320,39 @@ def load_ccf_ontology_json(path):
     return flat
 
 
+def regions_sidecar_path(regions_mask_path):
+    """<regions_mask>.regions.json -- the sidecar Registration_toolkit's
+    paint_mask.py (guide mode) writes next to its exported multi-label
+    volume. Mirrors that tool's own _output_stem: .nii.gz is special-cased
+    because it is a double suffix, so plain Path.stem would only strip the
+    .gz and leave a bogus "<name>.nii.regions.json"."""
+    path = Path(regions_mask_path)
+    name = path.name
+    stem = name[: -len(".nii.gz")] if name.endswith(".nii.gz") else Path(name).stem
+    return path.with_name(stem + ".regions.json")
+
+
+def load_regions_sidecar_ids(regions_mask_path):
+    """{label: [ontology structure id, ...]} read back from a guide mask's
+    own .regions.json sidecar, or {} if the mask has no such sidecar (hand-
+    built mask, or role="atlas" side without one).
+
+    This is what paint_mask.py's ontology picker recorded at export time --
+    the ids actually highlighted in the GUI while a label was painted, not a
+    copy of them. A pipeline config's own atlas_ids has to be hand-copied
+    from the same sidecar and kept in sync by hand across repaints, which is
+    exactly the kind of drift a hand-copy invites (a label repainted against
+    a different ontology node, with the config's atlas_ids left stale). This
+    reads the sidecar directly instead, so there is nothing to keep in sync.
+    """
+    sidecar = regions_sidecar_path(regions_mask_path)
+    if not sidecar.exists():
+        return {}
+    with open(sidecar, encoding="utf-8") as f:
+        data = json.load(f)
+    return {int(label): [int(v) for v in ids] for label, ids in (data.get("region_ids") or {}).items()}
+
+
 def structures_at_levels(structures, min_level, max_level):
     """Filter an ontology dict (id -> info with 'structure_id_path', as
     returned by get_allen_atlas or load_ccf_ontology_json) down to structures
