@@ -4,10 +4,36 @@ import shutil
 from pathlib import Path
 
 import ants
+import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from .atlas_utils import get_allen_atlas
 
 _FWD_WARP_RE = re.compile(r"\d+Warp\.nii\.gz$")
+
+
+def _guide_union_image(guide_regions, ref_img, side, sigma_vox=2.0):
+    """Smoothed union of one side of every guide_regions pair, as an ANTsImage
+    on ref_img's grid -- the shape signal the guide branch's Affine stage is
+    driven by (see the comment at that call site for why intensity cannot be
+    used instead). side=0 reads the atlas-side image of each (atlas, sample,
+    weight) triple, side=1 the sample-side.
+
+    Gaussian-smoothed rather than left as a hard 0/1 step, so meansquares has
+    a gradient band at each region's boundary to climb instead of a flat
+    interior, a flat exterior, and nothing but a knife-edge between them.
+    sigma_vox=2 is what this was validated at: from two starting poses 1.20x
+    apart in one axis, the fitted Affine converged to the same stretch/
+    rotation both times (2.9d / 4.3d, [0.66,0.84,1.01] / [0.66,0.84,1.02]) --
+    the intensity-driven Affine on the same data returns each starting pose
+    unchanged instead (no attractor at all). See PROGRESS_LOG.md.
+    """
+    union = np.zeros(ref_img.shape, dtype="float32")
+    for triple in guide_regions:
+        union = np.maximum(union, (triple[side].numpy() > 0).astype("float32"))
+    smoothed = gaussian_filter(union, sigma_vox)
+    return ants.from_numpy(smoothed, spacing=ref_img.spacing, origin=ref_img.origin,
+                            direction=ref_img.direction)
 
 
 def _repair_invtransforms_for_initial(reg, initial_inverse, outprefix):
@@ -133,16 +159,23 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     guide_regions: optional list of (atlas_outline_img, sample_outline_img,
     weight) tuples -- for tissue that's genuinely present but too locally
     deformed for the intensity metric to align on its own (e.g. a bulged
-    patch of cortex that keeps ending up mapped to background). This is the
-    opposite of mask/moving_mask: instead of excluding a region, it adds an
-    extra term that actively pulls the deformation to make the two outlines
-    overlap, on top of the normal intensity metric -- see
+    patch of cortex that keeps ending up mapped to background). At the SyN
+    stage this is the opposite of mask/moving_mask: instead of excluding a
+    region, it adds an extra term that actively pulls the deformation to make
+    the two outlines overlap, on top of the normal intensity metric -- see
     ../GT_tool_for_registration/paint_mask.py's `guide` kind and scripts/project_outline.py
-    for how to produce the outline pair. When given, this forces a two-stage
-    registration (plain Rigid+Affine, then SyNOnly + multivariate_extras)
-    regardless of type_of_transform, because ANTs' multivariate_extras is
-    only supported for SyNOnly/antsRegistrationSyN* transforms. Validated on
-    synthetic data before wiring in (see PROGRESS_LOG.md): pulled two
+    for how to produce the outline pair. When given, this ALSO drives the
+    Affine stage before SyN (see _guide_union_image): the two outlines' own
+    silhouettes, not sample/atlas intensity, because on data where intensity
+    MI has no usable gradient (measured, see that function's docstring) this
+    is the only signal that gives the Affine a real optimum instead of a
+    no-op. type_of_transform="affine"/"Affine" stops after this Affine stage
+    (diagnostic use -- see ../Registration_toolkit/affine_probe.py); anything
+    else forces the same two-stage registration (plain Rigid+Affine, then
+    SyNOnly + multivariate_extras) regardless of the exact value, because
+    ANTs' multivariate_extras is only supported for SyNOnly/
+    antsRegistrationSyN* transforms. The SyN pull term itself was validated
+    on synthetic data before wiring in (see PROGRESS_LOG.md): pulled two
     deliberately-offset regions from Dice 0.18 to 0.92.
 
     syn_sampling: ants.registration()'s syn_sampling means DIFFERENT things
@@ -184,29 +217,65 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
                 aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=prealign_mm,
                 mask_all_stages=True,
             )["fwdtransforms"][0]
+        # Driven by the guide regions' SHAPE, not by sample/atlas intensity --
+        # measured on real data, Mattes MI between a cleared-tissue lightsheet
+        # sample and the DevCCF template is ~1/10 the magnitude ANTs' 1e-6
+        # convergence threshold needs to see any progress, so an intensity
+        # Affine here "converges" after ~9-12 iterations having moved nowhere.
+        # Confirmed with a perturbation test, not just low iteration counts:
+        # seeded 1.20x off in one axis, it returns 1.20x unchanged; seeded
+        # rotated 10 degrees, it returns 10 degrees unchanged -- a flat
+        # metric, not a local optimum near the seed. The guide regions' union
+        # silhouette has a real attractor instead (same perturbation test
+        # pulls back to the same answer from different seeds -- see
+        # _guide_union_image). This is still one global 12-DOF affine, same as
+        # the intensity version it replaces -- local shape correction is still
+        # SyN's job below, via the same guide_regions as a multivariate_extras
+        # term it already had. What changes is only what SyN starts from.
+        atlas_shape = _guide_union_image(guide_regions, atlas_template, side=0)
+        sample_shape = _guide_union_image(guide_regions, sample_img, side=1)
         reg_affine = ants.registration(
-            fixed=atlas_template, moving=sample_img, type_of_transform="Affine",
-            initial_transform=affine_init,
-            aff_metric="mattes", verbose=verbose, mask=mask, moving_mask=moving_mask,
-            mask_all_stages=True,
-        )
-        extras = [("MeanSquares", atlas_outline, sample_outline, weight, 0)
-                  for atlas_outline, sample_outline, weight in guide_regions]
-        reg = ants.registration(
-            fixed=atlas_template,
-            moving=sample_img,
-            type_of_transform="SyNOnly",
-            initial_transform=reg_affine["fwdtransforms"][0],
-            syn_metric="CC",
-            syn_sampling=syn_sampling,
-            reg_iterations=reg_iterations,
+            fixed=atlas_shape, moving=sample_shape, type_of_transform="Affine",
+            initial_transform=affine_init, aff_metric="meansquares", verbose=verbose,
             outprefix=outprefix,
-            verbose=verbose,
-            mask=mask,
-            moving_mask=moving_mask,
-            mask_all_stages=True,
-            multivariate_extras=extras,
         )
+        # outprefix matters here specifically (unlike the Translation prealign
+        # above, which stays scratch either way): when type_of_transform stops
+        # the pipeline at this stage below, this IS the final result, and
+        # without outprefix ants.registration() writes the .mat to a random
+        # temp path instead of somewhere this run keeps -- the in-memory reg
+        # dict still works for the rest of THIS run (apply_transforms reads it
+        # straight from reg['fwdtransforms']), but nothing durable survives
+        # for later reuse. When continuing to SyN below, this is harmless:
+        # that call's own outprefix write for its composite stage 0 produces
+        # the same content at the same path.
+        if type_of_transform.lower() == "affine":
+            # Diagnostic stop: the shape-driven Affine's own quality (does it
+            # cover the sample brain, is it a real fit or another no-op) is
+            # worth checking before paying for the SyN stage below -- see
+            # ../Registration_toolkit/affine_probe.py for the same check done
+            # standalone, without writing pipeline outputs. reg["fwdtransforms"]
+            # / reg["invtransforms"] are both just the one .mat here, same
+            # shape apply_transforms expects from any Affine-only reg.
+            reg = reg_affine
+        else:
+            extras = [("MeanSquares", atlas_outline, sample_outline, weight, 0)
+                      for atlas_outline, sample_outline, weight in guide_regions]
+            reg = ants.registration(
+                fixed=atlas_template,
+                moving=sample_img,
+                type_of_transform="SyNOnly",
+                initial_transform=reg_affine["fwdtransforms"][0],
+                syn_metric="CC",
+                syn_sampling=syn_sampling,
+                reg_iterations=reg_iterations,
+                outprefix=outprefix,
+                verbose=verbose,
+                mask=mask,
+                moving_mask=moving_mask,
+                mask_all_stages=True,
+                multivariate_extras=extras,
+            )
     else:
         prealign_mm = prealign_moving_mask if prealign_moving_mask is not None else moving_mask
         if initial_transform is not None:
