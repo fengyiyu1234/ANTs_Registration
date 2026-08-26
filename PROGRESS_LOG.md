@@ -1140,3 +1140,133 @@ Mask 侧：用户已经在 `paint_mask.py` 里删除 label 1/3/4 的游离关键
 1. 用户决定：这个 Affine 结果是否已经"good enough"到可以接上 SyN。如果是,把 `type_of_transform` 改回 `SyNRA`（或任意非 `"affine"` 的值,guide 分支只用这一个值判断是否早停),预期 1.5~3 小时,启动前会再确认。
 2. `atlas.slicing` 第三轴收紧到 `[151,371]`（此前测过,能去掉样本没有的腹侧 2mm 图谱地盘)这条建议本轮没有应用,仍然待做——可以和这次的形状驱动 Affine 叠加,预期覆盖率还能进一步改善,值得在正式跑 SyN 之前再探一次。
 3. label 5（hindbrain,`rel` 74%)之前标注"边缘情况,值得看一眼",还没有专门看过。
+
+---
+
+## 2026-08-25：在配准结果上改标签 —— `paint_mask.py` 新增 `mode: labels`，并把 partition 定义成"手工挑的分组树"而不是本体层级
+
+全部改动在 `../Registration_toolkit`，本仓库一行未动。
+
+### 需求
+
+现有两条路各缺一半：`paint_mask.py`（`mode: guide`）能在原图上从零画、能给每个画笔号指定图谱脑区，但不知道配准结果长什么样；`tools/edit_sample_labels.py` 从 `labels_in_sample.nii.gz` 起手、能按本体层级切换粒度，但导出的是像素级 delta，喂不回配准。要的是两者合体：**在配准输出上画，只画个别层，导出时整层进 keyframe、层间插值，并且能按脑区逐级细化**。
+
+### 关键结论：partition 不是本体深度
+
+最初的方案是"导出时锁定一个 ontology level，把所有 keyframe 折叠到该级"。**对 CCFv3 不成立**，拿 `atlas/DeMBA/DeMBA_P5_annotation.tif` 实测：
+
+| collapse 到 | 全 volume label 数（= guide 项数） | 单层最多 |
+|---|---|---|
+| level 2 | 24（其中只有 4 个真结构：root / Basic cell groups / fiber tracts / ventricular systems） | 14 |
+| level 3 | 35 | 18 |
+| level 4 | 59（已经细到 abducens nerve） | 24 |
+| level 6 | 184 | 53 |
+
+而且 annotation 里有 **20 个 id 根本不在 `CCF_v3_ontology.json` 里**（182305696、312782560…），`collapse_labels_to_level` 对它们原样穿过——level 2 那 24 个里 20 个是这种孤儿。CCFv3 的深度在"分区"这件事上没有一档是可用的：深度 2 只有细胞群/纤维束/脑室系统，深度 4 已经是脑神经。（DevCCF 不同，它 level 4 只有 15 个结构，最初的建议是照 DevCCF 的数字给的——这是本轮第一次判断失误的根因：**换了本体就得重新量，不能沿用另一套本体的层级手感**。）
+
+反过来看用户已经在用的 `atlas/mask/s12t_DeMBAguide7.regions.json`，那 7 组本来就**不是**任何一个深度：label 2 是 6 条纤维束并起来，label 5 是 Cerebellum + Hindbrain + cerebellum related fiber tracts，label 6 是 MOB + AOB nerve layer。这是按"guide 能有效拉动的尺度"手工挑的分区，而它的格式 `{画笔号: [ccf_ids]}` 恰好就是导出格式本身。
+
+所以把"level"重定义成 **一份 partition：一组分组，每组带若干 CCF 根 id，允许嵌套**。规则是**最深匹配**——一个体素归属于其 `structure_id_path` 上最深的那个组根。展开某一组＝给它的子结构各建新组，父组留下当残余；不用任何额外记账，太小的子结构没被建组就自动还归父组。
+
+### `shared/label_partition.py`（新增，约 490 行含 6 项 selftest）
+
+`Partition` / `Group`，核心 API：`from_regions_json` / `collapse` / `expandable` / `expand` / `merge_back`（递归）/ `atlas_exclude_ids` / `empty_atlas_side`。
+
+几个实现上必须记的点：
+
+- **`collapse` 走 `np.unique` + `searchsorted`，不建稠密 LUT**。CCFv3 的 id 最大到 6.1e8（DeMBA annotation 里有 614454272），`np.arange(max_id+1)` 要 2.4 GB 去描述几百个实际出现的 id。本仓库的 `atlas_utils.collapse_labels_to_level` 目前还是稠密 LUT 写法，对 CCFv3 能跑但很浪费，**这是一处已知可优化点，本轮没动**。
+- **`atlas_exclude_ids` 做了极小化**：exclude 项本身也按子树展开，所以列 `695` 就等于列了 `315/698/1089/822/1080`。不极小化的话残余 Cerebral cortex 会列 8 个 id 说同一件事。
+- **`empty_atlas_side` 必须用"每个 id 自己的体素数"，不能用 `atlas_reference.voxels_per_ontology_node` 的子树累计**。后者把每个体素记到全部祖先头上，父组的子组全被拆出去之后仍然报告它们的体素、永远不为空。第一版就是写错成子树累计，被 selftest 抓到。
+
+### 实测：展开 Cerebral cortex 该展到哪一级
+
+| 展开到 | annotation 里实际出现 | 其中 >1 mm³ | 尾巴 |
+|---|---|---|---|
+| 深度 5 | 2 | 2 | Cortical plate 95.8 / Cortical subplate 3.5 |
+| 深度 6 | 9 | 3 | Isocortex 58.5、Olfactory areas 18.9、**Hippocampal formation 18.4**，其余 6 个杏仁核/claustrum 在 0.25–1.02 |
+| 深度 7 | 36 | 10 | 后 26 个从 1.0 掉到 0.14 |
+| 深度 8 | 90 | ~20 | 尾巴是 `Perirhinal area, layer 6b` 0.00 mm³ |
+
+按 `configs/config.example.yaml` 里已经记着的实测结论（<1 mm³ 的 guide 区手圈误差占比太大，会主动把形变往错方向拽），深度 8 那 90 项里 70 个一个都不该成项。所以是**按需逐节点展开**，`expand()` 内建 `min_region_mm3`（默认 1.0）过滤，被过滤的子结构留在残余父组里。
+
+用户的目标（改 hippocampus 及再下一级）在 CCFv3 里是：`688 → 695 → 1089(HPF, 深度6) → 1080/822(深度7) → 375 Ammon's horn 6.4 / 726 Dentate gyrus 2.8(深度8)`。从 guide7 起手只展开 label 1 这一支，到 CA/DG 一级共 14 组、约 12 个生效 guide 项（现状是 7 组、`ignore_labels: [2,4]` 之后**实际只有 5 项生效**）。
+
+**代价**：Dentate gyrus 2.75 mm³ 且细长弯曲，正是日志里记过"每 20 层 Dice 只有 0.36、要每 10 层"的那个结构。展开到 CA/DG 意味着 hippocampus 所在 z 段的 keyframe 要从每 20 层加密到每 10 层。建议先只展到 Hippocampal region 9.3 / Retrohippocampal region 8.9（块状得多，每 20 层够）看效果。
+
+### 一个已经在手动做的事，现在自动了
+
+`configs/s12t.yaml:93` 的 `atlas_exclude_ids: {1: [507, 151]}` 就是一次手工的"非均匀展开 + 减去"——MOB(507) 在 CCFv3 里是 `688 → 695 → 698 → MOB` 的后代，但由 label 6 单独引导，不减掉的话同一批图谱体素被两个 guide pair 拉向不同目标。工具现在按 partition 树自动推导这一段并打进可粘贴的 config 片段。
+
+**一处对不上，值得注意**：从 guide7 的 sidecar 推出来是 `{1: [507]}`，config 里手写的是 `{1: [507, 151]}`。因为 sidecar 里 label 6 记的是 `[507, 1016]`，不含 AOB(151)——151 是手工额外加的。工具只保证"partition 记了什么就减什么"；AOB 目前不属于任何组、在样本侧归入 label 1 的残余，若仍要把它排除在图谱侧，得把它加进 label 6 或保留手写项。
+
+### 第二次判断失误：画布网格搞反了（用户指出）
+
+第一版 `mode: labels` 要求 `image_path` 是重采样后的 `*_fine_25um.nii.gz`，让人在 25 µm 各向同性网格上画。**这是错的**，而且本仓库 `pipeline.py:88` 的注释早就写着为什么：painted volume 必须活在原始 tiff 网格上，"that is the only grid where the structures are still resolvable by eye -- the isotropic resample throws away ~8x of the in-plane detail"。此外 25 µm 网格的 z 层是插值出来的，不是真正扫过的成像平面。
+
+改成：**画布仍是原始 tif，把配准结果重网格升采样到原图网格叠上去**。依据是本仓库的不变量——所有图像共享物理原点 0、identity direction、spacing 单位为微米（`io_utils.load_tiff_stack_as_ants` / `resample_to_isotropic` 从不传非零 origin，`crop_to_bounds` 裁剪时专门平移 origin），所以两网格之间每轴一次乘法即可，不需要任何变换。
+
+实现上两个决定：
+1. **先折叠再重网格**。`collapse` 跑在小的各向同性体积上（~20M 体素，uint32→uint8），只有 uint8 结果 gather 到原图网格（s12t 是 157×3974×2273 = 1.4e9 体素）。反过来做的话到达原图网格的是 uint32，4 倍内存。
+2. **用 numpy gather 而不是 `ants.resample_image_to_target`**。后者的 float32 往返每份约 5.7 GB；gather 是一次输出大小的分配，且离散 id 没有插值可以搞错。越界钳到边缘不回绕——`crop_for_registration` 之外 `labels_in_sample` 已被清零而原图是完整的，回绕会把对侧脑贴过来。
+
+**顺带修掉自己引入的一个 bug**：第一版写了 `voxel_size_um_from_spacing()`，把 NIfTI header spacing 乘 1000。这对**本仓库自己写出的文件是错的**——`labels_in_sample.nii.gz` 的 spacing 直接就是微米（读回来 25.0），乘完变成 25000 µm。外部下载的才是毫米（DevCCF 读回来 0.02）。改成 `labels_voxel_size_um()`，按数量级区分并打印实际采用哪种，`labels_voxel_size_um` 配置项可强制覆盖，header 是 (1,1,1) 时直接报错不猜。
+
+导出网格＝原图网格，所以打印的 `voxel_size_um` 就是 `[2.6, 2.6, 32.0]`，和 `mode: guide` 完全一致，直接替换 `configs/s12t.yaml` 的 `regions_mask` 即可。
+
+### 两个输出
+
+同一批整层 keyframe 喂 `mask_utils.interpolate_sparse_label_correction` 两次，只换 baseline：
+
+- baseline = 全 0 → **稀疏 guide**（`output_path`）：只有改过的层加层间插值，首尾 keyframe 之外留空，喂 `mask.guide_regions` 重新配准。
+- baseline = partition 折叠后的完整体积 → **稠密版**（`atlas_output_path`）：每层有值，下次打开继续画。
+
+用 `interpolate_sparse_label_correction` 而不是 guide 模式的 `interpolate_labels_separately`：这里所有区域共享同一批 keyframe（因为存的是整层），guide 模式那个"各 label keyframe 交错会互相吞掉"的问题不会出现；这里需要的反而是相邻区域为层间体素做逐区域 SDF 竞争，正是前者的行为。
+
+**keyframe 判定不挂 paint 事件**，而是 `paint != baseline` 逐层求或——mode: labels 的 baseline 本身就是折叠结果，diff 是精确的，而且 fill / 多边形擦除 / 撤销 / 批量 relabel 全都自动覆盖。展开 partition 时 `recollapse_keeping_edits()` 按"与旧 baseline 不同即为手改"保留手改像素、其余按新 partition 重新细化——实测在真实数据上：963 个手改体素原样保留、278972 个未碰过的体素细化到 CA/DG 粒度，3 个 keyframe 层仍被识别。
+
+**续做不复利**：`.keyframes.json` 记 `hand_drawn_slices` + **真正 baseline 的路径** + 两个网格的尺寸和体素大小（两个 header 里都没有）。重开时只读回那几层，其余从 `labels_path` 重新折叠重网格。不这么做的话本轮插值猜测会变成下轮"真值"，`paint_mask.load_guide_resume` 的 docstring 量化过：5 层的活第二轮回来变 11 层。
+
+### 实测代价
+
+在 251 GB / 48 核的机器上，按 s12t 的真实平面尺寸（3974×2273）：
+
+- 一次 signed-distance 场：**0.48 s**
+- `labels_export`：**2.4 s 每（keyframe 间隔 × 区域）**
+- 折叠 + 重网格 157 层：约 3 s
+
+按现有 36 个 keyframe 配十来个区域推算，**一次导出 15–20 分钟**。可接受（一次性），但应该知道。一个未做的优化：把每个区域的 EDT 限制在自己的包围盒内算（远处区域 SDF 恒为大正数不可能赢），能砍掉大部分——要改 `mask_utils` 并单独验证。
+
+### 显示：脑区默认填充
+
+`single_sample.py:936` 原本强制 `labels_layer.contour = 1`（只画边界）。改成默认填充，轮廓保留为控制面板里一个复选框——原注释说得对，轮廓压在高分辨率原图上是判断配准精度的主要手段，只是不该是默认。`_apply_region_contour()` 在两个视图加载函数末尾都调一次（两者都清空重建图层，新层是 napari 默认值）。高亮层 `>> Highlight Atlas <<` **故意不跟随**：它是搜索结果，轮廓化等于把刚搜到的东西藏起来。
+
+`paint_mask.py` 本来就是填充的（napari 0.8 的 Labels 默认 `contour = 0`，从没被覆盖过），加了同名同默认的 Display 面板保持两个工具一致。
+
+### 显示：面板宽度可调
+
+两件不同的事：
+
+- `single_sample.py` 两个面板写了 `setMaximumWidth(320)` —— **硬上限，怎么拖都不可能更宽**。
+- `paint_mask.py` 没有上限，但会被**最小宽度**钉住：Qt 从子控件 `minimumSizeHint` 推最小宽度，QLabel 的 hint 是最长那行的宽度，一路传到 QMainWindow，一句长说明就让分隔条推不动。
+
+`tools/atlas_view.py` 里已经有解法（`_shrinkable` = `setMinimumWidth(1)`，带说明）。提到 `shared/ontology_tree_ui.py` 成 `shrinkable()`，另加 `set_dock_width()` —— 用 `QMainWindow.resizeDocks` 给**起始宽度**而不是上限，设完两边照样能拖。应用到 paint_mask 全部 7 个面板（含本体树/列表控件本身）和 single_sample 两个面板。`tools/atlas_view.py` 未改（用户有未提交改动在里面），其私有 `_shrinkable` 仍可用，可择机去重。
+
+### `tests/test_gui_smoke.py`（新增，5 项，3.2 秒）
+
+此前所有测试都是无头的纯 numpy，覆盖不到面板接线。这次发现本机有 `xvfb-run`，napari 可以无头起窗口，于是补上：guide 模式（含 ontology 面板）、labels 模式（画布必须在原图网格、Expand/Merge、导出 5 个文件、稀疏/稠密边界）、续做（只恢复 keyframe）、填充/轮廓开关、面板宽度可调。
+
+三个写测试时才发现的坑：
+
+1. **ssh 转发的 X11 跑不了。** 本机 `DISPLAY=localhost:10.0`（渲染器字符串是 "2.1 Metal"，一路转发回客户端的 Mac），GL 只到 1.4，napari 的 shader 编译不过、进程 core dump 在 vispy 里。所以 Linux 上**即使 `$DISPLAY` 已设也优先用本地 xvfb**——测试从不真去看窗口，不可见但能用的 GL context 胜过可见但坏掉的。`GUI_SMOKE_USE_DISPLAY=1` 可强制。两者都没有则跳过，不算失败。
+2. **合成 annotation 写成 uint32 的 3D TIFF，SimpleITK 读回来是乱码**（8111 个 id），而其中碰巧有几个是对的，于是 partition 照样展开、测试照样通过。改成 `.nii.gz` 后干净的 5 个叶节点 id，并加了 `_assert_annotation_loaded()` 在所有测试之前断言"写进去什么就读回什么"。真实图谱两种格式都没问题，只有玩具图谱会踩到。
+3. 第一版 guide 模式测试传 `atlas=None`，**于是 `_add_ontology_picker` 从没被调用、用户点名的那个面板压根没被建出来**。改成带合成图谱跑。
+
+面板宽度那一项做了负向验证：把 cap 加回 ontology 面板 / 给 Partition 面板钉最小宽度 / 在 single_sample 恢复 cap，三种都能被抓到并指名道姓。single_sample 的面板建在 `MainController` 里需要真实样本目录，用源码级检查兜底——检查用 `tokenize` 剥掉注释和字符串再比对，因为解释"不要用 setMaximumWidth"的注释本身就含这个词。
+
+### 下一步
+
+1. 用真实 s12t 数据跑一次 `mode: labels`：从 `s12t_DeMBAguide7.regions.json` 起手，展开 label 1 到 Isocortex / Olfactory areas / HPF 一级，先不展到 CA/DG。
+2. 拿导出的稀疏 guide 替换 `configs/s12t.yaml` 的 `regions_mask`（`voxel_size_um` 不变，仍是 `[2.6, 2.6, 32.0]`），把自动生成的 `atlas_exclude_ids` 贴进去，重跑一次配准比较。
+3. AOB(151) 的归属要定：加进 label 6，还是保留 config 里的手写 exclude。
+4. 若 hippocampus 的 Dice 不到位再展开到 CA/DG，并把该 z 段的 keyframe 加密到每 10 层。
+5. 待办（本轮记下未做）：`atlas_utils.collapse_labels_to_level` 的稠密 LUT 换成 searchsorted；`labels_export` 的 per-region EDT 限定包围盒；`tools/atlas_view.py` 的 `_shrinkable` 去重。
