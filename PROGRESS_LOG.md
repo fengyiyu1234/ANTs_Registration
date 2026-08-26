@@ -1270,3 +1270,131 @@ Mask 侧：用户已经在 `paint_mask.py` 里删除 label 1/3/4 的游离关键
 3. AOB(151) 的归属要定：加进 label 6，还是保留 config 里的手写 exclude。
 4. 若 hippocampus 的 Dice 不到位再展开到 CA/DG，并把该 z 段的 keyframe 加密到每 10 层。
 5. 待办（本轮记下未做）：`atlas_utils.collapse_labels_to_level` 的稠密 LUT 换成 searchsorted；`labels_export` 的 per-region EDT 限定包围盒；`tools/atlas_view.py` 的 `_shrinkable` 去重。
+
+---
+
+## 2026-08-26：DeMBA P5 annotation 是 float32 —— 127 个 CCFv3 大 id 被舍入，换回官方 uint32 版并堵掉四处 cast
+
+起因很小：用户在 atlas view 里看完实际结构，要求把 `s12t_DeMBAguide7.regions.json` 的 label 2 从 6 条纤维束改成 `776`(corpus callosum) + `484682528`，并顺口问了一句"这个 id 数字太大了，会影响读取吗"。会。而且这一条追下去，从数据文件一直坏到加载器。
+
+### 现象与根因
+
+`atlas/DeMBA/DeMBA_P5_annotation.tif` 的 dtype 是 **float32**。float32 只有 24 位整数精度，超过 2²⁴ = 16,777,216 的整数会被吸附到最近的可表示值（在 4.8e8 量级上步长是 32）。CCFv3 有 **127 个 id 超过这条线**，最大 614,454,277。
+
+用户之所以要加 `484682528`，是因为他在 viewer 里点胼胝体中间那一段，查到的 id 就是它，本体一翻译报成 "commissural branch of stria terminalis"。实际上那是四个结构被压进同一个 float32 值：
+
+| uint32 id | 结构 | 官方文件里的真实体素 |
+|---|---|---|
+| 484682516 | ccb 胼胝体体部 | 198,512 |
+| 484682520 | or 视辐射 | 8,848 |
+| 484682524 | ar 听辐射 | 4,360 |
+| 484682528 | stc 终纹连合支 | 2,537 |
+| | **合计** | **214,257** ← 坏文件里那一桶的体素数，分毫不差 |
+
+后果：`descendant_ids_of(776)` 展开出 `484682516`，但 `np.isin` 在 float32 数组上匹配到 **0 个体素**，胼胝体体部整块消失，不报错不警告。用户说的"水平角度看胼胝体是不连续的"就是这个——实测各水平层的 2D 连通块：
+
+| 水平层(axis1) | 修复前 块数/体素 | 修复后 块数/体素 |
+|---|---|---|
+| 130 | 3 / 2,270 | **1** / 3,577 |
+| 140 | 2 / 1,236 | **1** / 3,687 |
+| 170 | 6 / 4,158 | 2 / 6,705 |
+| 180 | 3 / 5,747 | **1** / 6,888 |
+| 190 | 3 / 5,013 | **1** / 6,019 |
+
+修复前碎成 2–6 块，修复后是完整的 C 形弓。**用户凭解剖知识画的连续结构是对的，图谱是错的**——之前等于拿一个中间断掉的目标去引导一个连续的样本结构。
+
+### 全量损伤评估
+
+annotation 里超过 2²⁴ 的值共落成 24 个 float32 值：**4 个可唯一还原**（FRP6b / ORBm6b / HATA / Su3，32,884 体素），**20 个不可拆**（1,032,402 体素）。合计占全部有标签体素的 **3.63%**。最严重的几桶：
+
+| float32 值 | 合并了 |
+|---|---|
+| 607344832 | PN + IPR/IPC/IPA/IPL/IPI/IPDM/IPDL/IPRL（9 合 1，脚间核整个塌掉） |
+| 312782560 | VISa 全层 + VISli（8 合 1，跨区混） |
+| 484682496 | ProS 各亚区 + APr + scwm（8 合 1） |
+| 549009216 | LSS/RPF/InCo/MA3/P5/Acs5/PC5/I5（8 合 1） |
+| 484682528 | ccb + or + ar + stc（4 合 1） |
+
+同名分层合并的那几个（SSp-un、LGd、MM）影响不大，麻烦的是 VIS 跨区那几组。
+
+### 数据修复
+
+坏的不是本项目造的。旧 `DeMBA_P5_annotation.tif` 跟 `ClearMap/Resources/Atlas/p5_trimmed/DeMBA_P5_annotation_trimmed.tif` **md5 完全相同**（`17b7d73de163cb78ba89d54a70f9b793`），是直接拷过来的；那条链上游全是 float32。同目录的 `p4/DeMBA_P4_segmentation_2022.tif` 却是 uint32、77 个大 id 一个不少——说明是做 P5 那个 tif 时转的，不是官方数据的问题。
+
+DeMBA 的 P4 data descriptor 第 2 页明确警告过同一件事（"elastix introduces some rounding to very large values... e.g. 589508447 for the Hippocampo-amygdalar transition area"），他们的解法是**warp 前把 id 换成连续小整数、存盘前换回来**；文件清单里也区分了 `script_with_metadata/P4_resultSegmentation_2022.nii.gz`（"IDs are not consistent with the Allen ontology"）和顶层 `DeMBA_P4_segmentation_2022.nii.gz`（"IDs corresponding to Allen ontology"）。
+
+从 EBRAINS 重新取（DOI `10.25493/V3AH-HK7`，v2，CC-BY-4.0）。**页面默认只列顶层文件，体积文件在子目录里**，用 data-proxy 的公开 API 才看得到：
+
+```
+interpolated_segmentations/AllenCCFv3_segmentations/20um/2022/DeMBA_P5_segmentation_2022_20um.nii.gz  (11.3 MB, uint32)
+interpolated_volumes/DeMBA_templates/DeMBA_P5_brain.nii.gz
+compiled_volumes/AllenCCFv3-2022_segmentations/DeMBA_AllenCCFv3-2022_P4_to_P20.nii.gz  (4D 版，262 MB，同样可用)
+```
+
+重建（两个纯索引操作，无重采样）：
+
+```python
+v   = np.asanyarray(nib.load("DeMBA_P5_segmentation_2022_20um.nii.gz").dataobj)  # uint32 (570,400,705)
+arr = np.ascontiguousarray(np.transpose(v, (2,1,0))[39:602])                     # uint32 (563,400,570)
+```
+
+- `transpose(2,1,0)`：拿 `DeMBA_P5_brain.nii.gz` 跟 `p5_origin/DeMBA_P5_brain.tif` 比对，转置后逐体素完全相同
+- `[39:602]`：拿旧文件中间层去未裁剪体积里搜，唯一匹配在 index 320，反推 offset = 39，再整段 `array_equal` 确认。reference 用同一组参数也是 `array_equal` True
+- **无损证明**：`np.array_equal(new.astype(np.float32), old)` 为 True——旧文件就是新文件的 float32 像，边界一个体素没动
+
+新文件 uint32 (563,400,570)，684 个 label，md5 `3eccd2b7e1913b9a2ad0f0022572bb1b`。同时把过期的 `_1_3_2__285-510_full_35-356__pad20.tif` 缓存挪走（`prepare_custom_atlas` 的缓存，下次跑自动重建）。
+
+### 代码修复：四处 cast
+
+**磁盘修好只是必要条件，不充分**——本仓库的加载器每次读盘都在内存里把损坏重演一遍。
+
+| 位置 | 问题 |
+|---|---|
+| `io_utils.load_tiff_stack_as_ants` | 无条件 `.astype(np.float32)` |
+| `io_utils.load_nifti_stack_as_ants` | 同上，而且 **`ants.image_read` 默认 `pixeltype='float'`，在外面改 dtype 来不及**，必须传 `pixeltype='unsigned int'` |
+| `atlas_utils.get_allen_atlas` / `_read_atlas_array_xyz` / `_write_atlas_array_xyz` | BrainGlobe 标注、缓存读、缓存写三处都 cast |
+| `transforms.warp_labels_to_sample` | 把 annotation 直接送进 `ants.apply_transforms` |
+
+前三处加 `preserve_labels` 开关，annotation 传 True、template 维持 float32（强度图，配准需要浮点）。
+
+**第四处是 `test_pipeline_smoke.py` 抓出来的**：前三处改完后它挂在 `genericLabel interpolation introduced new label ids`。原因是 **ANTs/ITK 内部就是 float32**，annotation 只要经过 `apply_transforms`/`resample_image` 就会重新舍入——之前两边都坏所以对得上，图谱那边一准反而露馅。改成 DeMBA 那个办法：warp 前 `np.searchsorted` 把 id 重编号成 0..N-1，warp 后映射回去（几百个小整数在 float32 里完全精确）。合成数据验证：输入 `[0, 776, 484682516, 614454277]` → 输出完全一致，各 id 体素数不变。
+
+前因后果写成 `io_utils._LABEL_DTYPE_NOTE`，四处改动都指向它，并写明两类消费者的规矩：**只读 `.numpy()` 建 mask 的**（`_build_guide_regions_from_labels`、`build_region_exclusion_mask`，送进 ANTs 的是二值 mask 不是 annotation）加载时别 cast 就够；**要 warp annotation 的**必须先重编号。
+
+### 验证与副作用
+
+走真实加载路径（不是 `tifffile` 直读）：
+
+```
+annotation: uint32, pixeltype 'unsigned int'
+label 2 [776] -> 600,842 voxels   （修复前 402,330）
+   198512 ccb / 117755 fa / 100990 fp / 67084 ccg / 55733 ec / 55197 ccs / 5571 ee
+```
+
+sidecar 的 label 2 最终定为 `[776]` / `["corpus callosum"]`。**`484682528` 去掉了**——当初加它是为了捞回匹配不到的 ccb，修复后 `776` 自己就能正确展开，留着只会塞进 2,537 体素不相干的终纹连合支（修复前那一桶还会连带混进视辐射+听辐射 13,208 体素，约 6.5% 污染）。
+
+测试：4 个 smoke test 过 3 个。`test_new_features_smoke.py` 挂在 `KeyError: 'invtransforms'`，`git stash` 验过**改动前就是这样**，与本轮无关。
+
+**一个方法论教训**：中途一度宣布"已经修好了"，但那次验证用的是 `tifffile.imread` 直读文件，绕过了 pipeline 自己的加载器；走真实路径才发现 label 2 仍是 402,330。**改完数据必须用生产代码路径复验，不能用旁路脚本。**
+
+### 纠正 08-25 条目里的一处说法
+
+08-25 记的"annotation 里有 **20 个 id 根本不在 `CCF_v3_ontology.json` 里**（182305696、312782560…），`collapse_labels_to_level` 对它们原样穿过——level 2 那 24 个里 20 个是这种孤儿"——**那不是孤儿 id，正是本轮这些被 float32 舍入出来的假值**。换 uint32 之后 684 个 label 全部能在本体里查到，`np.isin` 匹配为 0 的情况不再存在。当时基于"孤儿 id"对 partition 层级做的计数（level 2 = 24 项等）应当重新量一遍。
+
+### 顺带记下
+
+- `kim_annotation_P4_to_P20.nii.gz`（DeMBA 同一数据集，uint32，4D 第 4 维是年龄）**index 1 = P5**——用 P5 brain mask 逐期算 Dice 确认：P4 0.841 / **P5 0.941** / P6 0.896 / P7 0.815。它是原生 P5 的 DevCCF 标注且跟本图谱同网格，比 sidecar `converted_from` 现在引的 `P04_DevCCF_Annotations_20um.nii.gz`（P4、另一套网格）合适得多。
+- `DeMBA_P5_lsfm.nii.gz` / `DeMBA_P5_mri.nii.gz` 是 25 µm 单模态平均图，(456,320,564)，跟图谱不是一套网格，用不上。
+- `atlas_utils.collapse_labels_to_level` 的稠密 LUT（08-25 已记的待办）现在更值得改：max id 由舍入后的 614454272 变回真值 614454277，`np.arange(max_id+1)` 仍是 2.4 GB。
+- 文件大小：uint32 和 float32 都是 4 字节/体素，改整数一个字节不多。真正影响体积的是压缩——这份 tif 加 zlib 是 514 MB → 4.9 MB（读写更快、`array_equal` 一致），本轮**按用户要求没有压缩**，维持无压缩 tif。
+- `atlas/` 整个目录在 `.gitignore` 里，`atlas/mask/` 下手画的 mask 和 sidecar 既不可复现也不在版本控制中，**需要单独备份**。
+
+### README
+
+根 `README.md` 新增 `## Atlas data` 一节，从读者角度写：用的是 DeMBA P5 + Allen CCFv3-2022（20 µm，DOI 10.25493/V3AH-HK7），三个文件名（`DeMBA_P5_segmentation_2022_20um.nii.gz` / `DeMBA_P5_brain.nii.gz` / `CCF_v3_ontology.json`，并提醒 2022 vs 2017 是不同 CCFv3 版本）、体积文件在哪两个子目录、转换代码，以及"annotation 必须读回 uint32"一句（细节指向 `_LABEL_DTYPE_NOTE`）。
+
+### 下一步
+
+1. sidecar 的 `converted_from` 换成 `kim_annotation_P4_to_P20.nii.gz` 的 P5 层。
+2. 重新量 08-25 那份 partition 层级统计（孤儿 id 已消失）。
+3. `collapse_labels_to_level` 换 searchsorted。

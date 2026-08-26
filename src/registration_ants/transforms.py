@@ -7,6 +7,7 @@ callers don't need to separately track which transform list maps which way.
 from pathlib import Path
 
 import ants
+import numpy as np
 
 
 def _mat_entries_to_invert(transformlist):
@@ -50,12 +51,36 @@ def warp_labels_to_sample(sample_reference_img, reg):
     Uses genericLabel interpolation so discrete label ids are preserved —
     linear/B-spline interpolation would blend adjacent label ids into
     meaningless intermediate values.
+
+    The ids are renumbered to 0..N-1 before the warp and mapped back after.
+    genericLabel already picks a nearest label rather than averaging, so this
+    is not about interpolation: it is about ANTs/ITK being float32 internally.
+    An id above 2**24 cannot survive a round trip through a float32 image (see
+    io_utils._LABEL_DTYPE_NOTE), and CCFv3 has 127 of them, so warping the raw
+    annotation silently returns ids that are not in the ontology — e.g.
+    484682516 "corpus callosum, body" coming back as 484682528, the id of a
+    different structure. There are only a few hundred distinct ids in any one
+    annotation, and small integers are exact in float32, so compacting the
+    value range sidesteps this entirely. DeMBA's own data descriptor documents
+    the same workaround for the same reason (elastix rounds identically).
     """
-    return ants.apply_transforms(
-        fixed=sample_reference_img, moving=reg["atlas_annotation"],
+    annotation = reg["atlas_annotation"]
+    ids = np.unique(annotation.numpy())
+    compact = ants.from_numpy(
+        np.searchsorted(ids, annotation.numpy()).astype(np.float32),
+        spacing=annotation.spacing, origin=annotation.origin, direction=annotation.direction,
+    )
+    warped = ants.apply_transforms(
+        fixed=sample_reference_img, moving=compact,
         transformlist=reg["invtransforms"], interpolator="genericLabel",
         whichtoinvert=_mat_entries_to_invert(reg["invtransforms"]),
     )
+    # Clip is belt-and-braces: genericLabel only ever emits values it read out
+    # of `compact`, but a future interpolator change here must not index out
+    # of `ids` silently.
+    idx = np.clip(np.rint(warped.numpy()).astype(np.intp), 0, len(ids) - 1)
+    return ants.from_numpy(np.ascontiguousarray(ids[idx]), spacing=warped.spacing,
+                           origin=warped.origin, direction=warped.direction)
 
 
 def transform_cell_points(points_df, reg, direction="atlas_to_sample"):

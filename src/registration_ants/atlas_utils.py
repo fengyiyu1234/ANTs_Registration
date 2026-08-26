@@ -34,7 +34,9 @@ def get_allen_atlas(resolution_um):
     atlas = BrainGlobeAtlas(f"allen_mouse_{resolution_um}um")
     spacing = (float(resolution_um),) * 3
     template = ants.from_numpy(atlas.reference.astype("float32"), spacing=spacing)
-    annotation = ants.from_numpy(atlas.annotation.astype("float32"), spacing=spacing)
+    # Annotation keeps BrainGlobe's own integer dtype -- these are the same
+    # CCFv3 structure ids that float32 cannot hold (io_utils._LABEL_DTYPE_NOTE).
+    annotation = ants.from_numpy(np.ascontiguousarray(atlas.annotation), spacing=spacing)
     return template, annotation, atlas.structures
 
 
@@ -73,7 +75,10 @@ def load_custom_atlas(template_path, annotation_path, resolution_um):
     loader = io_utils.load_nifti_stack_as_ants if _is_nifti(template_path) else io_utils.load_tiff_stack_as_ants
     template = loader(template_path, spacing)
     loader = io_utils.load_nifti_stack_as_ants if _is_nifti(annotation_path) else io_utils.load_tiff_stack_as_ants
-    annotation = loader(annotation_path, spacing)
+    # preserve_labels: structure IDs, not intensities -- float32 would round
+    # every CCFv3 id above 2**24 and silently merge structures. The whole
+    # story, with the measured damage, is in io_utils._LABEL_DTYPE_NOTE.
+    annotation = loader(annotation_path, spacing, preserve_labels=True)
     return template, annotation
 
 
@@ -147,16 +152,22 @@ def _atlas_prep_postfix(orientation, slicing_spec, background_margin_voxels=None
     return f'{orient_part}__{slicing_part}{margin_part}'
 
 
-def _read_atlas_array_xyz(src_path):
+def _read_atlas_array_xyz(src_path, preserve_labels=False):
     """Raw atlas file -> (x,y,z)-ordered array, per format -- the read half of
     prepare_custom_atlas, split out so template and annotation can be loaded
-    together (padding couples them: both must get the identical pad width)."""
+    together (padding couples them: both must get the identical pad width).
+
+    preserve_labels: True for an annotation, whose voxels are structure ids
+    rather than intensities (io_utils._LABEL_DTYPE_NOTE)."""
     src_path = Path(src_path)
     if _is_nifti(src_path):
         import ants
         # Already (x,y,z) on disk (see io_utils.load_nifti_stack_as_ants) --
         # no transpose needed before reorienting, unlike the TIFF branch below.
-        return ants.image_read(str(src_path)).numpy()
+        # pixeltype is forced here for the same reason the loader forces it:
+        # image_read's default 'float' rounds structure ids (_LABEL_DTYPE_NOTE).
+        pixeltype = "unsigned int" if preserve_labels else "float"
+        return ants.image_read(str(src_path), pixeltype=pixeltype).numpy()
     import tifffile
     return np.transpose(tifffile.imread(str(src_path)), (2, 1, 0))
 
@@ -169,7 +180,12 @@ def _write_atlas_array_xyz(arr_xyz, out_path, resolution_um):
         # Spacing here is only what this cache file's own header claims;
         # load_custom_atlas always overrides it from config.atlas.resolution_um
         # when this cache is loaded back, same as for the TIFF branch.
-        ants.image_write(ants.from_numpy(arr_xyz.astype(np.float32),
+        # An integer array is written out as-is: casting a label volume to
+        # float32 here would bake the id rounding this pipeline just went to
+        # some trouble to undo into the cache (io_utils._LABEL_DTYPE_NOTE).
+        # The TIFF branch below already preserves dtype for free.
+        arr_out = arr_xyz if np.issubdtype(arr_xyz.dtype, np.integer) else arr_xyz.astype(np.float32)
+        ants.image_write(ants.from_numpy(np.ascontiguousarray(arr_out),
                                          spacing=(float(resolution_um),) * 3), str(out_path))
     else:
         # Write back out in (z,y,x) on-disk order, matching how every other
@@ -279,7 +295,10 @@ def prepare_custom_atlas(template_path, annotation_path, resolution_um, orientat
     # on a shared grid, and with padding one cannot be rebuilt without the
     # other (the pad width comes from the annotation).
     if overwrite or not all(p.exists() for p in out_paths):
-        arrays = [_read_atlas_array_xyz(p) for p in src_paths]
+        # src_paths is [template, annotation] -- only the annotation is a
+        # label volume, so only it keeps its integer dtype through the prep.
+        arrays = [_read_atlas_array_xyz(p, preserve_labels=(i == 1))
+                  for i, p in enumerate(src_paths)]
         arrays = [reorient_volume(a, orientation) for a in arrays]
         if slicing_tuple is not None:
             arrays = [a[slicing_tuple] for a in arrays]

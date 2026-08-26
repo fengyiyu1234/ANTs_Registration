@@ -13,22 +13,62 @@ import tifffile
 from scipy.ndimage import gaussian_filter
 
 
-def load_tiff_stack_as_ants(raw_path, voxel_size_xyz):
+_LABEL_DTYPE_NOTE = """Why atlas annotations must not be cast to float32.
+
+An annotation volume looks like an image but is not one: each voxel holds an
+ontology structure ID, a label rather than a measurement. float32 keeps only 24
+bits of integer precision, so every ID above 2**24 = 16,777,216 is snapped to
+the nearest representable value -- and CCFv3 has 127 such IDs, going up to
+614,454,277. In the DeMBA P5 annotation that collapses 24 distinct float32
+values, e.g. 484682516 (corpus callosum, body), 484682520 (optic radiation),
+484682524 (auditory radiation) and 484682528 (commissural branch of stria
+terminalis) all land on 484682528.0. Once that has happened the four are
+indistinguishable, np.isin(annotation, [484682516]) matches nothing, and a
+guide mask built from the ontology silently loses the whole corpus callosum
+body (measured: 198,512 voxels, which is what made the callosum look like
+three disconnected pieces in a horizontal view).
+
+This is not a hypothetical: the copy of this atlas shipped with ClearMap had
+already been damaged this way on disk, and DeMBA's own data descriptor warns
+that elastix does the same thing (their workaround is to renumber IDs to small
+sequential integers before warping and back afterwards).
+
+Keeping the integer dtype on load is necessary but not sufficient: ANTs/ITK
+itself is float32 throughout, so an annotation handed to ants.resample_image
+or ants.apply_transforms comes back rounded regardless of the dtype it went in
+as. Two kinds of consumer therefore exist here:
+
+  - id lookups on the numpy array (pipeline._build_guide_regions_from_labels,
+    build_region_exclusion_mask). These never touch ANTs -- it is the
+    resulting BINARY mask, not the annotation, that reaches registration --
+    so loading without the cast is all they need.
+  - warping the annotation itself (transforms.warp_labels_to_sample). This
+    must renumber the ids to 0..N-1 before the warp and map back after, the
+    same workaround DeMBA used for elastix. Any new code that pushes the
+    annotation through ANTs needs to do likewise."""
+
+
+def load_tiff_stack_as_ants(raw_path, voxel_size_xyz, preserve_labels=False):
     """Read a TIFF stack and wrap it as an ANTs image with correct spacing.
 
     raw_path: path to a multi-page TIFF / BigTIFF volume.
     voxel_size_xyz: (sx, sy, sz) in microns, matching the physical x/y/z axes.
+    preserve_labels: keep the file's own integer dtype instead of casting to
+        float32 -- see _LABEL_DTYPE_NOTE. Pass True for an atlas ANNOTATION,
+        leave False for anything whose voxels are intensities.
 
     tifffile returns array axis order (z, y, x); this is transposed to
     (x, y, z) so it lines up with the (sx, sy, sz) spacing order ANTs expects.
     """
     arr_zyx = tifffile.imread(str(raw_path))
-    arr_xyz = np.transpose(arr_zyx, (2, 1, 0)).astype(np.float32)
+    arr_xyz = np.transpose(arr_zyx, (2, 1, 0))
+    if not preserve_labels:
+        arr_xyz = arr_xyz.astype(np.float32)
     sx, sy, sz = voxel_size_xyz
-    return ants.from_numpy(arr_xyz, spacing=(sx, sy, sz))
+    return ants.from_numpy(np.ascontiguousarray(arr_xyz), spacing=(sx, sy, sz))
 
 
-def load_nifti_stack_as_ants(raw_path, voxel_size_xyz):
+def load_nifti_stack_as_ants(raw_path, voxel_size_xyz, preserve_labels=False):
     """Read a NIfTI volume and wrap it as an ANTs image with correct spacing,
     discarding the file's own header spacing/direction/origin.
 
@@ -41,12 +81,19 @@ def load_nifti_stack_as_ants(raw_path, voxel_size_xyz):
 
     raw_path: path to a .nii/.nii.gz volume.
     voxel_size_xyz: (sx, sy, sz) in microns, matching the physical x/y/z axes.
+    preserve_labels: read the file as unsigned integers instead of float32 --
+        see _LABEL_DTYPE_NOTE. Pass True for an atlas ANNOTATION, leave False
+        for anything whose voxels are intensities. The cast has to be avoided
+        inside ants.image_read, not after it: image_read defaults to
+        pixeltype='float', so by the time .numpy() hands the array back the
+        large IDs have already been rounded.
 
     ants.image_read(...).numpy() returns the array in the same on-disk (i,j,k)
     order as e.g. nibabel's dataobj -- no reorientation happens on read, so
     (unlike the TIFF path) no transpose is needed here to reach (x,y,z) order.
     """
-    arr_xyz = ants.image_read(str(raw_path)).numpy().astype(np.float32)
+    pixeltype = "unsigned int" if preserve_labels else "float"
+    arr_xyz = ants.image_read(str(raw_path), pixeltype=pixeltype).numpy()
     sx, sy, sz = voxel_size_xyz
     return ants.from_numpy(arr_xyz, spacing=(sx, sy, sz))
 
