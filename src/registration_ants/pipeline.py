@@ -18,6 +18,7 @@ directly (skipping the wrapper) still works but only prints to the console --
 nothing is written to run.log.
 """
 import logging
+import os
 import shutil
 import sys
 import time
@@ -262,6 +263,38 @@ def _log_atlas_face_clearance(atlas_annotation, configured_margin):
                         ", ".join(flush))
 
 
+# Runs take hours and write ~20 files under output_dir; silently reusing a
+# directory that already holds a previous run mixes two runs' outputs (the
+# ones whose names happen to differ survive, the rest get overwritten) and
+# there is no way to tell afterwards which file came from which run. Set
+# REGANTS_OVERWRITE=1 to deliberately write into an existing directory.
+_OVERWRITE_ENV = "REGANTS_OVERWRITE"
+
+
+def _guard_output_dir(output_dir):
+    """Abort if output_dir already holds a previous run's outputs.
+
+    run.log is ignored: run_pipeline.sh creates output_dir and starts `tee`
+    into it *before* this process gets going, so a directory containing
+    nothing but run.log is this run's own doing, not a previous run's.
+    """
+    if os.environ.get(_OVERWRITE_ENV) == "1":
+        return
+    if not output_dir.exists():
+        return
+    existing = sorted(p.name for p in output_dir.iterdir() if p.name != "run.log")
+    if not existing:
+        return
+    raise SystemExit(
+        f"Refusing to run: output_dir already exists and is not empty: {output_dir}\n"
+        f"  contains: {', '.join(existing[:8])}"
+        f"{' ...' if len(existing) > 8 else ''}\n"
+        "Point config.output_dir (atlas_variants.<source>.output_dir) at a new "
+        f"directory, move/delete the old one, or set {_OVERWRITE_ENV}=1 to "
+        "overwrite it on purpose."
+    )
+
+
 def run_pipeline(config_path):
     config = load_config(config_path)
     sample = config["sample"]
@@ -269,6 +302,7 @@ def run_pipeline(config_path):
     prep_cfg = config["preprocess"]
 
     output_dir = Path(config["output_dir"])
+    _guard_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     transforms_prefix = str(output_dir / "transforms" / f"{sample['name']}_")
     Path(transforms_prefix).parent.mkdir(parents=True, exist_ok=True)

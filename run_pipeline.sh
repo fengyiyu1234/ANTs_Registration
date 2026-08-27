@@ -27,6 +27,18 @@ from registration_ants.config import load_config
 print(load_config(sys.argv[1])['output_dir'])
 " "$CONFIG_PATH")
 
+# Same guard as pipeline.py's _guard_output_dir(), applied here too because
+# this wrapper would otherwise create the directory and start appending to
+# run.log before Python ever gets a chance to refuse.
+if [ -d "$OUTPUT_DIR" ] && [ "$REGANTS_OVERWRITE" != "1" ]; then
+    LEFTOVERS=$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 ! -name run.log | head -n 1)
+    if [ -n "$LEFTOVERS" ]; then
+        echo "Refusing to run: output_dir already exists and is not empty: $OUTPUT_DIR" >&2
+        echo "Point output_dir at a new directory, move/delete the old one, or set REGANTS_OVERWRITE=1." >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$OUTPUT_DIR"
 LOG_PATH="$OUTPUT_DIR/run.log"
 
