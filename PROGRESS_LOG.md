@@ -1398,3 +1398,97 @@ sidecar 的 label 2 最终定为 `[776]` / `["corpus callosum"]`。**`484682528`
 1. sidecar 的 `converted_from` 换成 `kim_annotation_P4_to_P20.nii.gz` 的 P5 层。
 2. 重新量 08-25 那份 partition 层级统计（孤儿 id 已消失）。
 3. `collapse_labels_to_level` 换 searchsorted。
+
+---
+
+## 2026-08-28：0827 三组结果对比（baseline / rescale / weighted）—— label 4 的 id 是对错问题不是权重问题；形变不平滑的根源是 SyN guide 项用了二值 mask，已改为高斯平滑
+
+起因：用户看完 0827 全部结果，发现海马下缘被 root 覆盖、皮层一小块被推到 background，怀疑"自己手绘 mask + interpolate 不够准，不能正确指导配准"。把 `DeMBA_0827`（基线）/ `DeMBA_0827_rescale`（label 4 改用 8 个中脑核团 id）/ `DeMBA_0827_weighted`（label 4 保持 [313] 但 weight 0.3）三组结果和手绘 mask 系统比了一遍。结论：**mask 的插值不是瓶颈，rescale 的做法正确，weighted 的做法有副作用；真正的平滑度问题在代码里（SyN guide 项的二值边界），本轮已修。**
+
+### rescale vs weighted
+
+每个 guide label：warp 到样本空间的图谱区域 vs 手绘该 label 的 Dice（括号为体积比 warp/手绘）：
+
+| lbl | 区域 | 0827 基线 | rescale | weighted |
+|---|---|---|---|---|
+| 1 | Cerebral cortex | 0.931 | 0.927 | 0.928 |
+| 3 | Cerebral nuclei | 0.928 | 0.927 | **0.937** |
+| 4 | Midbrain | 0.124 (13.3x) | **0.896 (1.01x)** | 0.201 (7.9x) |
+| 5 | Cerebellum/HB | 0.681 | 0.707 | **0.811** |
+| 6 | Main olfactory bulb | **0.973** | **0.973** | 0.815 (0.77x) |
+| 7 | Interbrain | 0.928 | 0.919 | 0.892 |
+
+形变质量（1Warp 的 Jacobian）与"手绘组织落到 background/root"的泄漏率：
+
+| | %J≤0 | mean \|∇log J\| | p1(J) | 泄漏 |
+|---|---|---|---|---|
+| 0827 | 0.0026% | 0.0296 | 0.311 | 4.31% |
+| rescale | 0.0054% | 0.0300 | 0.287 | 4.35% |
+| weighted | **0.0178%** | **0.0385** | **0.185** | **5.25%** |
+
+根因：手绘 label 4 根本不是 CCFv3 `Midbrain(313)` 的全部——313 展开 1,529,791 体素，画的只有 45,647，**33 倍失配**。基线把整个中脑往那一小块上拽（体积比 13.3x）。rescale 换成实际画到的 8 个核团（MRN 128 / APN 215 / RN 214 / NB 580 / NOT 628 / PPT 1061 / OP 706 / DT 75，共 229,310 体素）后体积比 1.01、Dice 0.896——id 对了，问题消失。weighted 是"错误配对被小声执行"：折叠体素 3.3x，且副作用溢出——**嗅球 Dice 0.973→0.815（体积掉到 0.77x）**，丘脑内侧沿中线出现一条 12 万体素的 background 带。weighted 在 label 5 上的收益（0.681→0.811）是中脑被放松的连带效果，不值这个代价。
+
+**决策：采用 rescale 配置（config 已是），weight 全 1.0；若要 label 5 的收益，单独给 5 调。**
+
+### 手绘 mask 自检：插值不是瓶颈
+
+留一法（拿前后两个手绘层的 SDF 插值去预测中间那个手绘层；间隔翻倍，是悲观估计）：
+
+| lbl | 平均 Dice | 平均表面误差 (2.6 µm px) |
+|---|---|---|
+| 1 CTX | 0.845 | 22.7 (~59 µm) |
+| 3 CNU | 0.846 | 22.8 |
+| 4 MB | 0.616 | 40.0 |
+| 5 CB/HB | 0.927 | 8.9 |
+| 6 MOB | 0.932 | 7.8 |
+| 7 IB | 0.895 | 17.4 |
+| 2 cc | **0.001** | 270 |
+
+label 2（胼胝体）在水平面上是逐层剧变的薄弓，SDF 插值完全失效——`ignore_labels: [2]` 是正确的，别加回来。
+
+关键检验：用与手绘完全独立的 auto brain mask 作参照，按"该层离最近手绘关键帧的距离"分组量配准轮廓误差（20 µm 体素，rescale/weighted）：0 层距 6.76/6.10，0.6–2 层 6.86/6.08，2–4 层 6.39/5.86，4–7 层 6.48/5.74，>7 层 6.85/5.21。**完全平坦——在关键帧那层（插值误差为零）配准并不更准。多画层数不会改善配准，插值不是瓶颈。**
+
+### 海马下缘的 root 带：图谱自带，不是配准错误
+
+HPF 与丘脑之间的 root(997) 条带：图谱本身 5,386 体素、平均厚 2.21 体素；warp 后（rescale）3,135 体素、厚 2.22 体素，按 HPF 体积归一化只放大 1.14x（weighted 1.28x）。**CCFv3 在海马-丘脑之间（侧脑室/伞/脉络丛一带）本来就没有叶子标签**，改 mask 消不掉。要消：warp 后对 997 做最近邻叶子填充，或下游把 997 当"未分配"排除。
+
+### 形变不平滑的真正根源：SyN guide 项的二值边界（已修）
+
+粗糙度按"离最近 guide 区域边界的距离"分箱（rescale）：0–2 体素处 mean |∇log J| = 0.1473，40+ 体素处 0.0253——**贴边界处粗糙 6 倍，且全部折叠体素（J≤0）100% 落在 guide 边界 10 体素以内**。机制：`register.py` 送进 SyN `multivariate_extras` 的是原始 0/1 mask，MeanSquares 在其内外梯度为零、全部作用力集中成边界上一圈 δ，SyN 只能沿这条线剪切——而手绘边界自身就有 ±2–3 体素不确定度。Affine 阶段的 `_guide_union_image` 早就为同一理由做了 σ=2 平滑，SyN 这一路漏掉了。
+
+修复：新增 `register._smoothed_outline`（σ=2 高斯，与 `_guide_union_image` 同参数），extras 改为对每个 outline 平滑后再交给 ANTs。合成验证：48³ 球体 + 偏置 guide 区域，完整 guide 分支（Translation 预对齐 → shape Affine → SyNOnly + smoothed extras）跑通，warp 后 guide 区域 Dice 0.968（旧二值版当年的验证值是 0.92）。**"皮层被推到 background"的那几块（最大 2.2 万体素）正是边界剪切把组织挤出图谱轮廓所致，预期此修复直接缓解。**
+
+### sidecar 回写
+
+`s12t_DeMBAguide7.regions.json` 的 `region_ids[4]` 从 `[313]` 改为上述 8 个核团 id，`regions[4]` 同步为 8 个结构名，`converted_from.manual_overrides[4]` 记录了两次改动的历史与依据。config 与 sidecar 现在一致，`_build_guide_regions_from_labels` 的不一致 WARNING 不再触发。
+
+### 关键帧密度：画多少层才够
+
+同一份留一法数据回答"下个样本每个区要画几层"。**决定密度的是形状变化速率，不是面积大小**——"最宽处"通常在中段，恰恰变化最慢，一层就够：
+
+- **平滑中段 20-30 层间隔足够**。皮层 z=66→86（隔 25）、z=86→110（隔 33 重建 z=99）留一 Dice 仍有 0.83-0.90，而留一是双倍间隔的悲观估计。MOB 画了 15 层是浪费。
+- **必须加密的是起止端**。皮层 z=26 Dice 0.694（-42%）、z=142 0.639、z=151 0.727（-43%）——SDF 线性插值让面积匀速缩小，真实结构在端部快速收口。且 `interpolate_sparse_mask` 在首末关键帧之外一律留空，端点画短了直接截断结构。策略：起止层画在结构真正出现/消失处，再往内 3-5 层各补一层。
+- **形状剧变处**。label 4 是反例：间隔只有 8-11 层，Dice 仍只有 0.35-0.80——不是画少了，是截面在层间平移+变形，线性 SDF 跟不上。这种地方 3-5 层一画。
+- 相邻 label 尽量画在同一批层上（guide7 已经是：66/86/99/110 各 label 共用），共享边界在插值层上才不会互相错开。
+
+经验值：**起止各一层 + 端部内侧各一层 + 中段每个形状拐点一层，平滑段 20-30 层一层**。皮层这种大结构 6-8 层够，不需要现在的 18 层。
+
+### 合并 label 省掉胼胝体
+
+下个样本若不想单独画胼胝体，可以把皮层+胼胝体圈成一个实心 label。图谱侧**不能只写 `[688, 776]`**：两者之间还夹着 supra-callosal white matter(484682512, 7.3 万体素)、cingulum bundle(940, 5.3 万体素) 等薄层，只取 688∪776 会留 12.9 万体素内缝，而手绘是实心的，两边形状系统性不一致。补齐为 `[688, 776, 484682512, 940, 466, 884]`（+alveus, +amygdalar capsule）后剩余内缝仅 317 体素，实测是实心的。机制上无损失：guide 项只用轮廓，内部平坦无梯度，而胼胝体本来就是 `ignore_labels`。`atlas_exclude_ids: {该 label: [507, 151]}` 照旧。注意 484682512 是超 2²⁴ 的大 id，依赖 08-26 的 uint32 修复。
+
+### 工具：scripts/guide_mask_selftest.py
+
+把本轮的留一法分析固化成正式工具（之前是一次性脚本）。读任意 `<mask>.regions.json` sidecar，对每个 label 的每个内部关键帧做留一重建，报 Dice / 平均表面距离（可选 `--voxel-size-um` 换算成微米），并单列 Dice < 阈值的关键帧和各 label 的端点。只依赖 numpy/scipy/nibabel，不需要 ANTs。
+
+    python scripts/guide_mask_selftest.py atlas/mask/s12t_DeMBAguide7.nii.gz --voxel-size-um 2.6 2.6 32.0
+
+docstring 里写清了两个读法上的坑：结果是**双倍间隔的悲观估计**；以及**配准精度不与它成正比**（上面那张平坦的关键帧距离表），低分意味着"插值在编造这个形状"，不等于配准就差了。
+
+拿旧的 `s12t_guide6.nii.gz` 当反例跑，顺手发现并加了一项检查：**误笔关键帧**。guide6 里有 8 个平面只画了 1-259 像素（label 4 的 plane 46 只有 1 个像素，label 3 的 plane 124 只有 4 个），显然是手滑而不是标注。这种平面不只自己得 0 分——它夹在 SDF 混合中间，会把**两侧邻居**的重建一起拉垮，于是一个错误读起来像三个（label 3 的 119 和 126 双双塌到 0.041/0.002，元凶是中间那个 4 像素的 124）。工具现在按"该 label 关键帧面积中位数的 2%"判定，单列一节并在失败行上标注 `<- stray mark` / `<- neighbour is a stray mark; fix that first`。用中位数而非均值，免得一个误笔把基准拉低到藏住下一个。当前在用的 guide7 是 0 个误笔——这条检查同时验证了 guide6→guide7 的重画确实修掉了这批问题。
+
+### 下一步
+
+1. 用 rescale 配置 + smoothed extras 重跑一次，验证边界处 |∇log J| 与折叠体素下降、皮层 background 泄漏块缩小。
+2. 考虑拆开 label 5（CB+HB+纤维束一团，Dice 仅 0.71）——比加密关键帧有用。
+3. 997 的下游处理定一个策略（最近邻填充 or 排除）。

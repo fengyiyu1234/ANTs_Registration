@@ -14,3 +14,5 @@ atlas/
 # per-script local path configs -- real paths live in *_local.yaml, gitignored
 # so editing them isn't a git diff.
 *_local.yaml
+# startup-failure breadcrumb from run_pipeline.sh (see its header)
+run_pipeline.error.log

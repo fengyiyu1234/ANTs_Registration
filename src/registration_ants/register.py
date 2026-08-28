@@ -36,6 +36,29 @@ def _guide_union_image(guide_regions, ref_img, side, sigma_vox=2.0):
                             direction=ref_img.direction)
 
 
+def _smoothed_outline(img, sigma_vox=2.0):
+    """Gaussian-smoothed copy of one binary guide-region image, same grid --
+    what the SyN stage's multivariate_extras term is fed instead of the raw
+    0/1 mask.
+
+    Same rationale as _guide_union_image's smoothing, and it matters just as
+    much here: a binary mask gives meansquares a flat interior, a flat
+    exterior, and a knife-edge in between, so the guide term's entire pull
+    concentrates into a one-voxel shell at the boundary. Measured on the
+    s12t DeMBA_0827 runs (raw binary extras): mean |grad log J| within 2
+    voxels of a guide boundary was ~6x the far-field value (0.147 vs 0.025),
+    and 100% of folded voxels (J<=0) sat within 10 voxels of one -- the
+    deformation was shearing along a hand-drawn line whose own uncertainty
+    is +-2-3 voxels. Smoothing turns that knife-edge into a gradient band a
+    few voxels wide, so the pull acts as a ramp spread over the boundary
+    region instead. sigma_vox=2 matches _guide_union_image's validated
+    value. See PROGRESS_LOG.md (2026-08-28).
+    """
+    smoothed = gaussian_filter((img.numpy() > 0).astype("float32"), sigma_vox)
+    return ants.from_numpy(smoothed, spacing=img.spacing, origin=img.origin,
+                           direction=img.direction)
+
+
 def _repair_invtransforms_for_initial(reg, initial_inverse, outprefix):
     """Rebuild reg['invtransforms'] when an external initial_transform field
     was used. Mutates reg in place.
@@ -162,7 +185,10 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
     patch of cortex that keeps ending up mapped to background). At the SyN
     stage this is the opposite of mask/moving_mask: instead of excluding a
     region, it adds an extra term that actively pulls the deformation to make
-    the two outlines overlap, on top of the normal intensity metric -- see
+    the two outlines overlap, on top of the normal intensity metric (each
+    outline is Gaussian-smoothed before being handed to ANTs -- see
+    _smoothed_outline for why raw binary masks make the deformation shear
+    along the drawn boundary) -- see
     ../GT_tool_for_registration/paint_mask.py's `guide` kind and scripts/project_outline.py
     for how to produce the outline pair. When given, this ALSO drives the
     Affine stage before SyN (see _guide_union_image): the two outlines' own
@@ -259,7 +285,8 @@ def register_to_atlas(sample_img, atlas_template, atlas_annotation, atlas_struct
             # shape apply_transforms expects from any Affine-only reg.
             reg = reg_affine
         else:
-            extras = [("MeanSquares", atlas_outline, sample_outline, weight, 0)
+            extras = [("MeanSquares", _smoothed_outline(atlas_outline),
+                       _smoothed_outline(sample_outline), weight, 0)
                       for atlas_outline, sample_outline, weight in guide_regions]
             reg = ants.registration(
                 fixed=atlas_template,
