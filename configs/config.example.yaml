@@ -155,6 +155,19 @@ mask:
   #   atlas_exclude_ids:
   #     1: [15905]   # 把 label 1 (pallium) 的图谱轮廓里减掉 olfactory bulb
   #
+  #   # 【可选】damage_labels：把某几个画笔 label 解释成"样本上存在、但图谱里
+  #   # 【没有对应物】的组织"——不参与 guide pair，而是并进 moving_mask 把这些
+  #   # 体素从 metric 里挖掉，语义同下面的 sample_damage_mask_path。典型用途：
+  #   # 半脑样本局部切过了中线，多出的对侧薄片在半球图谱里没有对应物。
+  #   # 好处是和 guide 区域在同一次 paint_mask.py 会话里画（每个 label 独立做
+  #   # 关键帧插值，薄片只需画几层），不用单独维护一份 damage 文件。画的时候在
+  #   # ontology 树顶部选 "damage / no atlas counterpart" 分配给该 label 即可，
+  #   # 导出的 sidecar 会记下 damage_labels，这里就【可以不写】（sidecar 自动
+  #   # 读入，同 region_ids 的 fallback 逻辑；显式写的 atlas_ids/atlas_names/
+  #   # ignore_labels 优先于 sidecar 的 damage 标记）。与 ignore_labels 的
+  #   # 区别：ignore 是"当没画过"，damage 是"主动从 metric 里排除"。
+  #   damage_labels: [9]
+  #
   # 关键层间隔按结构选（实测 Dice：形状连续的大结构每 20 层够用，细长/弯曲的
   # 会崩）：cortex 每 20 层 0.82、cerebellum 每 20 层 0.90，但 corpus callosum
   # 每 20 层只有 0.40、dentate gyrus 0.36 —— 后两者要每 10 层。

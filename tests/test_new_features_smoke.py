@@ -186,7 +186,8 @@ def test_assign_cell_regions(tmp_dir):
     atlas_annotation = ants.from_numpy(atlas_arr, spacing=(25.0, 25.0, 25.0))
 
     sample_fine_img = ants.from_numpy(np.zeros((20, 20, 20), dtype=np.float32), spacing=(50.0, 50.0, 50.0))
-    reg = {"fwdtransforms": [], "atlas_annotation": atlas_annotation}  # [] == identity (verified: ants passes points through unchanged)
+    reg = {"fwdtransforms": [], "invtransforms": [],  # [] == identity (verified: ants passes points through unchanged)
+           "atlas_annotation": atlas_annotation}
     atlas_structures = {5: {"name": "RegionFive"}}
 
     voxel_size_um = (5.0, 5.0, 5.0)
@@ -289,6 +290,66 @@ def test_apply_atlas_variant():
     print("   OK (pass-through / multi-field override / partial entry / unknown-source and unknown-field validation all correct)")
 
 
+def test_guide_damage_labels(tmp_dir):
+    print("7. pipeline._build_guide_regions_from_labels damage_labels...")
+    import ants
+    from registration_ants import pipeline
+
+    shape = (6, 5, 4)  # (x, y, z), same grid for sample and "atlas"
+    sample_ref = ants.from_numpy(np.zeros(shape, dtype=np.float32), spacing=(20.0, 20.0, 20.0))
+
+    regions = np.zeros(shape, dtype=np.uint8)
+    regions[1:3, 1:4, 1:3] = 1   # guide label, paired to atlas id 5
+    regions[5, :, :] = 9         # damage label: tissue with no atlas counterpart
+    regions_path = tmp_dir / "guide_damage_regions.nii.gz"
+    ants.image_write(ants.from_numpy(regions.astype(np.float32)), str(regions_path))
+
+    annotation = np.zeros(shape, dtype=np.float32)
+    annotation[1:3, 1:4, 1:3] = 5
+    ann_img = ants.from_numpy(annotation, spacing=(20.0, 20.0, 20.0))
+    structures = {5: {"name": "testregion", "structure_id_path": [5]}}
+
+    guide_cfg = {"regions_mask": str(regions_path), "voxel_size_um": [20.0, 20.0, 20.0],
+                 "atlas_ids": {1: [5]}, "atlas_names": {}, "atlas_exclude_ids": {},
+                 "weight": 1.0, "damage_labels": [9]}
+    triples, hole = pipeline._build_guide_regions_from_labels(guide_cfg, sample_ref, ann_img, structures)
+    assert len(triples) == 1, "damage label must not become a guide pair"
+    assert hole is not None and hole.dtype == bool and hole.shape == shape
+    assert np.array_equal(hole, regions == 9), "hole must cover exactly the damage-label voxels"
+
+    # Without damage_labels the unpaired label 9 must still be refused loudly.
+    plain_cfg = dict(guide_cfg, damage_labels=[])
+    try:
+        pipeline._build_guide_regions_from_labels(plain_cfg, sample_ref, ann_img, structures)
+        assert False, "unconfigured painted label must raise"
+    except ValueError as e:
+        assert "damage_labels" in str(e), "error should point at the damage_labels option"
+
+    # A damage label that is not painted is stale config.
+    stale_cfg = dict(guide_cfg, damage_labels=[9, 7])
+    try:
+        pipeline._build_guide_regions_from_labels(stale_cfg, sample_ref, ann_img, structures)
+        assert False, "unpainted damage label must raise"
+    except ValueError:
+        pass
+
+    # The sidecar's own damage_labels (paint_mask.py's "damage / no atlas
+    # counterpart" pseudo-region) work with NO config entry at all.
+    import json
+    sidecar_path = tmp_dir / "guide_damage_regions.regions.json"
+    sidecar_path.write_text(json.dumps({"region_ids": {"1": [5]}, "damage_labels": [9]}))
+    try:
+        triples, hole = pipeline._build_guide_regions_from_labels(
+            dict(guide_cfg, damage_labels=[]), sample_ref, ann_img, structures)
+        assert len(triples) == 1 and hole is not None and np.array_equal(hole, regions == 9), \
+            "sidecar damage_labels must be honored without a config entry"
+    finally:
+        sidecar_path.unlink()
+
+    print("   OK (damage label excluded from guide pairs, hole exact, sidecar fallback works, "
+          "unconfigured/stale still raise)")
+
+
 def main():
     tmp_dir = Path(tempfile.mkdtemp(prefix="registration_ants_smoketest_"))
 
@@ -299,6 +360,7 @@ def main():
     test_read_centroid_csv(tmp_dir)
     test_assign_cell_regions(tmp_dir)
     test_apply_atlas_variant()
+    test_guide_damage_labels(tmp_dir)
 
     print("\nALL SMOKE TESTS PASSED")
 

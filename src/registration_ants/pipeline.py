@@ -71,8 +71,11 @@ def _preprocess(img, prep_cfg):
 
 
 def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, atlas_structures):
-    """(atlas_region_img, sample_region_img, weight) triples from ONE
-    hand-painted multi-label volume plus atlas region names.
+    """(guide_triples, damage_hole): (atlas_region_img, sample_region_img,
+    weight) triples from ONE hand-painted multi-label volume plus atlas region
+    names, and a bool array (registration grid, or None) of voxels painted
+    with a damage_labels label -- sample tissue with no atlas counterpart,
+    for the caller to punch out of moving_mask.
 
     Only the sample side is drawn by hand; the atlas side comes out of the
     annotation, so a region never has to be painted twice.
@@ -140,13 +143,35 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
     # out of), so without this an ignored label would still get built into a
     # guide pair.
     ignored = {int(v) for v in (guide_cfg.get("ignore_labels") or [])}
-    configured = sorted((set(ids_cfg) | set(names_cfg) | set(sidecar_ids)) - ignored)
-    unconfigured = painted - set(configured) - ignored
+    # damage_labels: painted regions that mark sample tissue with NO atlas
+    # counterpart (e.g. a sliver of contralateral tissue past the midline on a
+    # hemisphere sample). Not built into a guide pair; instead returned as a
+    # hole for the caller to merge into moving_mask, same semantics as
+    # mask.sample_damage_mask_path. Painting them here instead of a separate
+    # damage file gets paint_mask.py's per-label keyframe interpolation and
+    # keeps everything in one painting session. The sidecar's own
+    # damage_labels (labels assigned to the GUI's "damage / no atlas
+    # counterpart" pseudo-region at export) are unioned in, same
+    # nothing-to-keep-in-sync rationale as the region_ids fallback above --
+    # but an explicit config entry for a label (atlas_ids/atlas_names/
+    # ignore_labels) beats the sidecar, mirroring the atlas_ids precedence.
+    config_damage = {int(v) for v in (guide_cfg.get("damage_labels") or [])}
+    sidecar_damage = set(atlas_utils.load_regions_sidecar_damage_labels(guide_cfg["regions_mask"]))
+    overridden = sidecar_damage & (set(ids_cfg) | set(names_cfg) | ignored)
+    if overridden:
+        logger.warning(
+            "Guide regions: label(s) %s are marked damage in %s but the config explicitly "
+            "configures them (atlas_ids/atlas_names/ignore_labels) -- using the config value.",
+            sorted(overridden), sidecar_path.name)
+    damage = config_damage | (sidecar_damage - overridden)
+    configured = sorted((set(ids_cfg) | set(names_cfg) | set(sidecar_ids)) - ignored - damage)
+    unconfigured = painted - set(configured) - ignored - damage
     if unconfigured:
         raise ValueError(
             f"mask.guide_regions.regions_mask contains painted label(s) {sorted(unconfigured)} with no "
             f"atlas_ids/atlas_names entry and no matching region_ids in {sidecar_path} -- they would be "
-            "silently ignored. Add them, list them under ignore_labels if that is deliberate, or "
+            "silently ignored. Add them, list them under ignore_labels if that is deliberate, list them "
+            "under damage_labels if they mark tissue with no atlas counterpart, or "
             "re-export the mask from paint_mask.py so its sidecar covers them.")
     if ignored & painted:
         logger.info("Guide regions: ignoring painted label(s) %s by config", sorted(ignored & painted))
@@ -154,6 +179,16 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
     if stale:
         raise ValueError(f"mask.guide_regions.ignore_labels lists label(s) {sorted(stale)} that are not "
                          "painted in regions_mask -- stale config, or the wrong mask file.")
+    stale_damage = config_damage - painted
+    if stale_damage:
+        raise ValueError(f"mask.guide_regions.damage_labels lists label(s) {sorted(stale_damage)} that are "
+                         "not painted in regions_mask -- stale config, or the wrong mask file.")
+    damage_hole = None
+    if damage:
+        damage_hole = np.isin(regions_arr, sorted(damage))
+        logger.info("Guide regions: damage label(s) %s mark %d voxel(s) as tissue with no atlas "
+                    "counterpart -- excluded from the metric via moving_mask",
+                    sorted(damage), int(damage_hole.sum()))
 
     annotation_arr = atlas_annotation.numpy()
     weight_cfg = guide_cfg["weight"]
@@ -227,7 +262,7 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
                             origin=sample_ref.origin, direction=sample_ref.direction),
             weight,
         ))
-    return out
+    return out, damage_hole
 
 
 def _log_atlas_face_clearance(atlas_annotation, configured_margin):
@@ -506,9 +541,10 @@ def run_pipeline(config_path):
         prealign_moving_mask = auto_mask_img
 
     guide_regions = None
+    guide_damage_hole = None
     guide_cfg = mask_cfg.get("guide_regions")
     if isinstance(guide_cfg, dict):
-        guide_regions = _build_guide_regions_from_labels(
+        guide_regions, guide_damage_hole = _build_guide_regions_from_labels(
             guide_cfg, sample_fine_prep, atlas_annotation, atlas_structures)
     elif guide_cfg:
         guide_regions = []
@@ -518,6 +554,19 @@ def run_pipeline(config_path):
             guide_regions.append((atlas_outline, sample_outline, gr.get("weight", 1.0)))
         logger.info("Loaded %d guide region(s): %s", len(guide_regions),
                     [gr["sample_outline_path"] for gr in guide_cfg])
+
+    if guide_damage_hole is not None and guide_damage_hole.any():
+        # Same moving_mask semantics as sample_damage_mask_path (see the
+        # comment above prealign_moving_mask); ANDed with it when both exist.
+        keep = (sample_mask.numpy() > 0) if sample_mask is not None \
+            else np.ones(sample_fine_prep.shape, dtype=bool)
+        newly_excluded = int((keep & guide_damage_hole).sum())
+        keep &= ~guide_damage_hole
+        sample_mask = ants.from_numpy(keep.astype("float32"), spacing=sample_fine_prep.spacing,
+                                      origin=sample_fine_prep.origin,
+                                      direction=sample_fine_prep.direction)
+        logger.info("Merged guide-mask damage label(s) into moving_mask: %d voxel(s) newly excluded, "
+                    "%.1f%% of the registration grid participates", newly_excluded, 100 * keep.mean())
 
     init_cfg = reg_cfg.get("initial_transform") or {}
     initial_transform = init_cfg.get("path")

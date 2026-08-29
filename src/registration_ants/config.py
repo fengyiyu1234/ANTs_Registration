@@ -304,6 +304,31 @@ def load_config(path):
             raise ValueError(
                 f"mask.guide_regions.atlas_exclude_ids has label(s) {sorted(stray)} with no matching "
                 "atlas_ids/atlas_names/regions_mask-sidecar entry to exclude from")
+        for key in ("ignore_labels", "damage_labels"):
+            raw = guide_cfg.get(key) or []
+            if not isinstance(raw, (list, tuple)):
+                raise ValueError(f"mask.guide_regions.{key} must be a list of painted labels (integers)")
+            try:
+                labels = sorted({int(v) for v in raw})
+            except (TypeError, ValueError):
+                raise ValueError(f"mask.guide_regions.{key} must be a list of painted labels "
+                                 f"(integers), got {raw!r}") from None
+            if any(label < 1 for label in labels):
+                raise ValueError(f"mask.guide_regions.{key} labels must be >= 1 (0 is background)")
+            guide_cfg[key] = labels
+        both = set(guide_cfg["ignore_labels"]) & set(guide_cfg["damage_labels"])
+        if both:
+            raise ValueError(
+                f"mask.guide_regions label(s) {sorted(both)} appear in both ignore_labels and "
+                "damage_labels -- ignore drops the painted voxels entirely, damage excludes them "
+                "from the metric; pick one per label.")
+        guided_damage = set(guide_cfg["damage_labels"]) & (set(guide_cfg["atlas_ids"])
+                                                           | set(guide_cfg["atlas_names"]))
+        if guided_damage:
+            raise ValueError(
+                f"mask.guide_regions label(s) {sorted(guided_damage)} appear in damage_labels AND in "
+                "atlas_ids/atlas_names -- a label cannot both mark tissue with no atlas counterpart "
+                "and be pulled toward an atlas region.")
         weight = guide_cfg.get("weight", 1.0)
         if isinstance(weight, dict):
             guide_cfg["weight"] = {int(k): float(v) for k, v in weight.items()}

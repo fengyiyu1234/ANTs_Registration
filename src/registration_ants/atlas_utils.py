@@ -372,6 +372,22 @@ def load_regions_sidecar_ids(regions_mask_path):
     return {int(label): [int(v) for v in ids] for label, ids in (data.get("region_ids") or {}).items()}
 
 
+def load_regions_sidecar_damage_labels(regions_mask_path):
+    """Sorted brush labels the guide mask's .regions.json sidecar marks as
+    damage -- sample tissue with NO atlas counterpart (paint_mask.py's
+    "damage / no atlas counterpart" pseudo-region), [] without a sidecar or
+    the key. Same read-the-sidecar-instead-of-a-hand-copy rationale as
+    load_regions_sidecar_ids: the pipeline unions these with the config's own
+    mask.guide_regions.damage_labels, so a label marked damage in the GUI
+    needs no config entry at all."""
+    sidecar = regions_sidecar_path(regions_mask_path)
+    if not sidecar.exists():
+        return []
+    with open(sidecar, encoding="utf-8") as f:
+        data = json.load(f)
+    return sorted(int(v) for v in (data.get("damage_labels") or []))
+
+
 def structures_at_levels(structures, min_level, max_level):
     """Filter an ontology dict (id -> info with 'structure_id_path', as
     returned by get_allen_atlas or load_ccf_ontology_json) down to structures

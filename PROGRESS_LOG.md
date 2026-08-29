@@ -1492,3 +1492,32 @@ docstring 里写清了两个读法上的坑：结果是**双倍间隔的悲观�
 1. 用 rescale 配置 + smoothed extras 重跑一次，验证边界处 |∇log J| 与折叠体素下降、皮层 background 泄漏块缩小。
 2. 考虑拆开 label 5（CB+HB+纤维束一团，Dice 仅 0.71）——比加密关键帧有用。
 3. 997 的下游处理定一个策略（最近邻填充 or 排除）。
+
+## 2026-08-29：半脑样本局部越中线的处理 —— guide mask 新增 `damage_labels`
+
+**背景/决定**：
+- 6 个半脑样本切割时中线不完全一致：有的中段 z 局部略越过中线（多出一条对侧组织），有的略少于中线。定下的规则：**图谱永远严格按解剖中线裁切（所有样本同一参考），样本侧把越过中线的组织从 metric 里排除**——否则样本内侧的"组织/背景"强度台阶在物理切面而不是解剖中线上，metric 会把图谱中线拉去对齐切面，内侧结构被系统性拉宽、对侧细胞被错归进内侧核团（与图谱侧"不放宽 slicing"是同一逻辑的镜像）。
+- 越中线的样本经此处理后与"正好切在中线"等价，不引入 bias；**切少于中线的样本才是真正的 bias 来源**（组织物理缺失，无法补回），且只影响紧贴中线一薄层的结构。计划的应对：把各样本 brain mask warp 到图谱空间算每脑区覆盖率，覆盖率掉下来的中线脑区用密度（细胞数/实际覆盖体积）代替绝对计数或从统计中排除；并确认越线/欠线没有和实验分组重合。
+- 排除方式：`crop_for_registration` 是轴对齐框，对"只有中段 z 局部越线"切不准；单独画一份 damage mask 文件工作量大。改为**在画 guide mask 的同一次会话里多画一个 label**，流水线把它解释成"样本上存在、但图谱里没有对应物的组织"。
+
+**做了什么**：
+- `pipeline._build_guide_regions_from_labels` 支持 `mask.guide_regions.damage_labels`：列出的画笔 label 不进 guide pair，而是并进 moving_mask（与 `sample_damage_mask_path` 同语义、两者可叠加），返回值改为 `(triples, damage_hole)`。paint_mask.py 的 guide 导出本来就按 label 独立做关键帧插值，所以薄片只需画几层。
+- `config.py` 校验：`ignore_labels`/`damage_labels` 规范为 int 列表；同一 label 同时出现在两者、或同时在 damage_labels 和 atlas_ids/atlas_names 里都直接报错。未配对 label 的报错信息里加了 damage_labels 这个出口。
+- `config.example.yaml` 和 README 的 guide-mask 章节补了用法说明。
+- 新增烟雾测试 `test_guide_damage_labels`（hole 精确、不进 guide pair、未配置/未画仍报错）；顺手修了 `test_assign_cell_regions` 的陈旧 fake reg（`transform_cell_points` 的 sample_to_atlas 改用 `invtransforms` 后测试没跟上，补上 `"invtransforms": []`）。`python tests/test_new_features_smoke.py` 全绿。
+
+**下一步**：
+- 对越线样本：在 guide mask 会话里把对侧薄片画成新 label（几个关键帧即可），config 里列进 `damage_labels`，重跑配准。
+- 配准完成后做覆盖率检查，确定受影响的中线脑区名单，决定密度校正还是排除。
+
+## 2026-08-29（续）：paint_mask.py 的 ontology 树加 "damage / no atlas counterpart" 伪节点
+
+**背景**：damage_labels 落地后，画的时候那个 label 在 picker 里没有可选的脑区——不报错但导出一路 warning（"painted but has no region_labels entry"）、面板一直显示未分配，还得手动往 pipeline config 里抄 damage_labels。
+
+**做了什么**（Registration_toolkit/paint_mask.py）：
+- ontology 树顶部插入伪节点 "damage / no atlas counterpart"（sentinel `DAMAGE_ID = -1`，负数保证永不撞真实 ontology id）。像普通脑区一样 Assign to label；同一 label 不能既是 damage 又配脑区（GUI、config 解析、_seed_assignment 三处都拦）。
+- 导出时 damage label 不进 region_ids/guide pair，写进 sidecar 新键 `damage_labels`；打印的 YAML snippet 带上 `damage_labels: [...]`；导出 warning/逐 label 报告用 DAMAGE_NAME 显示但【不】写进 sidecar 的 regions 键（避免 resume 时被当脑区名去解析）。resume 从 sidecar 读回 damage 标记重新 seed。paint config 也支持手写 `damage_labels:`（configs/paint_mask.example.yaml 有说明）。
+- Registration_ants 侧：`atlas_utils.load_regions_sidecar_damage_labels` + pipeline 自动 union sidecar 的 damage 标记（同 region_ids 的"读 sidecar、不手抄"逻辑，pipeline config 可以完全不写）；显式配了 atlas_ids/atlas_names/ignore_labels 的 label 优先于 sidecar 的 damage 标记（打 WARNING）。
+- 测试：paint_mask `--selftest` 扩了 sidecar/seed/assignment_rows/config-normalizer 四处并全绿；Registration_ants 烟雾测试加了 sidecar fallback 断言，全绿。
+
+**下一步**：在 s12t 之外那个越中线样本的 guide 会话里实际用一次：树顶选 damage、画对侧薄片几个关键帧、导出、直接重跑配准（config 不用改）。
