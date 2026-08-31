@@ -364,6 +364,10 @@ def _load_reposition(sample_cfg):
             f"That file is the fragment outlines the plan moves; without it the plan "
             f"says how far to move tissue but not which tissue.")
     fragments = sitk.GetArrayFromImage(sitk.ReadImage(str(fragments_path))).astype(np.uint8)
+    # The file records the planes that were actually grabbed; the planes
+    # between them are filled here rather than baked into the file, so that
+    # file stays the record of what was decided (see reposition.densify_fragments).
+    fragments = reposition.densify_fragments(fragments)
     if tuple(plan["image_shape_zyx"]) != fragments.shape:
         raise ValueError(f"{fragments_path} is {fragments.shape} but {plan_path} was drawn on "
                          f"{tuple(plan['image_shape_zyx'])}")

@@ -365,6 +365,33 @@ def test_grab_fragment_finds_the_flap_and_the_hinge():
         "the grab leaked across the crack into the brain"
     assert not got[8].any(), "the grab ran past the hinge"
 
+    # A crack too tight to threshold apart: the pieces touch, so the walk runs
+    # straight through. A few strokes in `exclude` separate them again, which
+    # is the whole point of the cut brush -- far less work than tracing.
+    welded = tissue.copy()
+    welded[:, 12:14, 12:34] = True                # the crack closed on every plane
+    leaked, _, _ = rp.grab_fragment(welded, (5, 8, 20))
+    assert leaked[5, 20:38, 10:50].any(), "the phantom does not actually leak; test is void"
+    cut = np.zeros(tissue.shape, dtype=np.uint8)
+    cut[:, 12:14, 12:34] = 255
+    fixed, planes_cut, _ = rp.grab_fragment(
+        rp.threshold_planes(welded.astype(np.uint8), 0, exclude=cut), (5, 8, 20))
+    assert not fixed[5, 20:38, 10:50].any(), "the cut did not separate the pieces"
+    assert fixed[5, 4:12, 12:34].all(), "the cut ate into the flap"
+
+    # follow_z=False is for pieces that sit apart in z but overlap in xy: the
+    # walk links planes by overlap and would step from one onto the other, so
+    # the extent has to come from grabbing a few planes each instead.
+    two = np.zeros((12, 40, 60), dtype=bool)
+    two[:, 14:38, 5:55] = True                    # the brain
+    two[2:5, 4:12, 12:34] = True                  # piece A, low z
+    two[8:11, 4:12, 12:34] = True                 # piece B, same xy, high z
+    single, planes_one, note_one = rp.grab_fragment(two, (3, 8, 20), follow_z=False)
+    assert planes_one == [3], planes_one
+    assert "no z walk" in note_one, note_one
+    assert single[3, 4:12, 12:34].all() and not single[9].any(), \
+        "follow_z=False reached another plane"
+
     # Seeding on the brain instead grabs the brain, and says so by size rather
     # than by failing -- there is nothing to detect, the click was just wrong.
     brain, brain_planes, _ = rp.grab_fragment(tissue, (5, 25, 30))
@@ -406,6 +433,32 @@ def test_orient_segments_reads_the_outline_not_the_order():
     print("   OK")
 
 
+
+def test_densify_fills_between_grabbed_planes_only():
+    print("13. densify: sparse grabs fill in, labels stay apart, dense input is untouched...")
+    sparse = np.zeros((12, 40, 60), dtype=np.uint8)
+    sparse[2, 10:20, 10:30] = 1          # fragment 1, grabbed on 2 and 6
+    sparse[6, 10:20, 10:30] = 1
+    sparse[8, 25:35, 10:30] = 2          # fragment 2, grabbed on 8 and 10
+    sparse[10, 25:35, 10:30] = 2
+
+    dense = rp.densify_fragments(sparse)
+    assert sorted(int(z) for z in np.unique(np.nonzero(dense == 1)[0])) == [2, 3, 4, 5, 6]
+    assert sorted(int(z) for z in np.unique(np.nonzero(dense == 2)[0])) == [8, 9, 10]
+    assert not (dense == 1)[7].any(), "filling ran past the last grabbed plane"
+    assert not (dense == 2)[7].any(), "filling ran before the first grabbed plane"
+    assert not ((dense == 1) & (dense == 2)).any()
+
+    # Per plane, without building the volume -- what the GUI preview uses.
+    for z in range(12):
+        assert np.array_equal(rp.densify_plane(sparse, z), dense[z]), z
+
+    # Already dense in, the same volume out: one code path serves a sparse
+    # export and an outline someone traced the long way.
+    assert np.array_equal(rp.densify_fragments(dense), dense)
+    print("   OK")
+
+
 def main():
     tmp_dir = Path("/tmp/claude-1004/-home-fyu7-My-project-Registration-ants/"
                    "aac47064-271f-44d0-8e1d-aadcd5b55308/scratchpad/reposition_smoketest")
@@ -422,6 +475,7 @@ def main():
     test_plan_roundtrip_and_validation(tmp_dir)
     test_grab_fragment_finds_the_flap_and_the_hinge()
     test_orient_segments_reads_the_outline_not_the_order()
+    test_densify_fills_between_grabbed_planes_only()
     test_pipeline_integration(tmp_dir)
 
     print("\nALL SMOKE TESTS PASSED")

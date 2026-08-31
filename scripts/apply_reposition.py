@@ -147,6 +147,8 @@ def main(argv=None):
 
     image, write_image = read_volume(image_path)
     labels, write_labels = read_volume(labels_path)
+    # Sparse in the file, filled in use -- see reposition.densify_fragments.
+    labels = rp.densify_fragments(labels)
     if image.shape != labels.shape:
         raise SystemExit(f"image {image.shape} and labels {labels.shape} are different "
                          f"volumes; they must be the same (z, y, x) grid")

@@ -280,13 +280,23 @@ class threshold_planes:
     looks at a handful of planes. This defers it per plane and keeps the same
     `[z]` / `.shape` surface a bool array has, so callers with a small volume
     can still just pass the array.
+
+    `exclude`, when given, is a same-shaped volume whose nonzero voxels are
+    taken OUT of the tissue -- a few hand-drawn strokes across a crack too
+    tight to threshold apart. That is far less work than tracing the piece
+    they separate, and it is all the walk needs to get past a join: cutting
+    the two apart in the mask makes them two components again.
     """
 
-    def __init__(self, stack, value):
+    def __init__(self, stack, value, exclude=None):
         self.stack, self.value, self.shape = stack, value, stack.shape
+        self.exclude = exclude
 
     def __getitem__(self, z):
-        return self.stack[z] > self.value
+        plane = self.stack[z] > self.value
+        if self.exclude is not None:
+            plane = plane & (self.exclude[z] == 0)
+        return plane
 
 
 def otsu_threshold(stack, max_planes=24):
@@ -299,7 +309,8 @@ def otsu_threshold(stack, max_planes=24):
     return float(threshold_otsu(np.asarray(stack[::step], dtype=np.float32)))
 
 
-def grab_fragment(tissue_zyx, seed_zyx, max_growth=5.0, max_fraction=0.5, min_area=8):
+def grab_fragment(tissue_zyx, seed_zyx, max_growth=5.0, max_fraction=0.5, min_area=8,
+                  follow_z=True):
     """The split-open piece of tissue under `seed_zyx`, found rather than traced.
 
     A flap does not need outlining by hand, because on the planes where it is
@@ -322,6 +333,17 @@ def grab_fragment(tissue_zyx, seed_zyx, max_growth=5.0, max_fraction=0.5, min_ar
     So the z extent is not asked for either: it comes out of where the tissue
     stops being separable, which is the honest answer to "how far does this
     flap go" and not one an eye is good at giving.
+
+    follow_z=False takes ONLY the seed plane and does no walking. That is the
+    mode for a sample carrying several pieces, where the extents are already
+    known: grab each piece's first and last plane and interpolate between them,
+    the same sparse-keyframe idiom the guide outlines use. Not because the walk
+    misbehaves there -- measured on two pieces sharing an xy footprint at
+    different z, it stops at each piece's own ends rather than stepping between
+    them -- but because it DECIDES the extent, and an extent that is known is
+    better stated than inferred, especially when keyframes have to bracket it
+    anyway. The walk stays the quicker route for one flap of unknown extent,
+    and it is the only thing here that locates the hinge.
 
     tissue_zyx: anything where `tissue_zyx[z]` is a 2D boolean plane and
     `.shape` is (z, y, x) -- a bool array, or `threshold_planes(stack, value)`
@@ -358,7 +380,7 @@ def grab_fragment(tissue_zyx, seed_zyx, max_growth=5.0, max_fraction=0.5, min_ar
     out[z0] = current
     reasons = {}
 
-    for direction in (1, -1):
+    for direction in ((1, -1) if follow_z else ()):
         previous = out[z0]
         z = z0 + direction
         while 0 <= z < n_planes:
@@ -385,10 +407,96 @@ def grab_fragment(tissue_zyx, seed_zyx, max_growth=5.0, max_fraction=0.5, min_ar
             reasons[direction] = f"z={z - direction}: reached the end of the volume"
 
     planes = sorted(int(z) for z in np.unique(np.nonzero(out)[0]))
-    note = (f"planes {planes[0]}..{planes[-1]} ({len(planes)}), {int(out.sum())} voxels\n"
-            f"  low end  {reasons.get(-1, 'n/a')}\n"
-            f"  high end {reasons.get(1, 'n/a')}")
+    if not follow_z:
+        note = f"plane {z0} only, {int(out.sum())} voxels (no z walk)"
+    else:
+        note = (f"planes {planes[0]}..{planes[-1]} ({len(planes)}), {int(out.sum())} voxels\n"
+                f"  low end  {reasons.get(-1, 'n/a')}\n"
+                f"  high end {reasons.get(1, 'n/a')}")
     return out, planes, note
+
+
+# =====================================================================================
+# Sparse fragment outlines -> dense, at the moment they are used
+# =====================================================================================
+# A fragment is grabbed on a handful of planes, not traced on all of them, and
+# the file that comes out of the GUI keeps it that way: the planes carrying
+# voxels ARE the keyframes, and densifying before saving would erase the one
+# record of which planes were actually decided. Reopening a dense file gives
+# back a solid block with no way to tell a grabbed plane from a guessed one --
+# the same reason mode: labels keeps a .keyframes.json beside its dense volume.
+#
+# So the filling happens here, against the volume in hand, every time a plan is
+# applied. On an already-dense volume it is a no-op (every plane is a keyframe,
+# so there is nothing between any two), which is what lets one code path serve
+# both a sparse export and a hand-made outline traced the long way.
+#
+# What does NOT interpolate is the line segments. They are how a keyframe's
+# transform was arrived at, and the transform is already what gets interpolated
+# (plane_transform, above); blending the endpoints as well would be a second,
+# disagreeing route to the same number -- linear interpolation of two endpoints
+# does not even preserve the segment's length once there is rotation, which is
+# the one quantity the whole copy-don't-redraw rule exists to keep fixed.
+
+def _keyframe_planes(fragments_zyx, label):
+    """{plane index: 2D bool} for the planes where `label` was actually put."""
+    planes = {}
+    for z in range(fragments_zyx.shape[0]):
+        plane = fragments_zyx[z] == label
+        if plane.any():
+            planes[int(z)] = plane
+    return planes
+
+
+def densify_fragments(fragments_zyx):
+    """Fill a sparse fragment volume between the planes each label appears on.
+
+    Per label and independently, so two fragments whose grabbed planes
+    interleave -- or which share an xy footprint at different z -- cannot bleed
+    into one another the way a single merged interpolation would let them.
+    """
+    from . import mask_utils
+
+    fragments_zyx = np.asarray(fragments_zyx)
+    out = np.zeros_like(fragments_zyx)
+    for label in sorted({int(v) for v in np.unique(fragments_zyx) if v != 0}):
+        keyframes = _keyframe_planes(fragments_zyx, label)
+        if not keyframes:
+            continue
+        dense = mask_utils.interpolate_sparse_mask(keyframes, fragments_zyx.shape)
+        out[dense] = label
+    return out
+
+
+def densify_plane(fragments_zyx, z):
+    """One filled plane of `densify_fragments`, without building the volume.
+
+    The GUI redraws a preview on every slider tick, and a dense copy of a
+    190 x 3967 x 2249 outline volume is gigabytes to allocate for a question
+    about one plane. Only the two keyframes bracketing z matter, so only those
+    are interpolated -- through the same function the whole-volume path uses,
+    on a three-plane stand-in, rather than a second copy of the arithmetic.
+    """
+    from . import mask_utils
+
+    fragments_zyx = np.asarray(fragments_zyx)
+    out = np.zeros(fragments_zyx.shape[1:], dtype=fragments_zyx.dtype)
+    z = int(z)
+    for label in sorted({int(v) for v in np.unique(fragments_zyx) if v != 0}):
+        keyframes = _keyframe_planes(fragments_zyx, label)
+        if z in keyframes:
+            out[keyframes[z]] = label
+            continue
+        below = [k for k in keyframes if k < z]
+        above = [k for k in keyframes if k > z]
+        if not below or not above:
+            continue                      # outside this label's span: stays empty
+        lo, hi = max(below), min(above)
+        span = mask_utils.interpolate_sparse_mask(
+            {0: keyframes[lo], hi - lo: keyframes[hi]},
+            (hi - lo + 1,) + fragments_zyx.shape[1:])
+        out[span[z - lo]] = label
+    return out
 
 
 # =====================================================================================
