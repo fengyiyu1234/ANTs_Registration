@@ -27,8 +27,10 @@ from pathlib import Path
 
 import ants
 import numpy as np
+import SimpleITK as sitk
 
-from . import atlas_utils, brain_mask, cell_points, io_utils, preprocess, register, transforms
+from . import (atlas_utils, brain_mask, cell_points, io_utils, preprocess, register,
+               reposition, transforms)
 from .config import load_config
 
 logger = logging.getLogger("registration_ants.pipeline")
@@ -70,7 +72,8 @@ def _preprocess(img, prep_cfg):
     return preprocess.clip_and_normalize(img, lo, hi)
 
 
-def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, atlas_structures):
+def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, atlas_structures,
+                                     reposition_plan=None, reposition_fragments=None):
     """(guide_triples, damage_hole): (atlas_region_img, sample_region_img,
     weight) triples from ONE hand-painted multi-label volume plus atlas region
     names, and a bool array (registration grid, or None) of voxels painted
@@ -101,6 +104,11 @@ def _build_guide_regions_from_labels(guide_cfg, sample_ref, atlas_annotation, at
     cropping only shifts origin), so the resample is a pure regrid.
     """
     regions = io_utils.load_nifti_stack_as_ants(guide_cfg["regions_mask"], guide_cfg["voxel_size_um"])
+    # The outlines were traced on the geometry the plan is about to change, so
+    # they move with it -- otherwise every region painted over a flap would
+    # keep pointing at where the flap used to be.
+    regions = _reposition_volume(regions, reposition_plan, reposition_fragments,
+                                 "labels", "the guide regions mask")
     if regions.shape != sample_ref.shape:
         regions = ants.resample_image_to_target(regions, sample_ref, interp_type="genericLabel")
     regions_arr = np.rint(regions.numpy()).astype(np.int32)
@@ -330,6 +338,65 @@ def _guard_output_dir(output_dir):
     )
 
 
+def _load_reposition(sample_cfg):
+    """(plan, fragments_zyx) for sample.reposition_plan, or (None, None).
+
+    A reposition plan closes the gaps left by tissue that split open, and it
+    has to be applied to EVERY input drawn on the raw grid -- the stack, the
+    guide outlines, the damage mask, the cell centroids -- or those stop
+    describing the same anatomy as each other. Doing it here, at load, rather
+    than asking for a pre-repositioned copy of each file, is what keeps the
+    config pointing at the original data and keeps the four from drifting
+    apart: one key moves all of them or none of them.
+
+    (scripts/apply_reposition.py writes the repositioned copies out instead,
+    for looking at and for QC. Both go through registration_ants.reposition,
+    so they cannot disagree.)
+    """
+    plan_path = sample_cfg.get("reposition_plan")
+    if not plan_path:
+        return None, None
+    plan = reposition.read_plan(plan_path)
+    fragments_path = plan.get("labels_path")
+    if not fragments_path or not Path(fragments_path).exists():
+        raise FileNotFoundError(
+            f"{plan_path} names labels_path={fragments_path!r}, which does not exist. "
+            f"That file is the fragment outlines the plan moves; without it the plan "
+            f"says how far to move tissue but not which tissue.")
+    fragments = sitk.GetArrayFromImage(sitk.ReadImage(str(fragments_path))).astype(np.uint8)
+    if tuple(plan["image_shape_zyx"]) != fragments.shape:
+        raise ValueError(f"{fragments_path} is {fragments.shape} but {plan_path} was drawn on "
+                         f"{tuple(plan['image_shape_zyx'])}")
+    n = sum(len(f["keyframes"]) for f in plan["fragments"])
+    logger.info("Reposition: %d fragment(s), %d keyframe(s) from %s", len(plan["fragments"]), n,
+                plan_path)
+    for line in reposition.boundary_warnings(reposition.boundary_report(plan, fragments)):
+        logger.warning("Reposition: %s", line)
+    return plan, fragments
+
+
+def _reposition_volume(img, plan, fragments, kind, what):
+    """Apply a plan to one ANTs image loaded on the painted grid.
+
+    Refuses rather than resamples when the shapes disagree: a plan's offsets
+    are microns on the grid it was drawn on, so applying it to a volume of a
+    different shape would move everything by a believable but wrong amount,
+    and nothing downstream could tell.
+    """
+    if plan is None:
+        return img
+    expected = tuple(reversed(plan["image_shape_zyx"]))          # (z,y,x) -> ANTs (x,y,z)
+    if img.shape != expected:
+        raise ValueError(
+            f"{what} is {img.shape} but sample.reposition_plan was drawn on {expected} "
+            f"(x, y, z). A reposition plan can only be applied on the grid it was drawn on.")
+    moved = reposition.apply_to_volume_xyz(img.numpy(), fragments, plan, kind=kind)
+    out = ants.from_numpy(moved.astype(img.numpy().dtype), spacing=img.spacing,
+                          origin=img.origin, direction=img.direction)
+    logger.info("Reposition applied to %s", what)
+    return out
+
+
 def run_pipeline(config_path):
     config = load_config(config_path)
     sample = config["sample"]
@@ -350,6 +417,9 @@ def run_pipeline(config_path):
 
     _setup_logging()
     logger.info("Starting pipeline for sample '%s', config=%s", sample["name"], config_path)
+    # Loaded once and threaded through every input drawn on the raw grid --
+    # see _load_reposition for why they have to move together or not at all.
+    reposition_plan, reposition_fragments = _load_reposition(sample)
     logger.info("Log file (only populated when run via run_pipeline.sh): %s", output_dir / "run.log")
 
     # (label, perf_counter() at the moment that step begins) -- consecutive
@@ -363,6 +433,11 @@ def run_pipeline(config_path):
     # reused below both for the full resample and, if crop_for_registration
     # is set, for the cropped one, instead of decoding the TIFF twice.
     raw_img = io_utils.load_tiff_stack_as_ants(sample["raw_tiff"], tuple(sample["voxel_size_um"]))
+    # Before the resample, not after: the plan's offsets are microns on the raw
+    # grid, and a flap has to be closed while the sections it was drawn on are
+    # still the sections in the array.
+    raw_img = _reposition_volume(raw_img, reposition_plan, reposition_fragments,
+                                 "image", "the raw stack")
 
     # sample_fine is the UNCROPPED fine/isotropic image, always written to
     # this exact path -- napari viewers in ../ClearMap/stats_vis/ glob for
@@ -459,6 +534,8 @@ def run_pipeline(config_path):
         # microns, cropping only shifts origin), so this is a pure regrid.
         if damage_um:
             sample_mask = io_utils.load_nifti_stack_as_ants(damage_path, damage_um)
+            sample_mask = _reposition_volume(sample_mask, reposition_plan, reposition_fragments,
+                                             "labels", "the sample damage mask")
         else:
             sample_mask = ants.image_read(damage_path)
         if sample_mask.shape != sample_fine_prep.shape:
@@ -545,7 +622,8 @@ def run_pipeline(config_path):
     guide_cfg = mask_cfg.get("guide_regions")
     if isinstance(guide_cfg, dict):
         guide_regions, guide_damage_hole = _build_guide_regions_from_labels(
-            guide_cfg, sample_fine_prep, atlas_annotation, atlas_structures)
+            guide_cfg, sample_fine_prep, atlas_annotation, atlas_structures,
+            reposition_plan, reposition_fragments)
     elif guide_cfg:
         guide_regions = []
         for gr in guide_cfg:
@@ -656,6 +734,7 @@ def run_pipeline(config_path):
         classes = cell_points.assign_cell_regions(
             cells_cfg["cell_centroids_dir"], output_dir, tuple(cells_cfg["voxel_size_um"]),
             sample_fine, reg, atlas_structures=reg.get("atlas_structures"), prefix=cells_cfg["prefix"],
+            reposition_plan=reposition_plan, reposition_fragments=reposition_fragments,
         )
         logger.info("Cell regions assigned for %d class(es): %s", len(classes), classes)
     else:

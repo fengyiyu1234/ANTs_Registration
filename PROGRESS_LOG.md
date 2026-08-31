@@ -1521,3 +1521,87 @@ docstring 里写清了两个读法上的坑：结果是**双倍间隔的悲观�
 - 测试：paint_mask `--selftest` 扩了 sidecar/seed/assignment_rows/config-normalizer 四处并全绿；Registration_ants 烟雾测试加了 sidecar fallback 断言，全绿。
 
 **下一步**：在 s12t 之外那个越中线样本的 guide 会话里实际用一次：树顶选 damage、画对侧薄片几个关键帧、导出、直接重跑配准（config 不用改）。
+
+## 2026-08-29（续2）：修 `_run_guide` 的 AttributeError，并去掉手工拼 namespace 这个坑
+
+**问题**：加了 `damage_labels` 之后启动 guide 模式直接崩：`AttributeError: 'types.SimpleNamespace' object has no attribute 'damage_labels'`。`_load_local_config` 里加了这个字段，但 `main()` 给 `_run_guide` 另外手工拼了一个 SimpleNamespace（只为把 `existing_mask_path` 改名成 `existing_mask`），字段得抄两遍，漏了。崩在 GUI 启动时、atlas 已经加载完之后。
+
+**做了什么**（Registration_toolkit/paint_mask.py）：
+- `_run_guide` 直接收 cfg（和 `_run_labels` 一样），内部读 `args.existing_mask_path`，删掉那个手工 namespace——这个改名从来不值得两处同步的代价。
+- 新增静态检查（在 selftest 10 里，`ast` 扫源码，不需要 GUI/图像/atlas）：`_run_guide` / `_run_labels` 读的每个 `args.<字段>` 都必须在 `_load_local_config` 的返回里出现。已验证把字段去掉时该检查确实报错。
+- `paint_mask.py --selftest` 全绿。
+
+**教训**：GUI 入口的字段漂移不会被任何现有测试覆盖（真跑要 GUI + 图像 + atlas），静态扫一遍是成本最低的兜底。
+
+## 2026-08-30：s12q 上机前的 mask 体检 + crop 定档
+
+**背景**：`configs/s12q.yaml` 之前是 s12t 的复制品——`sample.name`、`raw_tiff`、
+`cell_centroids_dir` 全都还指着 s12t，`regions_mask` 是空的。等于说照原样跑会拿
+s12t 的图去配 s12q 的输出目录。已全部改过来。
+
+**mask 杂点检查**（`s12q_DeMBA2.nii.gz`，(x,y,z)=(2249,3967,190)，label 1-4）：
+- 3D 26-连通：label 1 和 4 各只有 1 个连通域；label 2、3 各多出 **1 个单体素**
+  （label 2 @ z=91 (x999,y1869)，label 3 @ z=70 (x549,y3375)）。
+- 逐关键帧 2D 连通：另有 label 2 @ z=65 的 3px + 1px 两粒。
+- 合计 5 个杂点体素 / 2.7 亿标注体素，且都没扩散到相邻层（SDF 插值把它们吃掉了）。
+  **不用重画**。
+- label 2 @ z=70 那块 57543 px 的"第二团"是真解剖（水平面上皮层断开成两片），
+  z=65/91 同位置都有组织，不是笔误。
+
+**qc_guide_mask.py 的结论**：painted/atlas 体积比在皮层和脑干上都是 **64%**（完全
+一致，说明整体缩放交给 Affine 就行），小脑 49%（rel 76%，偏小但在容忍区内）。
+唯一 PROBLEM 是"label 4 在 z=65 有 stray keyframe (4497 px)"——查过了，z=65 是小脑
+的**首帧**（前一层 z=64 全空），是小脑尖端的正常端帽，不是误点；z=65→70 的面积
+4497→7318→11734→18160→28005→45627 平滑过渡，没有发生 stray keyframe 那种
+区间坍缩。**可以忽略**。
+
+**guide_mask_selftest.py**：分数普遍比 s12t 差，原因是关键帧密度差 3 倍
+（s12q 190 层画 14 帧，s12t 157 层画 36 帧），leave-one-out 的 gap 拉到 21-46 层。
+最该补帧的空档（按收益排序）：label 2 的 29↔65 和 165↔186、label 4 的 70↔91 和
+110↔137、label 3 的 155↔177。
+
+**crop 定档**：组织范围取【guide mask 并集】∪【原图 Otsu 最大连通域】：
+x mask[365,1877) ∪ 图像[328,1896)；y mask[90,3967) ∪ 图像[40,3960)；
+z mask[29,187) ∪ 图像[27,189)。y 的高位 3966 上还有 4205 个 voxel——脑干被画幅
+切掉了，所以 y 上界只能留 null。定为 `x: [300,1920] / y: [20,null] / z: [24,null]`，
+体积降到原来的 68%。
+
+**mask 侧配置**：按样本情况，`ignore_labels` / `atlas_exclude_ids` 都留空，
+`atlas_ids` 也留空（走 `s12q_DeMBA2.regions.json` 的 region_ids 回落，
+2→[688] 皮层 / 3→[343] 脑干 / 4→[512,960] 小脑），label 1（越中线的左半球组织）
+按 `damage_labels: [1]` 导入。atlas 的 orientation/slicing 与 s12t 保持一致
+（同为右半脑、同成像方位）。
+
+## 2026-08-30（续）：s12q 加了 label 5（嗅球），从 label 2 的图谱侧减掉
+
+**改动**：重画的 mask 多了 `label 5 = Main olfactory bulb`（sidecar region_ids `5->[507]`），
+需要把嗅球从 label 2（皮层）里摘出来。CCFv3 的层级是
+`688 CTX > 695 CTXpl > 698 OLF > 507 MOB / 151 AOB`，所以 label 2 的 688 匹配会把整个
+嗅球一起吃进去；嗅球既然已经由 label 5 单独引导，不减就是同一批图谱体素被同时往两条
+不同的样本轮廓上拉。配置写 `atlas_exclude_ids: {2: [507, 151]}`。
+
+**为什么 151（副嗅球）也要减**（这条和 s12t 的处理一致，但理由不同）：151 不在 label 5 的
+region_ids 里，所以它不构成"双重指派"；但在右半球切片里它的 bbox（x[55,94] y[50,99]
+z[159,196]）**完全落在 MOB 的 bbox 内部**，画 label 5 时必然已经覆盖了那块地方。留在
+label 2 里等于让 21867 个（0.175 mm3）图谱体素往一条根本不含嗅球的皮层轮廓上拉。
+右半球切片的量：CTX 6,281,915 vox / MOB 385,190 (6.13%) / AOB 21,867 (0.35%)。
+
+注意 s12t 的 label 6 是 `[507, 1016]`，多一个 onl（嗅神经层）；s12q 的 label 5 只有 507。
+1016 挂在 fiber tracts 下（`997 > 1009 > 967 > 840 > 1016`）而不是 CTX 下，所以它在不在
+label 5 里都不影响这次的 exclude。
+
+**验证**：QC 里 label 2 的图谱体积 50.26 -> 47.00 mm3，正好减掉 3.26 mm3 = MOB+AOB 的
+3.256 mm3。四个 guide region 的 painted/atlas 比现在是 皮层 65% / 脑干 64% / 小脑 49% /
+嗅球 70%（rel 101/99/76/109），一致性比加嗅球之前更好。
+
+**label 5 本身**：3D 单连通、9 个关键帧、z 91..151 共 61 层无空层，面积
+16548→272966(z119)→44994 平滑，没有杂点。样本侧也确实把嗅球从皮层里挖走了——
+label 2 的 painted 从 32.21 掉到 30.51 mm3（-1.70），label 5 是 2.16 mm3。
+
+**crop 跟着改了**：嗅球是最靠前的结构，把标注并集的 y 下界从 90 顶到了 **40**，
+和图像 Otsu 的 40 撞在一起。原来定的 `y: [20, null]` 只剩 20 行余量，索性改成
+`y: null`（不裁），代价只有 1% 体积。x/z 不变。最终：
+`x: [300, 1920] / y: null / z: [24, null]`。
+
+**没变的**：label 2/3 那两个单体素杂点还在（各 1 个），依旧不用管；label 4 @ z=65 的
+"stray keyframe"依旧是小脑尖端首帧的误报。

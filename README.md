@@ -14,6 +14,14 @@ ANTs-based registration of LSFM brain samples to the Allen CCF atlas, plus tools
 - `register.py` — runs the ANTs registration itself (one-shot SyNRA) to the CCF.
 - `transforms.py` — applies computed transforms to images and cell-coordinate points.
 - `cell_points.py` — reads ClearMap cell-centroid CSVs.
+- `reposition.py` — closes the gaps left by tissue that split open, as per-plane
+  in-plane rigid moves applied before registration (`sample.reposition_plan`).
+  `grab_fragment` finds a flap from one click by walking its connected component
+  along z, stopping at the hinge, so nothing has to be outlined by hand.
+  Plans are drawn in `paint_mask.py`'s Reposition panel; one config key moves the
+  stack, the guide outlines, the damage mask and the cell centroids together.
+  `scripts/apply_reposition.py` writes the repositioned copies out, and `--invert`
+  takes a result back onto the original geometry for QC.
 - `config.py` — loads and validates the pipeline YAML config.
 
 ## Annotation, visualization and evaluation → `../GT_tool_for_registration`

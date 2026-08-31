@@ -123,6 +123,8 @@ def load_config(path):
             raise ValueError(f"config.sample.{required} is required")
     if not Path(sample["raw_tiff"]).exists():
         raise FileNotFoundError(f"sample.raw_tiff not found: {sample['raw_tiff']}")
+    if sample.get("reposition_plan") and not Path(sample["reposition_plan"]).exists():
+        raise FileNotFoundError(f"sample.reposition_plan not found: {sample['reposition_plan']}")
 
     reg_iters = config["registration"]["reg_iterations"]
     if not isinstance(reg_iters, (list, tuple)) or not reg_iters:

@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import transforms
+from . import reposition, transforms
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,8 @@ def _physical_to_index(img, physical_xyz):
 
 
 def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fine_img, reg,
-                         atlas_structures=None, prefix='ob_'):
+                         atlas_structures=None, prefix='ob_', reposition_plan=None,
+                         reposition_fragments=None):
     """Process every <prefix><class>.csv under cell_centroids_dir: convert
     original-pixel-space centroids to physical microns, transform through
     `reg` into atlas space, look up the atlas region at each cell, and write
@@ -103,6 +104,15 @@ def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fi
     atlas_utils.get_allen_atlas or load_ccf_ontology_json), or None to skip
     name lookup (ids still get written, names fall back to "Region <id>").
 
+    reposition_plan / reposition_fragments: sample.reposition_plan, already
+    loaded (see pipeline._load_reposition). Cells sitting on a fragment are
+    moved by the same transform the stack was, so they are looked up against
+    a registration of the SAME geometry they now describe. Columns 0-2 stay
+    the ORIGINAL raw pixel positions -- that is where the cell really is in
+    the data on disk, and the only way back to it -- while columns 3-8 and
+    the region assignment are computed from the moved position, because the
+    grid registration ran on is the repositioned one.
+
     Returns the list of class names processed.
     """
     voxel_size_um = np.array(voxel_size_um, dtype=float)
@@ -126,7 +136,15 @@ def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fi
             continue
 
         raw_xyz = np.ascontiguousarray(df_src[['cx', 'cy', 'z']].values, dtype=float)
-        physical_xyz = raw_xyz * voxel_size_um
+        moved_xyz = raw_xyz
+        if reposition_plan is not None and reposition_fragments is not None:
+            cx, cy, cz, moved = reposition.apply_to_cells(
+                raw_xyz[:, 0], raw_xyz[:, 1], raw_xyz[:, 2],
+                reposition_fragments, reposition_plan, voxel_size_um)
+            moved_xyz = np.column_stack([cx, cy, cz])
+            logger.info("Class %s: repositioned %d of %d cell(s) with the fragments they sit on.",
+                        class_name, int((moved > 0).sum()), len(raw_xyz))
+        physical_xyz = moved_xyz * voxel_size_um
 
         pts_sample = pd.DataFrame({'x': physical_xyz[:, 0], 'y': physical_xyz[:, 1], 'z': physical_xyz[:, 2]})
         pts_atlas = transforms.transform_cell_points(pts_sample, reg, direction='sample_to_atlas')

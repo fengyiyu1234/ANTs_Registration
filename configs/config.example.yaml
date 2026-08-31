@@ -7,6 +7,29 @@ sample:
   raw_tiff: /path/to/downsampled_stack.tif
   voxel_size_um: [2.6, 2.6, 32.0]    # 顺序是 [x, y, z]，单位微米——每个样本自己实际的降采样体素尺寸
 
+  # 【可选】样本在处理过程中裂开、有组织掰开移位时，用这份 plan 在配准【之前】把
+  # 它们刚性地合回去。plan 由 Registration_toolkit/paint_mask.py 的 Reposition
+  # 面板导出（guide 和 labels 两个模式里都有），文件名是 <导出文件名>.reposition.json，
+  # 旁边的 <导出文件名>_fragments.nii.gz 记录着碎片轮廓（plan 里的 labels_path 指向它）。
+  # 碎片轮廓【不用手画】：掰开的那几层里碎片本来就是独立连通块，在面板里点一下
+  # "Grab fragment under the cursor" 就能抠出来，并沿 z 走到它不再独立为止——那里
+  # 就是铰链，z 范围也一并定了。
+  #
+  # 只需要这一行：raw_tiff、guide_regions.regions_mask、sample_damage_mask_path、
+  # cells.cell_centroids_dir 会【一起】被搬，因为它们都画/测在同一个原始网格上，
+  # 分开搬就会互相错位。config 仍然指向【原始】文件，不用维护一份复位后的副本。
+  #
+  # 变换模型是逐 z 层的面内刚体（平移 + 面内旋转 + 整层的 z 位移），不含面外旋转
+  # ——各向异性 2.6/2.6/32 的数据支撑不起那个自由度。细节见
+  # src/registration_ants/reposition.py 的模块 docstring。
+  #
+  # 细胞 CSV 的第 0-2 列保持【原始】坐标（那是细胞在磁盘数据里的真实位置），
+  # 第 3-8 列和脑区归属按复位后的位置算（配准跑的就是复位后的网格）。
+  #
+  # 想看复位后的图长什么样，或者需要把结果反向搬回原始几何做 QC：
+  #   python scripts/apply_reposition.py <plan.json> --output-dir <dir> [--invert]
+  # reposition_plan: /path/to/s18_regions.reposition.json
+
   # if the sample has multiple channels, you can specify them here. 
   #   - name: signal_channel1
   #     raw_tiff: /path/to/signal_channel1.tif
