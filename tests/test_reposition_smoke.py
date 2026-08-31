@@ -273,7 +273,8 @@ def test_pipeline_integration(tmp_dir):
                         labels_path=str(fragments_path))
     plan_path = rp.write_plan(tmp_dir / "s.reposition.json", plan)
 
-    loaded, frag_arr = pipeline._load_reposition({"reposition_plan": str(plan_path)})
+    sample_cfg = {"reposition_plan": str(plan_path), "voxel_size_um": list(painted_um)}
+    loaded, frag_arr = pipeline._load_reposition(sample_cfg)
     assert loaded == plan and np.array_equal(frag_arr, fragments)
     assert pipeline._load_reposition({}) == (None, None)
 
@@ -281,8 +282,20 @@ def test_pipeline_integration(tmp_dir):
     # it says how far to move tissue but not which tissue.
     orphan = dict(plan, labels_path=str(tmp_dir / "gone.nii.gz"))
     rp.write_plan(tmp_dir / "orphan.json", orphan)
+    # A plan drawn on a different grid -- or, the (1,1,1) case, on none at all.
+    for drawn, expect in ((( 20.0, 20.0, 10.0), "um/voxel"), ((1.0, 1.0, 1.0), "voxel counts")):
+        rp.write_plan(tmp_dir / "grid.json", dict(plan, voxel_size_um=list(drawn)))
+        try:
+            pipeline._load_reposition({"reposition_plan": str(tmp_dir / "grid.json"),
+                                       "voxel_size_um": list(painted_um)})
+        except ValueError as exc:
+            assert expect in str(exc), exc
+        else:
+            raise AssertionError(f"a plan drawn on {drawn} was applied to {painted_um}")
+
     try:
-        pipeline._load_reposition({"reposition_plan": str(tmp_dir / "orphan.json")})
+        pipeline._load_reposition({"reposition_plan": str(tmp_dir / "orphan.json"),
+                                   "voxel_size_um": list(painted_um)})
     except FileNotFoundError as exc:
         assert "labels_path" in str(exc), exc
     else:

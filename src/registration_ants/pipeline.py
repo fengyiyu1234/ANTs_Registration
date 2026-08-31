@@ -367,6 +367,21 @@ def _load_reposition(sample_cfg):
     if tuple(plan["image_shape_zyx"]) != fragments.shape:
         raise ValueError(f"{fragments_path} is {fragments.shape} but {plan_path} was drawn on "
                          f"{tuple(plan['image_shape_zyx'])}")
+    # The plan's grid must be THIS sample's grid. Shape alone is not enough:
+    # two samples imaged the same way share a shape, and a plan drawn without a
+    # voxel size at all comes out denominated in (1, 1, 1). Either mismatch
+    # applies cleanly to the image and moves the cells by a different scale,
+    # which is exactly the kind of disagreement no output shows.
+    configured = [float(v) for v in sample_cfg["voxel_size_um"]]
+    drawn = [float(v) for v in plan["voxel_size_um"]]
+    if not np.allclose(drawn, configured, rtol=1e-6):
+        raise ValueError(
+            f"{plan_path} was drawn on a grid of {drawn} um/voxel (x, y, z) but "
+            f"sample.voxel_size_um is {configured}. A plan's offsets are microns on the grid "
+            f"it was drawn on"
+            + (" -- this plan was exported with no voxel size configured in paint_mask, so its "
+               "offsets are really voxel counts; set voxel_size_um there and re-export."
+               if drawn == [1.0, 1.0, 1.0] else "."))
     n = sum(len(f["keyframes"]) for f in plan["fragments"])
     logger.info("Reposition: %d fragment(s), %d keyframe(s) from %s", len(plan["fragments"]), n,
                 plan_path)
