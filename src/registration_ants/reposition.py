@@ -431,6 +431,97 @@ def grab_plane(tissue_zyx, seed_zyx):
     return out, f"plane {z0}, {int(out.sum())} voxels"
 
 
+def outline_polygon(fragments_zyx, label, z, tolerance=1.0, max_vertices=200):
+    """The fragment's own boundary on one plane, as (N, 2) (y, x) voxel coords.
+
+    A draggable stand-in for the piece: dragging its silhouette into the
+    socket is the judgement the eye is making anyway. Three degrees of freedom
+    entered as the piece itself -- this is an input device, not a different
+    model. (It replaced a two-line fit, orient_segments/fit_from_segments,
+    which asked for the same judgement to be restated as two abstract
+    endpoints first.)
+
+    The LONGEST contour only. A piece that falls into two components on this
+    plane is two fragments' worth of work and wants two labels; one polygon
+    around both would rotate about the pair's shared centre and tear them
+    apart.
+
+    Simplified (Douglas-Peucker at `tolerance` voxels) and then thinned to
+    `max_vertices`: raw marching squares on a 2.6 um grid returns tens of
+    thousands of points, and the polygon is re-triangulated on every drag.
+    The vertices are a HANDLE, not the outline of record -- what actually
+    moves is the label volume, so losing a voxel of boundary detail here
+    costs nothing.
+    """
+    from skimage import measure
+
+    plane = np.asarray(fragments_zyx[int(z)]) == int(label)
+    if not plane.any():
+        raise ValueError(f"fragment {label} has nothing on plane {z} -- grab it there first")
+    contours = measure.find_contours(plane.astype(float), 0.5)
+    if not contours:
+        raise ValueError(f"fragment {label} on plane {z} has no traceable boundary")
+    poly = measure.approximate_polygon(max(contours, key=len), tolerance=float(tolerance))
+    if len(poly) > 1 and np.allclose(poly[0], poly[-1]):
+        poly = poly[:-1]                      # napari closes a polygon itself
+    if len(poly) > max_vertices:
+        poly = poly[:: int(np.ceil(len(poly) / max_vertices))]
+    if len(poly) < 3:
+        raise ValueError(f"fragment {label} on plane {z} is too small to outline "
+                         f"({len(poly)} vertices after simplification)")
+    return np.asarray(poly, dtype=float)
+
+
+def fit_from_points(source_xy_um, target_xy_um, center_um=None):
+    """The in-plane rigid transform carrying one set of points onto another.
+
+    For a whole dragged outline: an orthogonal Procrustes (Kabsch) fit -- the
+    rotation and translation minimising the squared distance between the two
+    point sets, with NO scale term.
+
+    Correspondence is BY INDEX: the caller passes the same vertices before and
+    after moving them, so vertex i is the same point on the outline in both.
+    That is what makes this exact rather than a shape-matching problem.
+
+    Returns (tx, ty, theta, centre, scale). `scale` is the uniform factor a
+    similarity fit WOULD have used: 1.0 when the outline was only moved and
+    turned, anything else when it was resized on the way (napari's selection
+    box resizes if a corner handle is dragged instead of the body). It is
+    REPORTED, never applied -- a reposition is rigid by construction, and
+    silently absorbing a resize would move the tissue by the wrong amount and
+    leave a plan that says otherwise.
+
+    center_um: the pivot to express the result about -- the hinge, when there
+    is one in this plane, so the transform's fixed point is the place the
+    tissue is still attached. It changes how the same motion is written down,
+    never the motion.
+    """
+    src = np.asarray(source_xy_um, dtype=float).reshape(-1, 2)
+    dst = np.asarray(target_xy_um, dtype=float).reshape(-1, 2)
+    if src.shape != dst.shape:
+        raise ValueError(f"the outline moved has {len(dst)} vertices but the one it was copied "
+                         f"from has {len(src)}; vertices were added or removed, so which point "
+                         f"went where is no longer known. Copy the outline again.")
+    if len(src) < 2:
+        raise ValueError("a rigid fit needs at least 2 points")
+
+    src_c, dst_c = src.mean(axis=0), dst.mean(axis=0)
+    a, b = src - src_c, dst - dst_c
+    u, sv, vt = np.linalg.svd(a.T @ b)
+    # The reflection guard: an unconstrained SVD solution can come back as a
+    # mirror when the points are nearly collinear, which is a "fit" no rigid
+    # move can perform.
+    d = float(np.sign(np.linalg.det(vt.T @ u.T))) or 1.0
+    rot = vt.T @ np.diag([1.0, d]) @ u.T
+    theta = float(np.degrees(np.arctan2(rot[1, 0], rot[0, 0])))
+    spread = float((a ** 2).sum())
+    scale = float((sv * [1.0, d]).sum() / spread) if spread > 1e-12 else 1.0
+
+    c = np.asarray(src_c if center_um is None else center_um, dtype=float)
+    t = dst_c - (_rotation_xy(theta) @ (src_c - c) + c)
+    return float(t[0]), float(t[1]), theta, (float(c[0]), float(c[1])), scale
+
+
 # =====================================================================================
 # Applying a plan to the image
 # =====================================================================================
@@ -552,86 +643,6 @@ def preview_plane(image_zyx, labels_zyx, plan, z_out, fill_value=None):
                 alpha = np.clip(ndimage.gaussian_filter(alpha, sigma=feather_vox), 0.0, 1.0)
             out = alpha * warped + (1.0 - alpha) * out
     return out
-
-
-def orient_segments(line_a, line_b, fragments_zyx, label, samples=25, margin=0.25):
-    """Of two drawn lines, which one is ON the fragment (the source) and which
-    marks where it belongs (the target).
-
-    Drawing order would answer this too -- the target is the copy, so it comes
-    second -- but that is an invisible convention, and the failure when it is
-    broken is the worst kind: reversing source and target produces a transform
-    that is entirely well-formed and moves the flap further from home instead
-    of onto it, at a magnitude that looks exactly right. Redrawing the source
-    after the target, or drawing the target first, is enough to trip it.
-
-    The fragment outline already answers it and can be checked: the source line
-    lies on the fragment, the target lies off it, in the socket. So this
-    samples both lines against the outline and decides by which one sits on it.
-
-    Lines are (2, 3) arrays in (z, y, x) VOXEL indices -- what a napari Shapes
-    layer holds. Returns (source, target, note); `note` says what it found, for
-    showing to whoever drew them. Raises when the two cannot be told apart,
-    rather than picking one: an ambiguous pair is a drawing to fix, not a coin
-    to flip.
-    """
-    fragments_zyx = np.asarray(fragments_zyx)
-    shape = np.array(fragments_zyx.shape) - 1
-
-    def on_fragment(line):
-        line = np.asarray(line, dtype=float).reshape(2, 3)
-        t = np.linspace(0.0, 1.0, samples)[:, None]
-        pts = np.rint(line[0] * (1 - t) + line[1] * t).astype(int)
-        pts = np.clip(pts, 0, shape)
-        return float((fragments_zyx[pts[:, 0], pts[:, 1], pts[:, 2]] == int(label)).mean())
-
-    frac_a, frac_b = on_fragment(line_a), on_fragment(line_b)
-    if max(frac_a, frac_b) < margin:
-        raise ValueError(
-            f"neither line lies on fragment {label} ({100 * frac_a:.0f}% and "
-            f"{100 * frac_b:.0f}% of their length). Grab or paint the fragment first, "
-            f"then draw one line across a feature ON it and move a copy to where that "
-            f"feature belongs.")
-    if abs(frac_a - frac_b) < margin:
-        raise ValueError(
-            f"both lines lie on fragment {label} ({100 * frac_a:.0f}% and "
-            f"{100 * frac_b:.0f}%), so which one is the target is not decidable. Move the "
-            f"copy off the fragment, onto the place it should end up.")
-    if frac_a >= frac_b:
-        source, target, sf, tf = line_a, line_b, frac_a, frac_b
-    else:
-        source, target, sf, tf = line_b, line_a, frac_b, frac_a
-    note = (f"source line is {100 * sf:.0f}% on fragment {label}, target {100 * tf:.0f}% "
-            f"-- read off the outline, not the drawing order")
-    return np.asarray(source, dtype=float), np.asarray(target, dtype=float), note
-
-
-def fit_from_segments(source_xy_um, target_xy_um, center_um=None):
-    """The in-plane rigid transform carrying one drawn segment onto another.
-
-    Two endpoints are exactly enough here and no more: an in-plane rigid
-    transform has three degrees of freedom (tx, ty, theta) and a segment
-    supplies four numbers, of which the length is already spent -- the target
-    is a COPY of the source and cannot be stretched. So the fit is exact by
-    construction rather than least-squares, and there is no residual to read
-    (which is why boundary_report, not a residual, is what checks this work).
-
-    center_um: the pivot to express the result about -- the hinge, when there
-    is one in this plane, so the transform's fixed point is the place the
-    tissue is still attached. It changes only how the same motion is written
-    down, never the motion: the segment lands on its target either way.
-    """
-    a0, a1 = np.asarray(source_xy_um, dtype=float).reshape(2, 2)
-    b0, b1 = np.asarray(target_xy_um, dtype=float).reshape(2, 2)
-    da, db = a1 - a0, b1 - b0
-    if np.hypot(*da) < 1e-9 or np.hypot(*db) < 1e-9:
-        raise ValueError("a segment with zero length gives no direction to rotate to")
-    theta = np.degrees(np.arctan2(db[1], db[0]) - np.arctan2(da[1], da[0]))
-    theta = (theta + 180.0) % 360.0 - 180.0
-    c = np.asarray(a0 if center_um is None else center_um, dtype=float)
-    # Solve p_out = R(p - c) + c + t for t at the segment's start point.
-    t = b0 - (_rotation_xy(theta) @ (a0 - c) + c)
-    return float(t[0]), float(t[1]), float(theta), (float(c[0]), float(c[1]))
 
 
 def apply_to_labels(labels_zyx, plan):

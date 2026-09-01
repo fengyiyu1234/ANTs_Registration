@@ -477,30 +477,54 @@ def test_pipeline_integration(tmp_dir):
 
 
 
-def test_orient_segments_reads_the_outline_not_the_order():
-    print("12. orient_segments: source/target decided by the fragment, either way round...")
-    fragments = np.zeros((6, 40, 60), dtype=np.uint8)
-    fragments[2, 5:15, 5:25] = 1                       # the flap
-    on_flap = [[2, 10, 8], [2, 10, 22]]
-    in_socket = [[2, 30, 8], [2, 30, 22]]
+def test_outline_polygon_and_rigid_fit_round_trip():
+    print("14. outline_polygon + fit_from_points: drag the silhouette, get the pose back...")
+    fragments = np.zeros((6, 60, 80), dtype=np.uint8)
+    fragments[2, 20:40, 30:52] = 1
+    fragments[2, 20:26, 52:60] = 1        # asymmetric, so a rotation is identifiable
 
-    for order, (first, second) in enumerate(((on_flap, in_socket), (in_socket, on_flap))):
-        src, dst, note = rp.orient_segments(first, second, fragments, 1)
-        assert np.allclose(src, on_flap), f"drawing order {order} flipped source and target"
-        assert np.allclose(dst, in_socket), order
-        assert "not the drawing order" in note, note
+    poly = rp.outline_polygon(fragments, 1, 2)
+    assert poly.ndim == 2 and poly.shape[1] == 2 and len(poly) >= 3, poly.shape
+    assert not np.allclose(poly[0], poly[-1]), "the closing duplicate vertex should be dropped"
+    ys, xs = poly[:, 0], poly[:, 1]
+    assert 19 <= ys.min() and ys.max() <= 40 and 29 <= xs.min() and xs.max() <= 60, poly
 
-    # Both off the fragment, or both on it: a drawing to fix, not a coin to flip.
-    for a, b, expect in ((in_socket, [[2, 35, 8], [2, 35, 22]], "neither line lies on"),
-                         (on_flap, [[2, 12, 6], [2, 12, 20]], "both lines lie on")):
-        try:
-            rp.orient_segments(a, b, fragments, 1)
-        except ValueError as exc:
-            assert expect in str(exc), exc
-        else:
-            raise AssertionError(f"an ambiguous pair was accepted ({expect})")
+    # The contract: whatever rigid move the vertices underwent comes back as
+    # the numbers that produced it, whatever centre it is expressed about.
+    src = np.column_stack([xs * PAINT_UM[0], ys * PAINT_UM[1]])
+    applied = rp.make_keyframe(2, tx_um=41.0, ty_um=-17.0, theta_deg=8.0, center_um=(120.0, 90.0))
+    moved = rp.transform_points_um(src, applied)
+    for centre in (None, (120.0, 90.0), (0.0, 0.0)):
+        tx, ty, theta, c, scale = rp.fit_from_points(src, moved, center_um=centre)
+        assert abs(theta - 8.0) < 1e-6, theta
+        assert abs(scale - 1.0) < 1e-9, scale
+        back = rp.transform_points_um(src, rp.make_keyframe(2, tx, ty, theta, 0, c))
+        assert np.abs(back - moved).max() < 1e-6, np.abs(back - moved).max()
+
+    # A resize is measured, never folded into the pose: napari's selection box
+    # resizes if a corner handle is dragged, and a plan that quietly absorbed
+    # it would move the tissue by the wrong amount.
+    stretched = (moved - moved.mean(axis=0)) * 1.2 + moved.mean(axis=0)
+    tx, ty, theta, c, scale = rp.fit_from_points(src, stretched)
+    assert abs(scale - 1.2) < 1e-6, scale
+    assert abs(theta - 8.0) < 1e-6, "a resize must not be read as a rotation"
+
+    # Vertices added or removed: refused, because index correspondence is gone.
+    try:
+        rp.fit_from_points(src, moved[:-1])
+    except ValueError as exc:
+        assert "vertices were added or removed" in str(exc), exc
+    else:
+        raise AssertionError("a mismatched vertex count was accepted")
+
+    # A plane the fragment was never grabbed on has no outline to copy.
+    try:
+        rp.outline_polygon(fragments, 1, 3)
+    except ValueError as exc:
+        assert "nothing on plane 3" in str(exc), exc
+    else:
+        raise AssertionError("an empty plane produced an outline")
     print("   OK")
-
 
 
 def test_densify_fills_between_grabbed_planes_only():
@@ -543,7 +567,7 @@ def main():
     test_boundary_report_flags_only_real_steps()
     test_plan_roundtrip_and_validation(tmp_dir)
     test_grab_plane_takes_the_piece_and_nothing_else()
-    test_orient_segments_reads_the_outline_not_the_order()
+    test_outline_polygon_and_rigid_fit_round_trip()
     test_densify_fills_between_grabbed_planes_only()
     test_pipeline_integration(tmp_dir)
 
