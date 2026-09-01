@@ -348,6 +348,135 @@ def test_pipeline_integration(tmp_dir):
 
 
 
+def test_grab_plane_takes_the_piece_and_nothing_else():
+    print("11. grab_plane: one click takes the piece on that plane, not the brain...")
+    tissue = np.zeros((12, 40, 60), dtype=bool)
+    tissue[:, 14:38, 5:55] = True                 # the brain
+    tissue[:, 4:12, 12:34] = True                 # a piece, across a one-voxel crack
+
+    got, note = rp.grab_plane(tissue, (5, 8, 20))
+    assert got[5, 4:12, 12:34].all(), "the piece was not taken"
+    assert not got[5, 14:38, 5:55].any(), "the grab leaked across the crack into the brain"
+    assert not got[4].any() and not got[6].any(), "grab_plane reached another plane"
+    assert "plane 5" in note, note
+
+    # A crack too tight to threshold apart: the pieces touch, so one component
+    # spans both. A few strokes in `exclude` separate them again -- the cut
+    # brush, and the only thing that gets a grab past a join.
+    welded = tissue.copy()
+    welded[:, 12:14, 12:34] = True
+    leaked, _ = rp.grab_plane(welded, (5, 8, 20))
+    assert leaked[5, 20:38, 10:50].any(), "the phantom does not weld; the test is void"
+    cut = np.zeros(tissue.shape, dtype=np.uint8)
+    cut[:, 12:14, 12:34] = 255
+    fixed, _ = rp.grab_plane(
+        rp.threshold_planes(welded.astype(np.uint8), 0, exclude=cut), (5, 8, 20))
+    assert not fixed[5, 20:38, 10:50].any(), "the cut did not separate the pieces"
+    assert fixed[5, 4:12, 12:34].all(), "the cut ate into the piece"
+
+    # Clicking off tissue is a mistake worth naming, not an empty result.
+    try:
+        rp.grab_plane(tissue, (5, 0, 0))
+    except ValueError as exc:
+        assert "not on tissue" in str(exc), exc
+    else:
+        raise AssertionError("a seed on background was accepted")
+    print("   OK")
+
+
+def test_pipeline_integration(tmp_dir):
+    print("10. pipeline wiring: one config key moves the stack, the outlines and the cells...")
+    import ants
+    import pandas as pd
+    import SimpleITK as sitk
+    from registration_ants import cell_points, pipeline
+
+    # A plan and its fragment outlines on a (10, 10, 10) painted grid.
+    fragments = np.zeros((10, 10, 10), dtype=np.uint8)
+    fragments[8, 4:8, 1:5] = 1        # (z, y, x)
+    fragments_path = tmp_dir / "frag.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(fragments), str(fragments_path))
+    painted_um = (10.0, 10.0, 10.0)
+    plan = rp.make_plan((10, 10, 10), painted_um,
+                        [rp.make_fragment(1, [rp.make_keyframe(z=8, tx_um=50.0, ty_um=20.0)], "flap")],
+                        labels_path=str(fragments_path))
+    plan_path = rp.write_plan(tmp_dir / "s.reposition.json", plan)
+
+    sample_cfg = {"reposition_plan": str(plan_path), "voxel_size_um": list(painted_um)}
+    loaded, frag_arr = pipeline._load_reposition(sample_cfg)
+    assert loaded == plan and np.array_equal(frag_arr, fragments)
+    assert pipeline._load_reposition({}) == (None, None)
+
+    # A plan whose outlines are missing or the wrong shape must stop the run:
+    # it says how far to move tissue but not which tissue.
+    orphan = dict(plan, labels_path=str(tmp_dir / "gone.nii.gz"))
+    rp.write_plan(tmp_dir / "orphan.json", orphan)
+    # A plan drawn on a different grid -- or, the (1,1,1) case, on none at all.
+    for drawn, expect in ((( 20.0, 20.0, 10.0), "um/voxel"), ((1.0, 1.0, 1.0), "voxel counts")):
+        rp.write_plan(tmp_dir / "grid.json", dict(plan, voxel_size_um=list(drawn)))
+        try:
+            pipeline._load_reposition({"reposition_plan": str(tmp_dir / "grid.json"),
+                                       "voxel_size_um": list(painted_um)})
+        except ValueError as exc:
+            assert expect in str(exc), exc
+        else:
+            raise AssertionError(f"a plan drawn on {drawn} was applied to {painted_um}")
+
+    try:
+        pipeline._load_reposition({"reposition_plan": str(tmp_dir / "orphan.json"),
+                                   "voxel_size_um": list(painted_um)})
+    except FileNotFoundError as exc:
+        assert "labels_path" in str(exc), exc
+    else:
+        raise AssertionError("a plan with no fragment volume was accepted")
+
+    # _reposition_volume works in ANTs' (x, y, z) order and refuses any other grid.
+    img_xyz = np.zeros((10, 10, 10), dtype=np.float32)
+    img_xyz[1:5, 4:8, 8] = 1000.0                      # the fragment, in (x, y, z)
+    moved = pipeline._reposition_volume(
+        ants.from_numpy(img_xyz, spacing=painted_um), plan, fragments, "image", "test")
+    assert moved.numpy()[1:5, 4:8, 8].max() < 1.0, "the source region was not vacated"
+    # +50 um and +20 um at 10 um/voxel: five voxels in x, two in y.
+    assert moved.numpy()[6:10, 6:10, 8].min() > 900.0, "the fragment did not land where planned"
+    try:
+        pipeline._reposition_volume(
+            ants.from_numpy(np.zeros((8, 8, 8), dtype=np.float32)), plan, fragments, "image", "wrong")
+    except ValueError as exc:
+        assert "only be applied on the grid it was drawn on" in str(exc), exc
+    else:
+        raise AssertionError("a plan was applied to a volume of a different shape")
+
+    # And the cells: moved with their fragment, but columns 0-2 keep the raw
+    # position the detector actually reported.
+    atlas_annotation = ants.from_numpy(np.full((10, 10, 10), 5, dtype=np.float32),
+                                       spacing=(25.0, 25.0, 25.0))
+    reg = {"fwdtransforms": [], "invtransforms": [], "atlas_annotation": atlas_annotation}
+    sample_fine = ants.from_numpy(np.zeros((20, 20, 20), dtype=np.float32), spacing=(50.0,) * 3)
+    cells_dir = tmp_dir / "cells"
+    cells_dir.mkdir(exist_ok=True)
+    # raw (6,10,16) * 5 um = (30,50,80) um = painted voxel (x3, y5, z8), on the
+    # fragment; raw (2,2,2) = 10 um = painted (1,1,1), off it.
+    pd.DataFrame({"cx": [6.0, 2.0], "cy": [10.0, 2.0], "z": [16.0, 2.0],
+                  "score": [0.5, 0.5], "slice_name": ["a", "b"], "tile_name": ["t", "t"]}
+                 ).to_csv(cells_dir / "ob_c.csv", index=False)
+
+    cell_points.assign_cell_regions(
+        str(cells_dir), str(tmp_dir / "out"), (5.0, 5.0, 5.0), sample_fine, reg,
+        atlas_structures={5: {"name": "R5"}}, prefix="ob_",
+        reposition_plan=plan, reposition_fragments=fragments)
+    got = pd.read_csv(tmp_dir / "out" / "cell_registration" / "c" / "cell_registration.csv",
+                      header=None)
+    assert np.allclose(got.iloc[0, 0:3].values.astype(float), [6.0, 10.0, 16.0]), \
+        "columns 0-2 must stay the raw detected position, not the moved one"
+    # (30,50,80) um moved to (80,70,80); the resample grid is 50 um, so the
+    # index is (1.6, 1.4, 1.6) where an unrepositioned run would give (0.6, 1.0, 1.6).
+    assert np.allclose(got.iloc[0, 3:6].values.astype(float), [1.6, 1.4, 1.6]), got.iloc[0, 3:6]
+    assert np.allclose(got.iloc[1, 3:6].values.astype(float), [0.2, 0.2, 0.2]), \
+        "the off-fragment cell moved"
+    print("   OK")
+
+
+
 def test_grab_fragment_finds_the_flap_and_the_hinge():
     print("11. grab_fragment: the flap comes out of a click, and it stops at the hinge...")
     # A brain-ish slab with a flap along its top edge, separated by a one-voxel
@@ -473,7 +602,7 @@ def main():
     test_two_fragments_erase_before_paste()
     test_boundary_report_flags_only_real_steps()
     test_plan_roundtrip_and_validation(tmp_dir)
-    test_grab_fragment_finds_the_flap_and_the_hinge()
+    test_grab_plane_takes_the_piece_and_nothing_else()
     test_orient_segments_reads_the_outline_not_the_order()
     test_densify_fills_between_grabbed_planes_only()
     test_pipeline_integration(tmp_dir)

@@ -11,9 +11,9 @@ sample:
   # 它们刚性地合回去。plan 由 Registration_toolkit/paint_mask.py 的 Reposition
   # 面板导出（guide 和 labels 两个模式里都有），文件名是 <导出文件名>.reposition.json，
   # 旁边的 <导出文件名>_fragments.nii.gz 记录着碎片轮廓（plan 里的 labels_path 指向它）。
-  # 碎片轮廓【不用手画】：掰开的那几层里碎片本来就是独立连通块，在面板里点一下
-  # "Grab fragment under the cursor" 就能抠出来，并沿 z 走到它不再独立为止——那里
-  # 就是铰链，z 范围也一并定了。
+  # 碎片轮廓【不用手画】：掰开的那几层里碎片本来就是独立连通块，在面板里点
+  # "Grab this plane" 再点碎片就能抠出来。一次一层，z 范围就是你点过的那些层，
+  # 层间在应用 plan 时自动填充（densify_fragments）。
   #
   # 只需要这一行：raw_tiff、guide_regions.regions_mask、sample_damage_mask_path、
   # cells.cell_centroids_dir 会【一起】被搬，因为它们都画/测在同一个原始网格上，

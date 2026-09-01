@@ -16,8 +16,9 @@ ANTs-based registration of LSFM brain samples to the Allen CCF atlas, plus tools
 - `cell_points.py` — reads ClearMap cell-centroid CSVs.
 - `reposition.py` — closes the gaps left by tissue that split open, as per-plane
   in-plane rigid moves applied before registration (`sample.reposition_plan`).
-  `grab_fragment` finds a flap from one click by walking its connected component
-  along z, stopping at the hinge, so nothing has to be outlined by hand.
+  `grab_plane` takes a piece from one click as its own connected component, so
+  nothing has to be outlined by hand; the planes between the ones clicked are
+  filled by `densify_fragments` when the plan is applied.
   Plans are drawn in `paint_mask.py`'s Reposition panel; one config key moves the
   stack, the guide outlines, the damage mask and the cell centroids together.
   `scripts/apply_reposition.py` writes the repositioned copies out, and `--invert`

@@ -272,150 +272,6 @@ def _plane_affine_inverse(tf, voxel_size_um):
 # Finding a fragment without painting one
 # =====================================================================================
 
-class threshold_planes:
-    """`stack > value`, one plane at a time, for grab_fragment.
-
-    A whole-volume comparison would be a boolean copy of the stack -- 1.7 GB
-    for a 190 x 3967 x 2249 raw one -- to answer a question that only ever
-    looks at a handful of planes. This defers it per plane and keeps the same
-    `[z]` / `.shape` surface a bool array has, so callers with a small volume
-    can still just pass the array.
-
-    `exclude`, when given, is a same-shaped volume whose nonzero voxels are
-    taken OUT of the tissue -- a few hand-drawn strokes across a crack too
-    tight to threshold apart. That is far less work than tracing the piece
-    they separate, and it is all the walk needs to get past a join: cutting
-    the two apart in the mask makes them two components again.
-    """
-
-    def __init__(self, stack, value, exclude=None):
-        self.stack, self.value, self.shape = stack, value, stack.shape
-        self.exclude = exclude
-
-    def __getitem__(self, z):
-        plane = self.stack[z] > self.value
-        if self.exclude is not None:
-            plane = plane & (self.exclude[z] == 0)
-        return plane
-
-
-def otsu_threshold(stack, max_planes=24):
-    """An Otsu threshold for `stack`, read off an evenly spaced subset of its
-    planes -- a starting value for the control that tunes it, not a decision.
-    Subsampled because this runs to fill in a slider's default, and a full
-    histogram of a multi-gigabyte stack is not worth the wait for that."""
-    from skimage.filters import threshold_otsu
-    step = max(1, stack.shape[0] // max_planes)
-    return float(threshold_otsu(np.asarray(stack[::step], dtype=np.float32)))
-
-
-def grab_fragment(tissue_zyx, seed_zyx, max_growth=5.0, max_fraction=0.5, min_area=8,
-                  follow_z=True):
-    """The split-open piece of tissue under `seed_zyx`, found rather than traced.
-
-    A flap does not need outlining by hand, because on the planes where it is
-    open it is already a separate object: the crack is a gap, so the flap is
-    its own 2D connected component in every plane that shows it. This walks
-    that component along z from the seed plane, taking on each next plane the
-    component(s) overlapping the last one.
-
-    WHERE IT STOPS IS THE HINGE. The flap is attached somewhere -- that is what
-    makes it a flap and not a fragment -- and on the first plane past the
-    attachment it stops being separate and the component becomes the whole
-    brain instead. Two tests for that, because either alone has a blind spot:
-
-      max_growth    the component grew more than this many times over the
-                    previous plane. Catches the jump from flap to brain.
-      max_fraction  the component is more than this share of the plane's total
-                    tissue. Catches a flap that merges gradually, where no
-                    single step trips the growth ratio.
-
-    So the z extent is not asked for either: it comes out of where the tissue
-    stops being separable, which is the honest answer to "how far does this
-    flap go" and not one an eye is good at giving.
-
-    follow_z=False takes ONLY the seed plane and does no walking. That is the
-    mode for a sample carrying several pieces, where the extents are already
-    known: grab each piece's first and last plane and interpolate between them,
-    the same sparse-keyframe idiom the guide outlines use. Not because the walk
-    misbehaves there -- measured on two pieces sharing an xy footprint at
-    different z, it stops at each piece's own ends rather than stepping between
-    them -- but because it DECIDES the extent, and an extent that is known is
-    better stated than inferred, especially when keyframes have to bracket it
-    anyway. The walk stays the quicker route for one flap of unknown extent,
-    and it is the only thing here that locates the hinge.
-
-    tissue_zyx: anything where `tissue_zyx[z]` is a 2D boolean plane and
-    `.shape` is (z, y, x) -- a bool array, or `threshold_planes(stack, value)`
-    for a raw stack that would cost gigabytes to binarize whole. Threshold the
-    raw stack for this rather than reusing a painted guide outline: a guide is
-    sparse keyframes interpolated into a smooth blob, and interpolation closes
-    exactly the thin crack this depends on.
-
-    Returns (mask_zyx, planes, note): the fragment, the planes it spans, and a
-    line saying where each end stopped and why.
-    """
-    z0, y0, x0 = (int(v) for v in seed_zyx)
-    n_planes = tissue_zyx.shape[0]
-    if not (0 <= z0 < n_planes):
-        raise ValueError(f"seed plane {z0} is outside the volume's {n_planes} planes")
-    if not tissue_zyx[z0][y0, x0]:
-        raise ValueError(f"the seed (z={z0}, y={y0}, x={x0}) is not on tissue -- click on the "
-                         f"fragment itself, or lower the threshold until it shows up")
-
-    def component_at(plane, seeds):
-        """The component(s) of `plane` that `seeds` touches, as one mask."""
-        labelled, n = ndimage.label(plane)
-        if not n:
-            return np.zeros_like(plane, dtype=bool), 0
-        hit = set(np.unique(labelled[seeds])) - {0}
-        if not hit:
-            return np.zeros_like(plane, dtype=bool), 0
-        return np.isin(labelled, list(hit)), len(hit)
-
-    seed_mask = np.zeros(tuple(tissue_zyx.shape[1:]), dtype=bool)
-    seed_mask[y0, x0] = True
-    current, _ = component_at(np.asarray(tissue_zyx[z0], dtype=bool), seed_mask)
-    out = np.zeros(tuple(tissue_zyx.shape), dtype=bool)
-    out[z0] = current
-    reasons = {}
-
-    for direction in ((1, -1) if follow_z else ()):
-        previous = out[z0]
-        z = z0 + direction
-        while 0 <= z < n_planes:
-            plane = np.asarray(tissue_zyx[z], dtype=bool)
-            grown, _ = component_at(plane, previous)
-            area, before = int(grown.sum()), int(previous.sum())
-            if area < min_area:
-                reasons[direction] = f"z={z}: the fragment thins out to nothing"
-                break
-            if before and area > max_growth * before:
-                reasons[direction] = (f"z={z}: the component jumps {area / before:.0f}x "
-                                      f"({before} -> {area} px) -- this is the hinge, where "
-                                      f"the flap rejoins the brain")
-                break
-            total = int(plane.sum())
-            if total and area > max_fraction * total:
-                reasons[direction] = (f"z={z}: the component is {100 * area / total:.0f}% of the "
-                                      f"tissue on that plane -- no longer a flap, this is the hinge")
-                break
-            out[z] = grown
-            previous = grown
-            z += direction
-        else:
-            reasons[direction] = f"z={z - direction}: reached the end of the volume"
-
-    planes = sorted(int(z) for z in np.unique(np.nonzero(out)[0]))
-    if not follow_z:
-        note = f"plane {z0} only, {int(out.sum())} voxels (no z walk)"
-    else:
-        note = (f"planes {planes[0]}..{planes[-1]} ({len(planes)}), {int(out.sum())} voxels\n"
-                f"  low end  {reasons.get(-1, 'n/a')}\n"
-                f"  high end {reasons.get(1, 'n/a')}")
-    return out, planes, note
-
-
 # =====================================================================================
 # Sparse fragment outlines -> dense, at the moment they are used
 # =====================================================================================
@@ -471,11 +327,9 @@ def densify_fragments(fragments_zyx):
 def densify_plane(fragments_zyx, z):
     """One filled plane of `densify_fragments`, without building the volume.
 
-    The GUI redraws a preview on every slider tick, and a dense copy of a
-    190 x 3967 x 2249 outline volume is gigabytes to allocate for a question
-    about one plane. Only the two keyframes bracketing z matter, so only those
-    are interpolated -- through the same function the whole-volume path uses,
-    on a three-plane stand-in, rather than a second copy of the arithmetic.
+    Only the two keyframes bracketing z matter, so only those are interpolated
+    -- through the same function the whole-volume path uses, on a stand-in
+    stack, rather than a second copy of the arithmetic.
     """
     from . import mask_utils
 
@@ -497,6 +351,84 @@ def densify_plane(fragments_zyx, z):
             (hi - lo + 1,) + fragments_zyx.shape[1:])
         out[span[z - lo]] = label
     return out
+
+
+class threshold_planes:
+    """`stack > value`, one plane at a time, for grab_fragment.
+
+    A whole-volume comparison would be a boolean copy of the stack -- 1.7 GB
+    for a 190 x 3967 x 2249 raw one -- to answer a question that only ever
+    looks at a handful of planes. This defers it per plane and keeps the same
+    `[z]` / `.shape` surface a bool array has, so callers with a small volume
+    can still just pass the array.
+
+    `exclude`, when given, is a same-shaped volume whose nonzero voxels are
+    taken OUT of the tissue -- a few hand-drawn strokes across a crack too
+    tight to threshold apart. That is far less work than tracing the piece
+    they separate, and it is all the walk needs to get past a join: cutting
+    the two apart in the mask makes them two components again.
+    """
+
+    def __init__(self, stack, value, exclude=None):
+        self.stack, self.value, self.shape = stack, value, stack.shape
+        self.exclude = exclude
+
+    def __getitem__(self, z):
+        plane = self.stack[z] > self.value
+        if self.exclude is not None:
+            plane = plane & (self.exclude[z] == 0)
+        return plane
+
+
+def otsu_threshold(stack, max_planes=24):
+    """An Otsu threshold for `stack`, read off an evenly spaced subset of its
+    planes -- a starting value for the control that tunes it, not a decision.
+    Subsampled because this runs to fill in a slider's default, and a full
+    histogram of a multi-gigabyte stack is not worth the wait for that."""
+    from skimage.filters import threshold_otsu
+    step = max(1, stack.shape[0] // max_planes)
+    return float(threshold_otsu(np.asarray(stack[::step], dtype=np.float32)))
+
+
+def grab_plane(tissue_zyx, seed_zyx):
+    """The piece of tissue under `seed_zyx`, on that plane, found rather than traced.
+
+    A split-open piece does not need outlining by hand: the crack is a gap, so
+    on any plane that shows the piece open it is already its own 2D connected
+    component. One click takes it.
+
+    ONE PLANE, deliberately. An earlier version walked the component along z
+    and stopped where it stopped being separate, which also located the hinge
+    -- but that decides the extent, and on a sample carrying several pieces the
+    extent is already known and better stated than inferred. Grabbing each
+    piece's planes and letting densify_fragments fill between them is the same
+    sparse-keyframe idiom the guide outlines use, and it keeps every piece's
+    span exactly where it was put.
+
+    tissue_zyx: anything where `tissue_zyx[z]` is a 2D boolean plane and
+    `.shape` is (z, y, x) -- a bool array, or `threshold_planes(stack, value)`
+    for a raw stack that would cost gigabytes to binarize whole. Threshold the
+    raw stack for this rather than reusing a painted guide outline: a guide is
+    sparse keyframes interpolated into a smooth blob, and interpolation closes
+    exactly the thin crack this depends on.
+
+    Returns (mask_zyx, note): a volume empty except on the seed plane, and a
+    line saying what was taken.
+    """
+    z0, y0, x0 = (int(v) for v in seed_zyx)
+    n_planes = tissue_zyx.shape[0]
+    if not (0 <= z0 < n_planes):
+        raise ValueError(f"seed plane {z0} is outside the volume's {n_planes} planes")
+    plane = np.asarray(tissue_zyx[z0], dtype=bool)
+    if not plane[y0, x0]:
+        raise ValueError(f"the seed (z={z0}, y={y0}, x={x0}) is not on tissue -- click on the "
+                         f"fragment itself, or lower the threshold until it shows up")
+
+    labelled, n = ndimage.label(plane)
+    out = np.zeros(tuple(tissue_zyx.shape), dtype=bool)
+    if n:
+        out[z0] = labelled == labelled[y0, x0]
+    return out, f"plane {z0}, {int(out.sum())} voxels"
 
 
 # =====================================================================================
