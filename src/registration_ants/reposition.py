@@ -354,7 +354,7 @@ def densify_plane(fragments_zyx, z):
 
 
 class threshold_planes:
-    """`stack > value`, one plane at a time, for grab_fragment.
+    """`stack > value`, one plane at a time, for grab_plane.
 
     A whole-volume comparison would be a boolean copy of the stack -- 1.7 GB
     for a 190 x 3967 x 2249 raw one -- to answer a question that only ever

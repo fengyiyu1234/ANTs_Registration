@@ -477,66 +477,6 @@ def test_pipeline_integration(tmp_dir):
 
 
 
-def test_grab_fragment_finds_the_flap_and_the_hinge():
-    print("11. grab_fragment: the flap comes out of a click, and it stops at the hinge...")
-    # A brain-ish slab with a flap along its top edge, separated by a one-voxel
-    # crack on planes 3..7 and FUSED to the slab from plane 8 on -- i.e. hinged
-    # there, which is the geometry the whole per-plane model is built for.
-    tissue = np.zeros((12, 40, 60), dtype=bool)
-    tissue[:, 14:38, 5:55] = True                 # the brain
-    tissue[:, 4:12, 12:34] = True                 # the flap
-    tissue[8:, 12:14, 12:34] = True               # ...welded on from z=8 (the hinge)
-
-    got, planes, note = rp.grab_fragment(tissue, (5, 8, 20))
-    assert planes == [0, 1, 2, 3, 4, 5, 6, 7], planes
-    assert "hinge" in note, note
-    assert got[5, 4:12, 12:34].all() and not got[5, 14:38, 5:55].any(), \
-        "the grab leaked across the crack into the brain"
-    assert not got[8].any(), "the grab ran past the hinge"
-
-    # A crack too tight to threshold apart: the pieces touch, so the walk runs
-    # straight through. A few strokes in `exclude` separate them again, which
-    # is the whole point of the cut brush -- far less work than tracing.
-    welded = tissue.copy()
-    welded[:, 12:14, 12:34] = True                # the crack closed on every plane
-    leaked, _, _ = rp.grab_fragment(welded, (5, 8, 20))
-    assert leaked[5, 20:38, 10:50].any(), "the phantom does not actually leak; test is void"
-    cut = np.zeros(tissue.shape, dtype=np.uint8)
-    cut[:, 12:14, 12:34] = 255
-    fixed, planes_cut, _ = rp.grab_fragment(
-        rp.threshold_planes(welded.astype(np.uint8), 0, exclude=cut), (5, 8, 20))
-    assert not fixed[5, 20:38, 10:50].any(), "the cut did not separate the pieces"
-    assert fixed[5, 4:12, 12:34].all(), "the cut ate into the flap"
-
-    # follow_z=False is for pieces that sit apart in z but overlap in xy: the
-    # walk links planes by overlap and would step from one onto the other, so
-    # the extent has to come from grabbing a few planes each instead.
-    two = np.zeros((12, 40, 60), dtype=bool)
-    two[:, 14:38, 5:55] = True                    # the brain
-    two[2:5, 4:12, 12:34] = True                  # piece A, low z
-    two[8:11, 4:12, 12:34] = True                 # piece B, same xy, high z
-    single, planes_one, note_one = rp.grab_fragment(two, (3, 8, 20), follow_z=False)
-    assert planes_one == [3], planes_one
-    assert "no z walk" in note_one, note_one
-    assert single[3, 4:12, 12:34].all() and not single[9].any(), \
-        "follow_z=False reached another plane"
-
-    # Seeding on the brain instead grabs the brain, and says so by size rather
-    # than by failing -- there is nothing to detect, the click was just wrong.
-    brain, brain_planes, _ = rp.grab_fragment(tissue, (5, 25, 30))
-    assert int(brain[5].sum()) > int(got[5].sum()) * 3
-
-    # Clicking off tissue is a mistake worth naming, not an empty result.
-    try:
-        rp.grab_fragment(tissue, (5, 0, 0))
-    except ValueError as exc:
-        assert "not on tissue" in str(exc), exc
-    else:
-        raise AssertionError("a seed on background was accepted")
-    print("   OK")
-
-
-
 def test_orient_segments_reads_the_outline_not_the_order():
     print("12. orient_segments: source/target decided by the fragment, either way round...")
     fragments = np.zeros((6, 40, 60), dtype=np.uint8)
