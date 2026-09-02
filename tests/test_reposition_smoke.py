@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from registration_ants import reposition as rp  # noqa: E402
@@ -552,6 +553,90 @@ def test_densify_fills_between_grabbed_planes_only():
     print("   OK")
 
 
+def test_restore_labels_puts_the_registration_back_on_the_raw_geometry():
+    print("15. restore_labels_to_original: the flap's regions come back onto the flap...")
+    # What a registration produces: labels describing the CLOSED brain. Built
+    # here by pushing an original label volume forward through the plan, so the
+    # fixture states exactly the move that has to be undone.
+    _, labels = make_stack(shape_zyx=(12, 60, 140))
+    original = np.zeros(labels.shape, dtype=np.uint32)
+    original[labels == 1] = 315                       # the flap's region
+    original[:, 45:, :] = 1129                        # tissue that never moves
+
+    # Far enough along x that the flap's two positions are disjoint: an
+    # overlapping pair is a much weaker fixture, since a restore that did
+    # nothing at all would still look half right. The pivot is the flap's own
+    # centre, so the angle turns it in place and tx alone separates the two.
+    plan = rp.make_plan(labels.shape, PAINT_UM, [rp.make_fragment(
+        1, [rp.make_keyframe(z=z, tx_um=130.0 + 10.0 * (z - 4), ty_um=-10.4, theta_deg=9.0,
+                             center_um=(197.6, 135.2)) for z in (4, 7)])])
+
+    # Push the flap's labels into the closed geometry the same way the pipeline
+    # pushes the image, and confirm the flap really is unlabelled where the
+    # tissue actually sits -- the "reads as background" symptom itself.
+    in_closed_geometry = original.copy()
+    for z in rp.fragment_source_planes(plan["fragments"][0], labels.shape[0]):
+        tf = rp.plane_transform(plan["fragments"][0], z)
+        matrix, offset = rp._plane_affine_inverse(tf, PAINT_UM)
+        mask = labels[z] == 1
+        moved_mask = ndimage.affine_transform(mask.astype(np.uint8), matrix, offset=offset,
+                                              order=0, mode="constant", cval=0) > 0
+        in_closed_geometry[z][mask] = 0
+        in_closed_geometry[z + tf["dz_planes"]][moved_mask] = 315
+    on_flap = labels == 1
+    assert (in_closed_geometry[on_flap] == 0).mean() > 0.9, \
+        "the fixture is wrong: the closed-geometry labels must not already cover the flap"
+
+    back = rp.restore_labels_to_original(in_closed_geometry, labels, plan)
+    assert (back[on_flap] == 315).mean() > 0.95, \
+        "the flap's regions did not come back onto the flap"
+    socket = (in_closed_geometry == 315) & ~on_flap
+    assert socket.any() and (back[socket] == 0).all(), \
+        "the socket the flap was folded into must be left empty, not doubled"
+    untouched = ~on_flap & ~socket
+    assert np.array_equal(back[untouched], in_closed_geometry[untouched]), \
+        "everything off a fragment must be bit-identical"
+
+    # A plan with no fragments changes nothing at all.
+    empty = rp.make_plan(labels.shape, PAINT_UM, [])
+    assert np.array_equal(rp.restore_labels_to_original(in_closed_geometry, labels, empty),
+                          in_closed_geometry)
+    print("   OK")
+
+
+def test_rescale_plan_keeps_the_physical_move():
+    print("16. rescale_plan: same microns, different grid...")
+    plan = rp.make_plan((12, 60, 80), PAINT_UM, [rp.make_fragment(
+        1, [rp.make_keyframe(z=4, tx_um=31.2, dz_planes=2, center_um=(190.0, 125.0)),
+            rp.make_keyframe(z=8, tx_um=62.4, dz_planes=2, center_um=(190.0, 125.0))])])
+
+    # Half the z spacing: every plane count doubles, every micron stays put.
+    fine = rp.rescale_plan(plan, (20.0, 20.0, 32.0), image_shape_zyx=(24, 15, 20))
+    kfs = fine["fragments"][0]["keyframes"]
+    assert [k["z"] for k in kfs] == [8, 16], kfs
+    assert [k["dz_planes"] for k in kfs] == [4, 4], kfs
+    assert [k["tx_um"] for k in kfs] == [31.2, 62.4], kfs
+    assert fine["voxel_size_um"] == [20.0, 20.0, 32.0] and fine["image_shape_zyx"] == [24, 15, 20]
+
+    # The interpolated transform at the same PHYSICAL depth is the same move.
+    at_paint = rp.plane_transform(plan["fragments"][0], 6)
+    at_fine = rp.plane_transform(fine["fragments"][0], 12)
+    assert abs(at_paint["tx_um"] - at_fine["tx_um"]) < 1e-9, (at_paint, at_fine)
+
+    # Too coarse in z to tell two keyframes apart: said, not silently merged.
+    # Adjacent keyframes onto a grid 5x coarser in z -- planes 4 and 5 both
+    # round to plane 1, and one plane cannot carry two transforms.
+    tight = rp.make_plan((12, 60, 80), PAINT_UM,
+                         [rp.make_fragment(1, [rp.make_keyframe(z=4), rp.make_keyframe(z=5)])])
+    try:
+        rp.rescale_plan(tight, (20.0, 20.0, 320.0))
+    except ValueError as e:
+        assert "too coarse" in str(e), e
+    else:
+        raise AssertionError("collapsing two keyframes onto one plane must raise")
+    print("   OK")
+
+
 def main():
     tmp_dir = Path("/tmp/claude-1004/-home-fyu7-My-project-Registration-ants/"
                    "aac47064-271f-44d0-8e1d-aadcd5b55308/scratchpad/reposition_smoketest")
@@ -569,6 +654,8 @@ def main():
     test_grab_plane_takes_the_piece_and_nothing_else()
     test_outline_polygon_and_rigid_fit_round_trip()
     test_densify_fills_between_grabbed_planes_only()
+    test_restore_labels_puts_the_registration_back_on_the_raw_geometry()
+    test_rescale_plan_keeps_the_physical_move()
     test_pipeline_integration(tmp_dir)
 
     print("\nALL SMOKE TESTS PASSED")

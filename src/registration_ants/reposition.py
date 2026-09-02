@@ -214,6 +214,56 @@ def fragment_source_planes(fragment, n_planes, interpolate=True):
             if plane_transform(fragment, z, interpolate) is not None]
 
 
+def rescale_plan(plan, voxel_size_um, image_shape_zyx=None):
+    """The same physical moves, re-expressed on a different sampling grid.
+
+    A plan is drawn on the raw stack, but not everything one wants to move by
+    it lives on that grid: the pipeline's own outputs -- the isotropic
+    resample, the atlas labels warped back into sample space -- are on a
+    coarser one, and putting a registration result back where the tissue
+    actually is means applying this plan there.
+
+    Only two of a keyframe's numbers are grid-dependent. `z` and `dz_planes`
+    are plane COUNTS and are rescaled by the ratio of z spacings; everything
+    else is microns and carries over untouched, which is the whole reason
+    plans are denominated in microns (see the module docstring).
+
+    Rounding to whole planes is where this can fail: on a target grid much
+    coarser in z than the one the plan was drawn on, two keyframes a plane or
+    two apart land on the SAME plane, and one plane cannot carry two
+    transforms. That raises rather than quietly dropping one of them.
+    """
+    voxel_size_um = [float(v) for v in voxel_size_um]
+    if len(voxel_size_um) != 3:
+        raise ValueError(f"voxel_size_um must have 3 entries (x, y, z), got {voxel_size_um}")
+    z_ratio = float(plan["voxel_size_um"][2]) / voxel_size_um[2]
+
+    fragments = []
+    for frag in plan["fragments"]:
+        keyframes = [make_keyframe(z=int(round(kf["z"] * z_ratio)),
+                                   tx_um=kf["tx_um"], ty_um=kf["ty_um"],
+                                   theta_deg=kf["theta_deg"],
+                                   dz_planes=int(round(kf["dz_planes"] * z_ratio)),
+                                   center_um=kf["center_um"])
+                     for kf in frag["keyframes"]]
+        zs = [k["z"] for k in keyframes]
+        dupes = sorted({z for z in zs if zs.count(z) > 1})
+        if dupes:
+            raise ValueError(
+                f"fragment label {frag['label']}: going from "
+                f"{plan['voxel_size_um'][2]} to {voxel_size_um[2]} um per plane in z "
+                f"collapses keyframes onto plane(s) {dupes}. The target grid is too "
+                f"coarse in z to carry this plan.")
+        fragments.append(make_fragment(frag["label"], keyframes, frag.get("name", "")))
+
+    out = dict(plan)
+    out["voxel_size_um"] = voxel_size_um
+    out["fragments"] = fragments
+    if image_shape_zyx is not None:
+        out["image_shape_zyx"] = [int(v) for v in image_shape_zyx]
+    return out
+
+
 # =====================================================================================
 # The transform itself, in physical microns
 # =====================================================================================
@@ -671,6 +721,95 @@ def apply_to_labels(labels_zyx, plan):
 
     for z_out, label, warped in pastes:
         out[z_out][warped] = label
+    return out
+
+
+def restore_labels_to_original(labels_zyx, fragments_zyx, plan):
+    """A label volume produced in the REPOSITIONED geometry, put back onto the
+    geometry the data on disk actually has.
+
+    Registration runs on a stack whose flaps have been swung shut, so every
+    volume that comes out of it -- `<name>_labels_in_sample.nii.gz` above all
+    -- describes the closed brain. Laid over the untouched stack it is right
+    everywhere except on the flaps, where it covers the socket the flap was
+    folded into and leaves the flap itself unlabelled. That reads as
+    "background" exactly where the tissue is, which is the one place a reader
+    is most likely to want an answer.
+
+    This carries each fragment's labels back: what the registration put where
+    the flap NOW sits is read off there and written onto the voxels the flap
+    occupies in the original data, and the moved footprint is cleared, so the
+    socket comes back empty instead of holding a second copy of the same
+    tissue. Everything off a fragment is left bit-identical.
+
+    labels_zyx and fragments_zyx must be on the SAME grid, and `plan` must be
+    expressed on it too -- `rescale_plan` is how a plan drawn on the raw stack
+    gets there. fragments_zyx is the dense outline volume in its ORIGINAL
+    position (`densify_fragments` of the painted file), i.e. exactly what
+    `apply_to_image` consumes; the moved footprint is derived here rather than
+    asked for, so the two cannot disagree.
+
+    Nearest neighbour throughout: these are region ids, and interpolating them
+    invents ids that are not regions.
+
+    This is `invert_plan`'s job done in one pass on a pulled volume rather than
+    a pushed one. Inverting and pasting would resample the labels twice (once
+    into the moved frame by the registration, once back out) and would need the
+    moved outline as a separate input; pulling through the forward transform
+    resamples once and needs only the outline that was painted.
+    """
+    labels_zyx = np.asarray(labels_zyx)
+    fragments_zyx = np.asarray(fragments_zyx)
+    if labels_zyx.shape != fragments_zyx.shape:
+        raise ValueError(f"labels {labels_zyx.shape} and fragment outlines "
+                         f"{fragments_zyx.shape} must be the same (z, y, x) volume")
+    interpolate = bool(plan.get("interpolate", True))
+    voxel_um = plan["voxel_size_um"]
+    n_planes = labels_zyx.shape[0]
+
+    erasures, pastes = [], []
+    for frag in plan["fragments"]:
+        label = int(frag["label"])
+        for z in fragment_source_planes(frag, n_planes, interpolate):
+            mask = fragments_zyx[z] == label
+            if not mask.any():
+                continue
+            tf = plane_transform(frag, z, interpolate)
+            z_out = z + int(tf["dz_planes"])
+            if not 0 <= z_out < n_planes:
+                raise ValueError(
+                    f"fragment label {label}: source plane {z} with dz_planes="
+                    f"{tf['dz_planes']} lands on plane {z_out}, outside the "
+                    f"volume's {n_planes} planes")
+            push, push_offset = _plane_affine_inverse(tf, voxel_um)
+            # _plane_affine_inverse hands back what affine_transform needs to
+            # PUSH the fragment forward (matrix = A^-1, offset = -A^-1 b for
+            # the forward map i_out = A i_in + b). Reading the moved frame from
+            # the original one is the other direction -- output index o wants
+            # input index A o + b -- so (A, b) is recovered from it rather than
+            # re-derived, keeping one statement of the algebra.
+            pull = np.linalg.inv(push)
+            pull_offset = -pull @ push_offset
+            erasures.append((z_out, ndimage.affine_transform(
+                mask.astype(np.uint8), push, offset=push_offset,
+                order=0, mode="constant", cval=0) > 0))
+            pulled = ndimage.affine_transform(labels_zyx[z_out], pull, offset=pull_offset,
+                                              order=0, mode="constant", cval=0)
+            # Only the voxels that will be written are kept: a whole warped
+            # plane per source plane adds up on a stack with several fragments,
+            # and everything outside the outline is discarded anyway.
+            pastes.append((z, mask, pulled[mask]))
+
+    # Every socket is emptied before anything is written back, for the same
+    # reason apply_to_image erases in a separate pass: a flap swung back over
+    # its own former position overlaps itself, so erasing as you go would wipe
+    # out labels that were just restored. The pastes read from the untouched
+    # input, never from `out`, so the order within each pass does not matter.
+    out = labels_zyx.copy()
+    for z_out, moved_mask in erasures:
+        out[z_out][moved_mask] = 0
+    for z, mask, values in pastes:
+        out[z][mask] = values
     return out
 
 
