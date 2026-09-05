@@ -1,0 +1,126 @@
+# ============================================================================
+# 组间分析配置
+#   conda activate antsreg
+#   python -m stats.qc_samples  --config stats/configs/group_analysis.yaml
+#   python -m stats.group_stats --config stats/configs/group_analysis.yaml
+#
+# 只有下面三节需要经常改：1 数据 / 2 分组 / 3 统计方法。
+# 相对路径按本文件所在目录解析。完整字段说明见 stats/README.md。
+# ============================================================================
+
+
+# ============================================================================
+# 1. 数据 —— 每个样本指向它的配准 RUN 目录
+#    （就是含 cell_registration/、*_labels_in_sample.nii.gz、*_brain_mask.nii.gz
+#     的那一层，不是它上面那个装了好几次 run 的样本目录）
+# ============================================================================
+samples:
+  s10:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s10/DeMBA_0904}
+  s18:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s18/DeMBA_0902_repos}
+  s11:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s11/DeMBA_0902}
+  s8:   {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s8/DeMBA_0904}
+  s12q: {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12q/DeMBA_0830_mask2}
+  s12t: {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DeMBA_0828}
+
+  # 可选：batch 标签，只被 qc_samples.py 用来检查"某个非生物学变量是否也把两组
+  # 分开了"。有真实批次（成像批次/显微镜/染色轮次）时才填，例如 {dir: ..., batch: A}。
+  # 注意类名里的 GFP / 3_GFP 不是批次，已核对为命名失误，别填那个。
+
+
+# ============================================================================
+# 2. 分组
+# ============================================================================
+groups:
+  a: {name: Control,      samples: [s10, s18, s11]}
+  b: {name: Experimental, samples: [s8, s12q, s12t]}
+
+
+# ============================================================================
+# 3. 统计方法 —— 每次跑完这一节会原样生成一份 methods.md
+# ============================================================================
+stats:
+  # welch   = Welch 不等方差 t 检验（默认）。n=3v3 时 df 在 2.4~4 之间。
+  # student = 合并方差的 Student t，恒定 df=4。只有在能论证两组方差相等时才用。
+  # 注意：置换检验和 Mann-Whitney 在 3v3 下双侧 p 下限是 0.1，到不了 0.05，
+  #      所以这里没有提供非参数选项——不是遗漏。
+  test: welch
+
+  alpha: 0.05
+
+  # 每层单独校正，一个 (细胞类, 指标, 层级) 组合就是一个 family。
+  #   holm       控制族错误率（FWER），一致优于 bonferroni
+  #   bonferroni 同上但更保守，没有理由优先选
+  #   bh         控制错误发现率（FDR）
+  #   none       不校正 —— 只在 gatekeeping 打开时才正当，且输出会打
+  #              exploratory=TRUE，措辞必须用"提示"而不是"显著"
+  correction: bh              # 未在下面列出的层用这个
+  correction_by_level:
+    2: holm                   # 8-9 个区，确证性主假设
+    3: holm
+    4: holm
+    5: bh                     # 46 个区
+    6: none                   # 82+ 个区，FDR 实测一个都过不了
+    7: none
+    8: none
+
+  # 固定序（门控）检验：只有当某区在上一个被检验的层级上 p_adj < alpha，
+  # 才检验它的子树。这是上面那三个 none 的正当性来源——不校正的层不是自由
+  # 搜索，而是在已通过强校正的分支内做描述。
+  # 副作用是它本身也提高功效：L7 的 family 从 98 降到 33。
+  gatekeeping: true
+
+
+# ============================================================================
+# 以下一般不用改
+# ============================================================================
+
+ontology_json: ../../atlas/DeMBA/CCF_v3_ontology.json
+
+# marker = 丢掉 YOLO 的 neuron/glia 判别，只按 marker 共表达分类，
+#          neuron_X 和 glia_X 相加（已验证互斥，不会重复计数）
+# full   = 保留原始 12 类
+classify_by: marker
+classes: [GFP, GFP_RFP, GFP_RFP_Sox9, GFP_Sox9, RFP, RFP_Sox9]
+
+# 六个互斥签名的聚合。它们彼此重叠，所以永远不做 RegionProportion 的分母。
+combined_categories:
+  GFP_any:  [{sign: "+", class: GFP}, {sign: "+", class: GFP_RFP},
+             {sign: "+", class: GFP_Sox9}, {sign: "+", class: GFP_RFP_Sox9}]
+  RFP_any:  [{sign: "+", class: RFP}, {sign: "+", class: GFP_RFP},
+             {sign: "+", class: RFP_Sox9}, {sign: "+", class: GFP_RFP_Sox9}]
+  # 细胞只在两个 soma 通道上检出，Sox9 只是共定位属性，不存在 Sox9 单阳细胞。
+  # 所以这是"reporter 阳性细胞中的 Sox9+"，不是组织里的星形胶质总数。
+  Sox9_any: [{sign: "+", class: GFP_Sox9}, {sign: "+", class: RFP_Sox9},
+             {sign: "+", class: GFP_RFP_Sox9}]
+  double_positive: [{sign: "+", class: GFP_RFP}, {sign: "+", class: GFP_RFP_Sox9}]
+  all_cells: [{sign: "+", class: GFP}, {sign: "+", class: GFP_RFP},
+              {sign: "+", class: GFP_RFP_Sox9}, {sign: "+", class: GFP_Sox9},
+              {sign: "+", class: RFP}, {sign: "+", class: RFP_Sox9}]
+
+metrics: [Count, Percentage, Density, RegionProportion, Volume, RelativeVolume]
+
+density_denominator: covered   # covered = 只算 brain mask 内的组织体积；full = 忽略 mask
+use_brain_mask: true
+
+region_filter:
+  # 整个分析里剔除的区，子树一起。作用在 rollup 之前，所以这些区不会出现在任何
+  # 祖先的计数/体积里，也不进 Percentage 和 RelativeVolume 的分母。
+  # 制备时有缺损的结构必须走这里。实测覆盖率（六样本 min/mean）：
+  #   512  Cerebellum  0.33/0.75    507 MOB  0.57/0.93
+  #   151  AOB         1.00/1.00   1016 onl  0.01/0.66
+  # 对照：CTX 0.98/1.00、HPF 0.99/1.00
+  # 候选（未默认排除）：354 Medulla 0.39/0.76、73 ventricular systems 0.63/0.85
+  # 注意 arb（小脑白质）、cbc（小脑连合）挂在 fiber tracts 下，不在 512 子树里。
+  exclude_ids: [512, 507, 151, 1016]
+
+  # 白名单，子树自动包含。null = 不限制。窄白名单是 n=3v3 下最大的一笔功效
+  # （L7：null 时 m=98 阈值 0.00051；[1089,477] 时 m=17 阈值 0.00294）。
+  # 必须先定后跑——看完 p 值再挑白名单是 p-hacking。
+  include_ids: null
+
+  levels: [2, 3, 4, 5, 6, 7, 8]
+  min_coverage: 0.8      # 覆盖率不足的区只在该样本上置 NaN，其余样本照常参与
+  min_total_count: 50    # 细胞太少的区不进 family
+
+output:
+  dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/stats_marker

@@ -11,6 +11,12 @@ configs/*.yaml
 !configs/atlas_presets.example.yaml
 data/
 atlas/
+# stats/ working configs, same convention as configs/ above: the tracked
+# *.example.yaml is the template (it carries real paths, so copying it is
+# enough to run), the working copy next to it stays local.
+stats/configs/*.yaml
+!stats/configs/*.example.yaml
+
 # per-script local path configs -- real paths live in *_local.yaml, gitignored
 # so editing them isn't a git diff.
 *_local.yaml

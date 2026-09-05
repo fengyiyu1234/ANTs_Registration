@@ -1605,3 +1605,424 @@ label 2 的 painted 从 32.21 掉到 30.51 mm3（-1.70），label 5 是 2.16 mm3
 
 **没变的**：label 2/3 那两个单体素杂点还在（各 1 个），依旧不用管；label 4 @ z=65 的
 "stray keyframe"依旧是小脑尖端首帧的误报。
+
+---
+
+## 2026-09-04：新建 `stats/` —— 组间统计脱离 ClearMap，细胞改按 marker 共表达分类
+
+**背景**：6 个样本配准全部完成，进入组间比较。用户两个要求：(1) 发育期 YOLO 的
+neuron/glia 形态判别不可靠，组间分析只按 marker 共表达分类；(2) 不再用 ClearMap，
+统计脚本全部放进本项目的 `stats/`。
+
+### 上机前查出来的两个混杂（必须先解决，否则绝对计数不可读）
+
+**1. 未归区（background）率和分组完全分离**
+
+| | s10 | s18 | s11 | s8 | s12q | s12t |
+|---|---|---|---|---|---|---|
+| 分组 | CTRL | CTRL | CTRL | EXP | EXP | EXP |
+| background % | 10.71 | 7.64 | 14.41 | 3.03 | 5.68 | 4.85 |
+
+三个对照全部高于三个实验，零重叠，差 2~4 倍。n=3 vs 3 时这种完全分离和真效应无法
+区分。得先判断是组织本身（越中线/损伤组织多、damage label 画得多）还是配准系统性
+偏差。**在此之前不能读绝对 Count/Density 的组间差异。**
+
+**2. `GFP_RFP` 双阳占比按 `GFP` / `3_GFP` 的命名分界完全分开**
+
+GFP 组（s8/s10/s18）21.30/22.30/23.49%，3_GFP 组（s11/s12q/s12t）27.79/28.16/29.58%，
+差 6 个百分点。
+
+**本条当天下午被用户核对推翻了一半，见下面"类名里的 3 是命名失误"。** 当时的读法是
+"两批检测参数不同"，这是错的：`3` 只是文件夹命名失误产生的幽灵 marker，两边检测
+参数一致、计数准确，不需要重跑。剩下的事实是：这条 3/3 分割确实存在，但既没有技术
+解释，也不沿实验分组走（s11 是对照，s12q/s12t 是实验），n=3 vs 3 时一次完美 3/3
+分割本就有 1/10 的概率偶然出现，目前按巧合处理。
+
+另外 s18 总检出 204k（其余 284k~374k）、s12t 的 Sox9+ 占比 14.8%（其余 20.7~25.8%）
+都是离群，同样支持"绝对计数不可比、优先看比例"。
+
+### marker 重编码：验证过合并是安全的
+
+`brain_detector` 给每个物理细胞写**一个**复合类名 `{soma_type}_{soma channels}_{TF}`，
+所以 6 个 marker 签名互斥。用 KD-tree 在 s11 上实测：同一 marker 组合下 neuron 与
+glia 文件之间 5 µm 内的重复 <0.3%（`cross_class_iou_thresh: 0.5` 的跨类去重已生效），
+不同 marker 组合之间同样 <0.3%。**12 类 → 6 类是直接相加，不会重复计数。**
+
+两条语义限制已写进 README 和 config 注释：细胞只在两个 soma 通道上检出，Sox9 只是
+共定位属性，**不存在 Sox9 单阳细胞**，所以 `Sox9_any` 是"reporter 阳性细胞中的
+Sox9+"，不能外推成组织星形胶质总数；`Sox9−` 只等于"没匹配上 Sox9 核"。
+
+### 从 ClearMap 移植过来的四处实质改动
+
+| | ClearMap 版 | `stats/` |
+|---|---|---|
+| 本体 | `ClearMap.Alignment.Annotation`（`ano`） | `stats/ontology.py`，直接读 `atlas/DeMBA/CCF_v3_ontology.json` |
+| 细胞的区域列 | 第 9 列当 `graph_order` | 第 9 列是**原始 CCF id**。**拿旧脚本读 ANTs 的输出会静默归错区**，不报错 |
+| 分区体积 | elastix 的 `volume/result.mhd` | `<run>/*_labels_in_sample.nii.gz` + `*_brain_mask.nii.gz` |
+| 细胞分类 | 12 类 | `classify_by: marker` → 6 类（`full` 可退回 12 类） |
+
+`order` 是本模块自己 DFS 出来的稠密下标，**和 ClearMap 的 `order` 不是一回事**，
+跨工具对照 join `id`。ids 最大 6.1e8，稠密 LUT 会到 2.4 GB，所以走 `np.searchsorted`
+（和 `collapse_labels_to_level` 那个待办同一个坑）。
+
+**踩到的坑：brain mask 和 label volume 不在同一网格上。**
+`crop_for_registration` 按 raw voxel 裁，其物理位置不一定是整数个 20 µm 配准体素——
+s11 crop x=180 → origin 468 µm → 23.4 个体素。六个样本的偏移量分别是
+0.3~0.5 体素。`region_volumes._voxel_offset` 按 affine 解平移量再四舍五入，残差
+>0.1 体素时打提示。测试里专门造了一个 5.2 体素偏移的用例。
+
+### 密度的分母：过 brain mask
+
+样本是半脑，切割面不是每只都落在解剖中线（0829 记的问题）。切短了的样本，中线附近
+的区图谱体积照旧、组织没了，用全体积当分母会系统性压低密度。所以
+`coverage` = 该区 warp 后落在 brain mask 内的比例，`density_denominator: covered`
+（默认）只算真正成像到的那部分；`min_coverage` 不够的区**只在该样本上置 NaN**，
+其余样本照常参与，`n_a`/`n_b` 记录实际贡献了几只。实测 root 覆盖率 0.93~1.00，
+mask 是有效的；被剔除的主要是中脑、小脑深部核团和颅神经，符合半脑截断的预期。
+
+### n=3 vs 3 的现实（写进了 ReadMe sheet 和 README）
+
+* **精确置换检验在这个设计下不可用**：C(6,3)/2 = 10 种划分，双侧 p 下限 0.1，
+  **永远到不了 0.05**。所以用 Welch t（代价是正态假设）+ 效应量。
+* Welch 在 n=3 时 df≈2~4，p<0.05 大约需要 |Hedges' g| > 3.5。
+* 真正决定有没有结果的是 `region_filter`：`levels`（每层独立 FDR family，level 7
+  单层 324 个区）、`include_ids`（预指定 20~40 个区，family 从 ~600 压到 ~30，
+  这是能拿到的最大一笔 power）、`min_total_count`。
+* 输出 `hedges_g` 用小样本校正（n=3 时 Cohen's d 高估约 15%）+ 95% CI。
+
+### 跑真实数据时抓出来的一个 bug（已修 + 有测试）
+
+第一次跑出 8 个 FDR survivor，其中 3 个是
+`mean_a=1, mean_b=0, p_value=0.0` 这种——**两组方差都是 0 时 Welch 的分母为 0，
+scipy 返回 t=inf、p=0.0**，于是"每只对照 1 个细胞、每只实验 0 个"直接穿过 FDR。
+两个常数组之间的差异是不可测量，不是无限显著。`welch_ttest` 现在显式判定该情形并
+置 p=1.0（和 `hedges_g` 返回 NaN 是同一个条件）。同时加了 `min_total_count` 闸门
+（默认 50），细胞数太少的区不进 FDR family。修完 5271 行结果里 8 个 survivor 全部
+是 GFP 密度在皮层/纤维束上升，|g| 3.7~7.8，n 都是 3v3，形态一致。
+
+### 文件
+
+```
+stats/
+├── ontology.py        CCF 本体树（DFS order / level / rollup / searchsorted）
+├── cell_tables.py     读 cell_registration.csv、marker 重编码、类名归一
+├── region_volumes.py  每样本分区体积 + 覆盖率 + volume_ratio_to_median
+├── group_stats.py     主入口：5 个指标、Welch + 分层 BH、Hedges' g、Excel 输出
+├── qc_samples.py      上机前体检：完全分离检查（分组 / 批次）
+├── test_stats.py      11 个合成数据自测，不碰真实数据
+├── configs/tsc_marker.example.yaml
+└── README.md
+```
+
+依赖只有 numpy/pandas/scipy/nibabel/pyyaml/openpyxl（+tifffile 仅在配了
+`reference_annotation` 时），**不 import ants**，任何装了这几个包的环境都能跑。
+
+`.gitignore` 加了 `stats/configs/*.yaml` + `!*.example.yaml`，和根 `configs/` 同一
+套约定：example 是模板（带真实路径，复制即可跑），工作副本留在本地不进 diff。
+
+**验证**：`python stats/test_stats.py` 11 项全绿；真实 6 样本端到端跑通
+（QC 25 秒 / 主分析 33 秒），`RegionProportion` 六个互斥类在两组都精确收敛到 100%，
+level-2 计数和手工 tally 一致。
+
+### 下一步
+
+1. 定 `include_ids` 区域白名单，跑正式分析。
+2. 可选：体素级密度图（细胞点 warp 到图谱空间 + 高斯 σ≈100 µm）作为补充，不受
+   分区边界和 FDR family 大小约束。
+
+---
+
+## 2026-09-04（续）：类名里的 `3` 是命名失误，不是检测批次
+
+用户核对了 `brain_detector`：s11/s12q/s12t 的 GFP tile 目录名叫 `GFP_3`，而
+`stitcher._merge_class`（`stitcher.py:350`）拼类名的方式是按 `_` 切分再
+`markers = sorted(markers_a | markers_b)`，于是 `3` 被当成一个独立 marker 并排到了
+GFP 前面，产出 `neuron_3_GFP` / `glia_3_GFP_RFP_Sox9` 这种标签。
+
+**计数本身是对的**——检测端的 Single Marker Positivity 表里 `3` 和 `GFP` 计数完全
+一样（s11 都是 233,174，s12t 都是 129,180），是同一列重复了一行，不是多出一群细胞。
+用户决定不重跑，分析时把 `neuron_3_GFP` 和 `neuron_GFP` 当同一类。
+
+**`stats/` 本来就是这么做的**，不需要改行为：`normalize_class_key` /
+`marker_signature` 丢弃纯数字 token，`3_GFP` 和 `GFP` 一直归的同一类。而且两套命名
+是**严格 1:1**——`3` 只挂在 GFP 阳性的类上，`RFP` / `RFP_Sox9` 完全没有 `3`
+（12 个类名逐一比对过）。重跑 `group_stats.py` 结果一字未变（5271 行 / 8 个 FDR
+survivor）。
+
+**本轮做的是防呆**，因为"丢掉数字 token"这条规则在别的数据上可能咬人：
+
+- 新增 `cell_tables.check_class_resolution()`，`group_stats.py` 启动时调用并打
+  `[WARN]`。查两件事：(a) 同一样本里两个**真的不同**的文件夹塌进同一个类标签
+  （比如同时存在 `neuron_GFP` 和 `neuron_3_GFP`）——那样相加就是重复计数；
+  (b) 同一个类在不同样本解析到的文件夹数量不一致（一只贡献 neuron+glia、另一只
+  只有 neuron），那样组间比较就不是同一回事。marker 模式合法地把一个 neuron_* 和
+  一个 glia_* 合并，所以 (a) 是按 (类, soma type) 判的，不是按类判。
+- 新增两个测试：真实的两套 12 个类名必须 1:1 映射到同样 6 个签名（逐一配对，不只是
+  集合相等）；防呆检查在塌缩和不对称两种情况下都要报出来。当前数据上它是静默的。
+- 文档更正：`stats/README.md` 新增"关于类名里的 `3`"一节；config 里的 `batch:`
+  字段全部留空，并写明 `GFP` / `3_GFP` **不是** batch、不要往那儿填；
+  `qc_samples.py` 的 docstring 同步。`batch` 机制本身保留，给真的批次变量用
+  （成像批次、显微镜、染色轮次）。
+
+**教训**：命名差异是"有事发生过"的信号，但信号指向什么得去源头查。当时看到
+6 个百分点的成分差沿着命名分界完全分开，就把命名当成了批次的代理变量——实际上
+命名差异和成分差异是两件独立的事，前者是 `_merge_class` 的字符串处理，后者至今
+没有解释。
+
+
+---
+
+## 2026-09-04（续2）：background 率的组间分离已解释；量化了 `include_ids` 的杠杆
+
+**background 不是混杂，是预期行为。** 用户确认：部分样本切割时越过中线，检测到了
+对侧半球的细胞，画 mask 时刻意排除了那部分组织（0829 的 `damage_labels`）。这些细胞
+本来就没有图谱对应物，归到 background 是正确的，越线越多的样本 background 率自然越高。
+
+不影响结论的理由：`Percentage` / `Density` / `RegionProportion` 的分子分母都只用
+**已归区**细胞（`total_valid`），被排除的对侧细胞不进任何分母。唯一要留意的是
+`n_cells_total` 这类原始检出数在样本间不可比，别拿它当分母。README 的混杂那节已改写。
+
+**量化了 `include_ids` 的杠杆**（用户问这个白名单是什么）。BH 在一个
+(class, metric, level) family 内校正，阈值是 `alpha/m`，所以白名单直接改校正强度。
+实测（GFP / Density / level 7，同一批 p 值，只改白名单）：
+
+| include_ids | m | BH 阈值 | 最小实测 p | 过 FDR |
+|---|---|---|---|---|
+| null（全部） | 98 | 0.00051 | 0.00115 | **0** |
+| 灰质五支 `[688,623,549,1097,512]` | 97 | 0.00052 | 0.00115 | **0** |
+| `[315,1089,477]` | 81 | 0.00062 | 0.00115 | **0** |
+| `[1089,477]` 海马+纹状体 | 17 | 0.00294 | 0.00115 | **4** |
+
+两条结论：
+
+* **粗白名单只在 level 4~5 有用**。灰质五支能把 family 从 36→8、54→26，砍掉的几乎
+  全是纤维束和脑室（`aco cing cpd fa fp int or st alv ec fi ml sm` …）以及覆盖率本来
+  就不够的中脑/脑桥；但到 level 7~8 几乎不起作用——那个深度本来就全是灰质。要在
+  皮层区/海马亚区这层拿到 power，白名单必须窄到十几个具体结构。
+* **必须先定后跑**，那张表同时也是"怎么把没有的结论做出来"的示范。已在 README 和
+  config 注释里写明这是 p-hacking 红线。
+
+**顺带查到的层级深度**（DeMBA/CCFv3 各支深浅不一，所以按 id 圈比按 level 圈自然）：
+`Cerebellum` L2 · `Cerebral cortex` L3 · `Thalamus` L4 · `Isocortex`/`海马结构` L5 ·
+`Caudoputamen` L6 · `Primary motor area` L7 · `Field CA1`/皮层分层 L8。
+**注意现在 config 里的 `levels: [2,3,4,5]` 根本够不到皮层分区**，要看皮层区得开到 6~8。
+
+**一个值得留意的信号**：当前唯一过 FDR 的几条里最强的是
+`lateral forebrain bundle system`（纤维束）。纤维束里的"细胞密度"生物学上不好解释，
+更像归区误差；灰质白名单会把这类一并挡掉。
+
+---
+
+## 2026-09-04（续3）：把 `*_3_GFP*` 在磁盘上改名成 `*_GFP*`
+
+用户查过配准数据，`neuron_GFP` 和 `neuron_3_GFP` 从未同时存在，决定直接改名而不是
+一直靠模糊匹配兜着。
+
+**范围**：`raw_data/` 和 `TSC_ants/` 下共 **200 项**——24 个 centroid CSV
+（s11/s12q/s12t 各 8 个）+ 176 个 `cell_registration/` 子目录（含 s12t 那一堆历史 run）。
+
+**改名前的 dry run**（4 项检查全过）：目标已存在 0 个；多源映射到同一目标 0 个；
+改完仍含数字 token 0 个；改完后类数不等于 12 的 `cell_registration` 目录 0 个
+——最后一条正是"两种拼法从未共存"的独立验证。
+
+**改名后重跑 `group_stats.py`：5271 行结果按 (order, class_name, metric, level) 对齐后
+`mean_a/mean_b/p_value/p_fdr/hedges_g/log2fc/n_a/n_b` 全部逐行完全一致**，
+`check_class_resolution` 也没报警。证实之前的 `normalize_class_key` 一直做的是对的，
+这次改名纯粹是清理。
+
+回滚日志写在 `<Registration>/rename_3_GFP_to_GFP.json`（含 from/to 全表和 undo 命令）。
+
+**没动的**：`clearmap/TSC_clearmap/` 下还有 32 个 `*_3_GFP*` 目录。那是已弃用的
+ClearMap 管线的输出，改名可能破坏它自身的一致性，且不在当前分析路径上。
+
+**代码没改**：丢弃纯数字 token 的规则保留——旧 ClearMap 目录仍是老拼法，以后再有数据
+踩到 `_merge_class` 这个坑也还得靠它。`test_stats.py` 里那两个用例保留，docstring
+注明 fixture 现在是历史数据。
+
+---
+
+## 2026-09-05：stats/ 加分层校正 + 门控；排除下沉到 rollup 之前；体积报告
+
+用户三个要求 + 一处对我的更正。
+
+### 更正：手绘引导让体积更准，不是"循环论证"
+
+我 0904 说 guide mask 引导的区体积有循环论证风险，**说法过头了**。guide mask 是照着
+组织画的人工分割，人工分割本来就是体积测量的金标准，它让 warp 后轮廓更贴合真实解剖。
+残留的注意点只有两条，都轻得多：**判读者一致性/盲法**（画的时候知道分组可能引入
+无意识偏倚），以及**准确性只到画的那一层**（CA1、皮层分层这些深层边界仍是 SyN 在
+手绘包络内插出来的）。已写进 `region_volumes.xlsx` 的 ReadMe sheet。
+
+### 排除区域下沉到 rollup 之前（原实现有真缺口）
+
+原来 `exclude_ids` **只过滤"检验哪些区"，不动任何分母**：`Percentage` 的分母仍是全脑
+细胞总数，相对体积的分母仍含小脑。用户要"计算之前就排除"，正确做法是在 `direct`
+（未 rollup 的逐区值）上把被排除子树清零再 rollup——这样每个祖先节点自动不含被排除的
+后代，root 处的数就是"分析范围内的总量"，两个分母同时正确。
+
+改动：
+- `cell_tables.class_counts(..., exclude_mask=)`，多返回 `n_excluded`；
+  `n_valid` 变成"范围内已归区细胞数"。
+- `region_volumes` 拆成两步：`sample_region_volumes` 只出**未 rollup 的直接体素数**，
+  `rollup_volumes(direct, ontology, exclude_mask)` 负责排除+汇总+相对体积。
+  **缓存改存直接值**（`per_sample_region_direct_volumes.csv`），所以改 exclude_ids
+  不会让缓存失效；旧格式缓存按列名识别并自动重算。
+- 新指标 `RelativeVolume` = 该区体积 / 分析范围内总体积 × 100。
+- 两个测试专门盯"祖先节点是否也被扣掉"和"相对体积是否只按保留区归一"。
+
+当前排除 `[512 CB, 507 MOB, 151 AOB, 1016 onl]` = 98 个区，依据是实测覆盖率
+（min/mean）：CB 0.33/0.75、MOB 0.57/0.93、onl 0.01/0.66，对照 CTX 0.98/1.00、
+HPF 0.99/1.00。config 注释里另列了 `354 Medulla` 0.39/0.76 和 `73 ventricular
+systems` 0.63/0.85 作候选。**注意 `arb`/`cbc` 这些小脑相关纤维束挂在 fiber tracts
+下、不在 512 子树里**，要去掉得单列。
+
+### 分层校正 + 门控
+
+用户方案：粗层级用 FWER 或普通 FDR，细层级不校正。**方向合理，但必须补门控**——
+153 个区不校正意味着期望 ~8 个纯靠运气 p<0.05。加了：
+
+- `stats.correction_by_level`：每层单独指定 `holm` / `bh` / `bonferroni` / `none`。
+- `stats.gatekeeping`：固定序检验，只有某区在上一个被检验层级通过了，才检验它的子树。
+  这是"不校正的层"的正当性来源——不是自由搜索，是在已通过强校正的分支内做描述。
+  没开门控却有 `none` 层时打 `[WARN]`。
+- 输出新增 `correction` / `m_family` / `p_adj` / `exploratory` / `gated` 五列
+  （`p_fdr` 改名 `p_adj`，因为它现在不一定是 FDR）。
+
+当前配置 L2-L4 holm / L5 bh / L6-L8 none + gatekeeping。真实数据上的漏斗：
+L2 检验 558 行 → L3 9 → L4 10 → L5 12 → L6 19 → L7 33 → L8 41。
+**L7 的 family 从无门控的 98 降到 33，门控本身也在提高功效。**
+
+确证层（L2-L5，已校正）通过 12 条，全是 GFP / GFP_any 的 Density 升高，链条自洽：
+Cerebrum → Cerebral cortex → Cortical plate / Cortical subplate → Isocortex / HPF，
+|g| 3.2~7.8。探索层顺着这条链落到 HIP / DG / CA1 / SSp / RSPagl / ProS / PRE。
+
+### 顺手更正的两个数字
+
+之前 README 和代码注释里写的 **"p<0.05 需要 |g| > 3.5"是错的**——等方差 n=3v3 下
+raw p<0.05 只需要 |g| ≈ 1.8（t_crit(df=4)=2.776，d=t/√1.5，g=0.8d）。3.5 那个量级是
+FDR 之后的门槛（m=17 需 4.2，m=98 需 6.7）。另外 **"Cohen's d 高估约 15%"也错了**，
+J = 1-3/(4N-9) = 0.8，是高估 **25%**。都已改。
+
+### 新输出
+
+`region_volumes.csv` / `.xlsx`：逐区体积报告，每样本绝对 mm³ + 相对 % + 覆盖率，
+加两组均值/SD 和 `min_coverage`。被排除的区不在其中；root 的相对体积恒为 100 已验证。
+
+### 验证
+
+`python stats/test_stats.py` **17 项全绿**（新增 exclusion-before-rollup、
+relative-volume、bh/holm/bonferroni/none 序关系、gatekeeping 共 4 项）。真实 6 样本
+端到端跑通，0 warning。
+
+### 下一步
+
+1. 定 `include_ids` 白名单（如果要进一步收窄确证层）。
+2. 可选：负二项 GLM + 跨区离散度收缩（DESeq2/pydeseq2 思路）作为第二后端——
+   计数数据的正确模型，n=3v3 下比逐区 Welch 有功效优势。
+
+
+---
+
+## 2026-09-05（续）：日常用的 group_analysis.yaml + 自动生成的 methods.md
+
+用户要一份"能设分组、设数据、看得见统计方法"的配置，并且要 gitignore。
+
+**`stats/configs/group_analysis.yaml`**（gitignore 已覆盖，跟踪的是
+`.example.yaml`）。开头三节就是全部需要改的：`samples:`（每个样本的 run 目录）、
+`groups:`（分组）、`stats:`（方法）。其余按当前定论填好当默认值。原来那份
+`tsc_marker.yaml` 保留当参考手册（字段相同、注释更详尽）。
+
+**`stats.test` 变成真选项**：`welch`（默认）/ `student`，`two_sample_ttest(a,b,test=)`
+真的切换 `equal_var`，未知值直接报错。README 和 config 注释里写明"没有非参数选项不是
+遗漏"——3v3 下置换检验和 Mann-Whitney 的双侧 p 下限都是 0.1。旧的 `welch_ttest`
+保留成薄别名。输出多一列 `test`。
+
+**`describe_methods()` / `methods.md`**：每次跑完按**本次实际生效的设置**生成一份方法
+说明（设计、分组与 n、类别与聚合公式、排除了哪些区及其机制、覆盖率与最小计数门槛、
+检验、效应量、family 定义、逐层校正、门控、探索层标记、以及样本量下限的三条限制），
+打印到终端 + 存 `methods.md` + 作为 Methods sheet 进 xlsx。测试里验证它是**生成的
+不是模板**：把 test 改成 student、门控关掉，文本必须跟着变且不再出现 "Welch"。
+
+**关于负二项 GLM + 跨区收缩（0905 提的那条）**：用户指出脑区数和基因数不是一个量级。
+更硬的反对意见其实是**脑区是嵌套的**——CA1 的细胞同时算进 HPF/CTX/root，而 DESeq2
+假设 feature 之间独立。这条比数量级更致命，该提议撤回，不做。
+
+**验证**：`python stats/test_stats.py` **19 项全绿**（新增 welch-vs-student、
+methods-summary 两项）。新 config 真实跑通，methods.md 正确生成。
+
+
+---
+
+## 2026-09-05（续2）：逐层解析深度 QC（stats/qc_depth.py）—— 按标注判叶子，不按本体树
+
+用户问 ClearMap 里见过的"L3 有 1000 个细胞、L4 只剩 800"在 ANTs 上有没有。有，但成因
+不是配准失败。
+
+**机制**：每个细胞只拿**一个**图谱标签，不同标签处在本体树的不同深度。落在标着
+`CA1` 的体素上解析到 L8，落在标着 `SUB` 的体素上就停在 L7——标注在那里就是这么写的。
+于是后者在 L8 的表里根本不出现。
+
+**关键的一次自我纠正**：第一版按"本体树有没有子节点"判定丢失，量出 12–16%。查图谱
+标注本身后发现判错了——PRE / POST / SUB / PAR / ProS / AON / TTv / TTd / PIR 在
+CCFv3 本体里都有子节点，而 DeMBA P5 标注里**子区体素数为 0**（PRE 自身 105311 体素、
+子区 0；AON 358968 / 0；PIR 597909 / 0）。**CCFv3 的本体树比这份标注实际用到的深度更
+深**，按树判会把这些区里的细胞全算成"丢失"，实际一个都没丢。
+
+改成按**每个样本自己的 `*_labels_in_sample.nii.gz` 实际用到了哪些标签**判定
+（`qc_depth.atlas_subdivides()`，深度优先反向扫一遍 O(n)），真丢失从 12–16% 降到
+**3.1–4.6%**，且 **level 6 之后不再增加**。
+
+**当前六个样本的结论**：
+- 真丢失 3.13%（s8）– 4.57%（s12t），全部低于 5% 提示线。
+- **没有把两组分开**（任何一层都不完全分离），不是组间比较的偏倚来源。
+- 数据能支撑到 **level 8**（各样本仍有 71–74% 细胞在场）；L9 只剩 23–28%，
+  在那里比较不是错但覆盖面小，图注要写 `reach%`。
+- 最大沉淀：`root` 0.94%（CCFv3 在海马-丘脑之间没有叶子标签的那条带子，见 08-28）、
+  `OLF` 0.60%、`VL` 0.51%、`fa` 0.44%。脑室和纤维束本来也不该有细胞，落那儿的更可能
+  是归区误差。
+
+**产出**：`qc_depth_report.md`（自动生成的解读文档，含机制说明、逐样本 reach%/
+cum_unresolved% 两张表、解读、沉淀清单、实践结论）+ `qc_depth_by_level.csv` +
+`qc_depth_sinks.csv`。报告里的"数据能支撑到第几层"取的是**每个样本都还剩 ≥50% 细胞**
+的最深层，不是字面上的最深层（第一版这里有 bug，会说"能支撑到 level 10"而那层
+reach 是 0%）。
+
+**测试**：21 项全绿（新增 `test_atlas_subdivides`、`test_depth_profile` 两项，
+前者显式验证"B 有子节点但标注从没用过 → B 是有效叶子"）。
+
+
+---
+
+## 2026-09-05（续3）：组间差异热图（静态冠状/矢状 + 交互式 3D）
+
+**新增三处**：
+
+- `stats/region_maps.py` —— 共用的"把逐区统计量画到图谱体积上"。关键操作是
+  **level 折叠**：`region_stats.csv` 一行是 (区, 层)，而标注给每个体素一个标签、
+  深浅不一。画 level 5 的图时每个体素必须读它的 **level-5 祖先**（标着 CA1 / L8 的
+  体素显示 HPF 的值），否则只会点亮那些自身标签恰好在 L5 的零星体素。
+  `Ontology.ancestor_at_level()` 一次前向扫描搞定（前序保证父在子前）。
+  `RegionVolume` 把贵的一步（体素 → 唯一标签下标，int16）只做一次，之后换
+  level/类别/指标都只是一次 fancy index。
+- `stats/plot_heatmaps.py` —— 静态图，冠状面 + 矢状面各一行，`--batch` 一次出全部
+  有显著结果的组合。`--value` 支持 log2fc / hedges_g / neglog10p / mean_a / mean_b，
+  signed 量用发散色标以 0 为中心。灰色脑轮廓垫底，**"没有结果"必须看得见**。
+  未校正层的图在标题里标 `EXPLORATORY`。
+- `Registration_toolkit/tools/stats_view.py` —— napari 交互式 3D，右侧面板切
+  level / 类别 / 指标 / 统计量。右半球满分辨率**加载 0.6 s、重绘 0.11–0.15 s**。
+  通过 config 的 `ants_root` 反向 import `stats.region_maps`，两边逻辑不会各说各话
+  （toolkit 本来就 import registration_ants，依赖方向一致）。`--selftest` 无显示器可跑。
+
+**图谱几何**（实测确定，之前没记过）：`DeMBA_P5_annotation.tif` shape
+**(563, 400, 570) = (AP, DV, ML)**，中线 ML=285，右半球 [285, 570)。判定依据：只有
+轴 2 的两半互为镜像（93% 体素一致），且 570 = CCFv3 10 µm 的 1140 个 ML 体素在 20 µm 下。
+
+**左半球样本 s10 的影响**（用户问的）：s10 是唯一左半球且在**对照组**，config 靠
+`orientation` 取负镜像图谱，解剖上没问题。实测它在 12 条确证结果上是其余两只对照的
+**0.91–1.15 倍**，完全在个体差异内，而且多数行里它是对照组**最高**的那只——对
+"实验组更高"是保守方向。真正需要用户回答的是**病毒是不是单侧注射**：如果是，左半球
+相对注射侧是对侧，reporter 阳性细胞密度不可比；如果是全身给药（如 AAV-PHP.eB
+逆行眶后注射）则无影响。已写进 README。
+
+**测试**：24 项全绿（新增 region_maps 的 level 折叠 / 半球裁切 / 按
+(level,class,metric) 取值 三项）；toolkit 那边 `stats_view.py --selftest` 3 项。

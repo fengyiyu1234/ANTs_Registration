@@ -1,0 +1,194 @@
+# Group comparison, marker-only cell classification.
+#   conda activate antsreg
+#   python -m stats.qc_samples  --config stats/configs/tsc_marker.yaml   # run this first
+#   python -m stats.group_stats --config stats/configs/tsc_marker.yaml
+# Relative paths are resolved against this file's directory.
+
+ontology_json: ../../atlas/DeMBA/CCF_v3_ontology.json
+
+# One entry per sample, pointing at the registration RUN directory (the one
+# holding cell_registration/, *_labels_in_sample.nii.gz and *_brain_mask.nii.gz)
+# -- not the sample directory above it, which holds several runs.
+#
+# `batch` is optional and not used by any statistic. qc_samples.py only uses
+# it to check whether some per-sample quantity separates the batches as
+# cleanly as it separates the groups. Fill it in if a real nuisance grouping
+# is known (imaging session, microscope, staining round).
+#
+# It is deliberately left empty here. The obvious candidate -- the class-folder
+# naming split, `ob_*_GFP.csv` for s8/s10/s18 vs `ob_*_3_GFP.csv` for
+# s11/s12q/s12t -- has been checked and is NOT a batch: the `3` came from a
+# `GFP_3` tile folder name that brain_detector's _merge_class turned into a
+# phantom marker. Same detection parameters, same counts. See stats/README.md.
+samples:
+  s10:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s10/DeMBA_0904}
+  s18:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s18/DeMBA_0902_repos}
+  s11:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s11/DeMBA_0902}
+  s8:   {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s8/DeMBA_0904}
+  s12q: {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12q/DeMBA_0830_mask2}
+  s12t: {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DeMBA_0828}
+
+groups:
+  a: {name: Control,      samples: [s10, s18, s11]}
+  b: {name: Experimental, samples: [s8, s12q, s12t]}
+
+# marker: discard YOLO's neuron/glia call, keep only the marker co-expression
+#         signature, summing neuron_* and glia_* of the same signature.
+#         Safe because brain_detector gives each physical cell exactly one
+#         composite class label, so the signatures are mutually exclusive.
+# full:   keep the 12 original neuron_*/glia_* classes.
+classify_by: marker
+
+# null = auto-discover from the class folders on disk. In marker mode that
+# yields the six signatures below; list them explicitly to freeze the order.
+classes: [GFP, GFP_RFP, GFP_RFP_Sox9, GFP_Sox9, RFP, RFP_Sox9]
+
+# Aggregates over the six mutually-exclusive signatures. These OVERLAP each
+# other by design (a GFP+RFP+ cell is in both GFP_any and RFP_any), which is
+# why they are never used as the RegionProportion denominator.
+combined_categories:
+  GFP_any:
+    - {sign: "+", class: GFP}
+    - {sign: "+", class: GFP_RFP}
+    - {sign: "+", class: GFP_Sox9}
+    - {sign: "+", class: GFP_RFP_Sox9}
+  RFP_any:
+    - {sign: "+", class: RFP}
+    - {sign: "+", class: GFP_RFP}
+    - {sign: "+", class: RFP_Sox9}
+    - {sign: "+", class: GFP_RFP_Sox9}
+  # Cells are only ever detected on the two soma channels, so Sox9 exists as a
+  # colocalisation attribute and never on its own. Sox9_any therefore means
+  # "Sox9+ among reporter-positive cells", NOT all Sox9+ cells in the tissue.
+  Sox9_any:
+    - {sign: "+", class: GFP_Sox9}
+    - {sign: "+", class: RFP_Sox9}
+    - {sign: "+", class: GFP_RFP_Sox9}
+  double_positive:
+    - {sign: "+", class: GFP_RFP}
+    - {sign: "+", class: GFP_RFP_Sox9}
+  all_cells:
+    - {sign: "+", class: GFP}
+    - {sign: "+", class: GFP_RFP}
+    - {sign: "+", class: GFP_RFP_Sox9}
+    - {sign: "+", class: GFP_Sox9}
+    - {sign: "+", class: RFP}
+    - {sign: "+", class: RFP_Sox9}
+
+metrics: [Count, Percentage, Density, RegionProportion, Volume, RelativeVolume]
+
+# covered = cells per mm^3 of region tissue actually inside the brain mask.
+# full    = cells per mm^3 of warped region volume, mask ignored.
+# `covered` is the default because the half-brain cut does not land on the
+# anatomical midline in every sample, so some midline regions are only
+# partly present (PROGRESS_LOG 2026-08-29).
+density_denominator: covered
+use_brain_mask: true
+
+region_filter:
+  # Regions below this tissue coverage are excluded FOR THAT SAMPLE ONLY --
+  # the region is still tested on the samples that have it, with n_a/n_b in
+  # the output recording how many contributed. 0 disables the check.
+  min_coverage: 0.8
+
+  # A region must hold at least this many cells of a class (summed over all
+  # samples) before that class is tested there. Without it, regions with one
+  # or two cells dominate the FDR family and produce findings like "1 cell in
+  # every control, 0 in every experimental".
+  min_total_count: 50
+
+  # Levels to test. Each level is its own FDR family. Testing all of 0-10 at
+  # n=3 vs 3 is how you end up with nothing surviving correction: level 7
+  # alone is 324 regions. Start coarse, then descend inside whatever survives.
+  levels: [2, 3, 4, 5, 6, 7, 8]
+
+  # Regions removed from the analysis ENTIRELY, subtree included. Unlike
+  # include_ids (which only picks what gets tested), exclude_ids is applied to
+  # the direct per-region counts and volumes BEFORE the hierarchical rollup.
+  # So an excluded structure disappears from every ancestor's Count and Volume
+  # and from the Percentage and RelativeVolume denominators -- which is what
+  # you need for structures damaged during preparation: otherwise every other
+  # region's share would depend on how much of the cerebellum happened to
+  # survive in that particular sample.
+  #
+  # Measured coverage in this dataset (min / mean across the six samples, and
+  # the smallest per-sample volume as a fraction of the six-sample median):
+  #   512  Cerebellum       0.33 / 0.75   ratio 0.28   <- excluded
+  #   507  MOB              0.57 / 0.93   ratio 0.30   <- excluded
+  #   151  AOB              1.00 / 1.00   ratio 0.57   <- excluded (with MOB)
+  #   1016 onl              0.01 / 0.66   ratio 0.76   <- excluded (olfactory nerve layer)
+  # Further candidates, NOT excluded by default -- decide from the biology:
+  #   354  Medulla          0.39 / 0.76   ratio 0.47   caudal truncation
+  #   73   ventricular sys  0.63 / 0.85   ratio 0.74   CSF space, not tissue
+  # Healthy for comparison: CTX 0.98/1.00, HPF 0.99/1.00.
+  exclude_ids: [512, 507, 151, 1016]
+
+  # Whitelist by CCF id; the whole subtree under each id is included. This is
+  # the single most effective knob for power here, because BH corrects within
+  # one (class, metric, level) family and the threshold is alpha/m: shrinking
+  # the family loosens it proportionally. Measured on this data (GFP/Density/
+  # level 7, identical p-values, only the whitelist changed):
+  #
+  #   null (everything)          m=98  threshold 0.00051  ->  0 pass FDR
+  #   [688,623,549,1097,512]     m=97  threshold 0.00052  ->  0 pass
+  #   [315,1089,477]             m=81  threshold 0.00062  ->  0 pass
+  #   [1089,477]                 m=17  threshold 0.00294  ->  4 pass
+  #
+  # Which is also why it MUST be chosen from the hypothesis before the run.
+  # Picking the whitelist after seeing the p-values is p-hacking.
+  #
+  # A coarse grey-matter whitelist mostly helps at levels 4-5 (it drops fiber
+  # tracts and ventricles, where a "cell density" is hard to interpret and
+  # findings are more likely assignment error); by level 7-8 almost everything
+  # is grey matter already, so only a narrow list of named structures helps.
+  #
+  # Depths differ per branch, so whitelisting by id beats filtering by level:
+  #   512  Cerebellum            L2      688  Cerebral cortex       L3
+  #   623  Cerebral nuclei       L3      549  Thalamus              L4
+  #   1097 Hypothalamus          L4      315  Isocortex             L5
+  #   1089 Hippocampal formation L5      477  Striatum              L4
+  #   672  Caudoputamen          L6      985  Primary motor area    L7
+  #   382  Field CA1             L8
+  # NOTE levels [2,3,4,5] never reaches cortical areas -- those start at L7.
+  include_ids: null
+
+# Per-level testing, with the correction chosen per level.
+#
+# The design is a gatekeeping (fixed-sequence) procedure:
+#   coarse levels 2-4   few regions (8-36), FWER-controlled with Holm. These
+#                       are the confirmatory, pre-specified hypotheses.
+#   level 5             46 regions, ordinary BH/FDR.
+#   fine levels 6-8     82-153 regions. FDR would leave nothing here (measured:
+#                       0 survivors at every one of them), so they run
+#                       UNCORRECTED -- but only inside branches that already
+#                       cleared a coarse level, because gatekeeping is on.
+#
+# gatekeeping is what makes the uncorrected levels legitimate: a region is
+# tested at a level only if its ancestor at the previous tested level reached
+# p_adj < alpha. Without it, level 8 uncorrected means ~8 of 153 regions hit
+# p<0.05 by chance and there is nothing to distinguish them from real ones.
+#
+# Rows from uncorrected levels carry exploratory=TRUE in the output. Report
+# them as leads, never as "significant".
+stats:
+  alpha: 0.05
+  correction: bh          # default for any level not listed below
+  correction_by_level:
+    2: holm
+    3: holm
+    4: holm
+    5: bh
+    6: none
+    7: none
+    8: none
+  gatekeeping: true
+
+# Optional: sample-independent atlas volumes, reported as ref_volume_mm3 for
+# orientation only. Density never uses it -- a fixed per-region constant would
+# make Density a rescaled Count and would hide the brain-size difference.
+reference_annotation:
+  path: ../../atlas/DeMBA/DeMBA_P5_annotation.tif
+  voxel_size_um: [20.0, 20.0, 20.0]
+
+output:
+  dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/stats_marker

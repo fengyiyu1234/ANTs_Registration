@@ -43,6 +43,20 @@ pipeline itself:
 - `scripts/convert_devccf_ontology.py` — converts the DevCCF ontology spreadsheet into the nested JSON the atlas loader expects.
 - `scripts/relabel_labels_to_devccf.py` — translates CCFv3 label ids into DevCCF ids via the published voxel-overlap crosswalk.
 
+## Group statistics
+
+`stats/` holds the post-registration group comparison -- per-region cell counts,
+densities and marker composition, with no ClearMap dependency. Cells can be
+classified by marker co-expression alone (dropping YOLO's neuron/glia call).
+
+```bash
+python -m stats.qc_samples  --config stats/configs/tsc_marker.yaml   # run first
+python -m stats.group_stats --config stats/configs/tsc_marker.yaml
+```
+
+See `stats/README.md` -- in particular the section on reading results at
+n=3 vs 3, and the two nuisance variables that currently separate the groups.
+
 ## Atlas data (`atlas/`)
 
 Gitignored (hundreds of MB), so a fresh checkout has to download it. The
