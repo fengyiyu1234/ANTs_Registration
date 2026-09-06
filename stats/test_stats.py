@@ -704,6 +704,45 @@ def test_values_by_order():
     print("  ok: values pulled per (level, class, metric), significance filter applied")
 
 
+def test_family_enrichment():
+    """The set-level columns are the only interpretable output an uncorrected
+    level has, so they have to be right: n_raw_sig against m*alpha, a binomial
+    p for the excess, and the implied false fraction."""
+    from scipy import stats as sp
+    with tempfile.TemporaryDirectory() as root:
+        ont, samples = _build_dataset(root, effect=6.0)
+        cfg = {"ontology_json": ont, "samples": samples,
+               "groups": {"a": {"name": "Ctrl", "samples": ["c1", "c2", "c3"]},
+                          "b": {"name": "Exp", "samples": ["e1", "e2", "e3"]}},
+               "classify_by": "marker", "classes": ["GFP"], "metrics": ["Count"],
+               "stats": {"alpha": 0.05, "correction": "none", "gatekeeping": False},
+               "region_filter": {"min_coverage": 0.0, "levels": [2]},
+               "output": {"dir": os.path.join(root, "out")}}
+        path = os.path.join(root, "cfg.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump(cfg, f)
+        df = group_stats.run_all(group_stats.load_config(path))["result"]
+
+        fam = df[df["level"] == 2]
+        m = int(fam["m_family"].iloc[0])
+        assert len(fam) == m, (len(fam), m)
+        n_raw = int((fam["p_value"] < 0.05).sum())
+        assert int(fam["n_raw_sig_in_family"].iloc[0]) == n_raw
+        assert np.isclose(fam["expected_false_in_family"].iloc[0], m * 0.05)
+        expected_p = sp.binomtest(n_raw, m, 0.05, alternative="greater").pvalue
+        assert np.isclose(fam["family_enrichment_p"].iloc[0], expected_p), (
+            fam["family_enrichment_p"].iloc[0], expected_p)
+        if n_raw:
+            assert np.isclose(fam["est_false_frac_in_family"].iloc[0],
+                              min(1.0, m * 0.05 / n_raw))
+        # the columns are family-level, so they must be identical on every row
+        for col in ("m_family", "n_raw_sig_in_family", "family_enrichment_p"):
+            assert fam[col].nunique() == 1, col
+        # and 'none' must leave p_adj equal to the raw p
+        assert np.allclose(fam["p_adj"], fam["p_value"])
+    print("  ok: family enrichment columns (binomial excess, false fraction)")
+
+
 def test_volume_cache_roundtrip():
     with tempfile.TemporaryDirectory() as root:
         o = Ontology.from_json(_write_ontology(root))
@@ -732,7 +771,7 @@ def main():
                test_relative_volume_excludes,
                test_volumes_and_coverage, test_grid_offset, test_bh_and_effect_size,
                test_degenerate_ttest, test_welch_vs_student, test_methods_summary,
-               test_corrections, test_gatekeeping,
+               test_corrections, test_gatekeeping, test_family_enrichment,
                test_atlas_subdivides, test_depth_profile,
                test_region_maps, test_hemisphere_slice, test_values_by_order,
                test_volume_cache_roundtrip, test_end_to_end,

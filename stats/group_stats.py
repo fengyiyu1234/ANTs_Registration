@@ -419,7 +419,7 @@ def hedges_g(a, b):
 
 def run_level_tests(mat_a, mat_b, metadata, keep_orders, level, class_name, metric,
                     samples_a, samples_b, count_gate=None, correction="bh",
-                    test="welch"):
+                    test="welch", alpha=0.05):
     """Test the regions of one ontology level, then BH-correct within that
     level alone -- each level is its own hypothesis family, and their sizes
     differ by an order of magnitude (18 regions at level 2, 324 at level 7)."""
@@ -459,6 +459,27 @@ def run_level_tests(mat_a, mat_b, metadata, keep_orders, level, class_name, metr
     out["correction"] = correction
     out["m_family"] = len(idx)
     out["p_adj"] = adjust_pvalues(p, correction)
+
+    # Family-level enrichment, carried on every row of the family.
+    #
+    # This is the only interpretable thing an UNCORRECTED level has to offer.
+    # Gatekeeping narrows where you look, but it controls no error rate: with
+    # m regions tested at alpha, m*alpha of them reach p<alpha by chance even
+    # if every one is null. So a per-region claim is not available there --
+    # but a claim about the SET is: seeing n_raw_sig hits where only
+    # expected_false were predicted is itself testable (binomial, one-sided),
+    # and expected_false / n_raw_sig estimates what fraction of the list is
+    # noise. Report those two numbers instead of pretending the p-values were
+    # corrected.
+    n_raw = int((p < alpha).sum())
+    m = len(idx)
+    out["alpha"] = alpha
+    out["n_raw_sig_in_family"] = n_raw
+    out["expected_false_in_family"] = m * alpha
+    out["family_enrichment_p"] = (
+        float(sp_stats.binomtest(n_raw, m, alpha, alternative="greater").pvalue)
+        if m > 0 else np.nan)
+    out["est_false_frac_in_family"] = (min(1.0, m * alpha / n_raw) if n_raw > 0 else np.nan)
     # An uncorrected level is descriptive: it is only defensible when reached
     # through gatekeeping, and its rows must never be called "significant".
     out["exploratory"] = (correction or "none").lower() == "none"
@@ -681,7 +702,7 @@ def run_all(cfg):
                     corr = corr_by_level.get(level, default_corr)
                     res = run_level_tests(ma, mb, metadata, open_orders, level, cls, metric,
                                           samples_a, samples_b, count_gate=gate,
-                                          correction=corr, test=test)
+                                          correction=corr, test=test, alpha=alpha)
                     if not res.empty:
                         res["gated"] = gatekeeping
                         rows.append(res)
@@ -756,9 +777,19 @@ def _readme_frame(r):
         ("m_family", "Number of regions in this row's correction family -- one "
                      "(class, metric, level) combination. The adjusted threshold scales with it"),
         ("p_adj", "Adjusted p-value under `correction`. Equals p_value when correction is none"),
-        ("exploratory", "TRUE where correction is none. Those rows are DESCRIPTIVE: with ~150 "
-                        "regions about 8 reach p<0.05 by chance. Report them as leads, never as "
-                        "significant findings"),
+        ("exploratory", "TRUE where correction is none. Those rows are DESCRIPTIVE. Gatekeeping "
+                        "narrows where you looked but controls no error rate, so no single region "
+                        "on such a level is established -- read the family columns below instead"),
+        ("n_raw_sig_in_family / expected_false_in_family",
+         "How many regions in this (class, metric, level) family reached p < alpha, against how "
+         "many were expected to by chance (m x alpha). The gap is the signal"),
+        ("family_enrichment_p",
+         "One-sided binomial p for seeing that many sub-alpha regions in a family of m if every "
+         "one were null. This is the claim an uncorrected level CAN support: not 'this region "
+         "differs' but 'this set of regions is enriched for differences'"),
+        ("est_false_frac_in_family",
+         "expected_false / n_raw_sig -- the fraction of that family's sub-alpha list expected to "
+         "be noise. Rank the list by effect size; the top of it is the least likely to be noise"),
         ("gated", "TRUE if gatekeeping was on: this region was only tested because its ancestor "
                   "at the previous tested level was significant. Gatekeeping is what makes an "
                   "uncorrected deep level defensible -- without it, an uncorrected level is a "
@@ -898,8 +929,39 @@ def describe_methods(r):
                          if r["correction_by_level"].get(lv, r["correction"]) == "none")
     if uncorrected:
         add(f"- **Exploratory levels**: {uncorrected}. Rows from these levels carry "
-            f"`exploratory = TRUE` and are reported as leads, not as significant findings.")
+            f"`exploratory = TRUE`. Gatekeeping restricts where these levels look but "
+            f"controls no error rate, so NO INDIVIDUAL REGION on them is established. "
+            f"What they support is a statement about the set: `n_raw_sig_in_family` "
+            f"against `expected_false_in_family` (= m x alpha), tested by "
+            f"`family_enrichment_p` (one-sided binomial), with "
+            f"`est_false_frac_in_family` estimating what fraction of the list is noise. "
+            f"Report the enrichment and the effect-size ranking, not per-region p-values.")
     add("")
+
+    # The family-level numbers are the substance of any uncorrected level, so
+    # spell them out rather than leaving the reader to recompute them.
+    res = r.get("result")
+    if uncorrected and res is not None and not res.empty:
+        rows = res[res["level"].isin(uncorrected)]
+        if not rows.empty:
+            add("### Set-level enrichment on the uncorrected levels")
+            add("")
+            add("| level | class | metric | m | p<alpha | expected by chance | "
+                "binomial p | est. false fraction |")
+            add("|---|---|---|---|---|---|---|---|")
+            key = ["level", "class_name", "metric", "m_family", "n_raw_sig_in_family",
+                   "expected_false_in_family", "family_enrichment_p",
+                   "est_false_frac_in_family"]
+            seen = rows[key].drop_duplicates().sort_values(["level", "class_name", "metric"])
+            for _, q in seen.iterrows():
+                if q["n_raw_sig_in_family"] == 0:
+                    continue
+                add(f"| {int(q['level'])} | {q['class_name']} | {q['metric']} | "
+                    f"{int(q['m_family'])} | {int(q['n_raw_sig_in_family'])} | "
+                    f"{q['expected_false_in_family']:.2f} | "
+                    f"{q['family_enrichment_p']:.2g} | "
+                    f"{q['est_false_frac_in_family']:.0%} |")
+            add("")
 
     add("## Limitations at this sample size")
     add(f"- With {na} vs {nb} samples there are C({na + nb},{na}) = {n_perm} labelings, so an "
