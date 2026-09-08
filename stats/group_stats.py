@@ -44,7 +44,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import yaml
-from scipy import stats as sp_stats
+from scipy import special, stats as sp_stats
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -313,6 +313,127 @@ def welch_ttest(a, b):
     return two_sample_ttest(a, b, test="welch")
 
 
+def _inv_trigamma(x):
+    """Smyth (2004) appendix: Newton iteration for trigamma^-1."""
+    if not np.isfinite(x) or x <= 0:
+        return np.inf
+    y = 0.5 + 1.0 / x
+    for _ in range(60):
+        tri = special.polygamma(1, y)
+        step = tri * (1 - tri / x) / special.polygamma(2, y)
+        y += step
+        if abs(step / y) < 1e-10:
+            break
+    return y
+
+
+# A prior fitted from a handful of regions is noise, not information. limma is
+# normally run on thousands of features; here a family is 8-40 regions. Below
+# MIN_FEATURES the variance prior is not estimable and the test falls back to
+# Welch; between that and MIN_FOR_TREND a single global prior is used, because
+# a lowess trend through ~15 points would follow the points rather than a trend.
+# Measured consequence of NOT having this guard: level 2 (a family of 8-9)
+# produced prior_df between 0.6 and 49.1 across families -- i.e. anywhere from
+# no shrinkage to almost total shrinkage, decided by noise.
+MIN_FEATURES_FOR_MODERATION = 12
+MIN_FEATURES_FOR_TREND = 25
+
+
+def moderated_ttest(a, b, trend=True, lowess_frac=0.6):
+    """Empirical-Bayes moderated t-test (limma; Smyth 2004), per family.
+
+    Why this exists: at n=3 vs 3 every region's test has 4 residual degrees of
+    freedom, and that -- not multiplicity -- is what stops deep levels from
+    reaching a corrected threshold. Shrinking each region's variance toward a
+    prior fitted across the regions in the same family buys back degrees of
+    freedom (measured here: 4 -> 7-9), which is enough to move levels 7 and 8
+    from zero survivors to a dozen.
+
+    What it assumes, and why it is defensible here: the regions in one family
+    share a variance distribution. Borrowing across them is legitimate because
+    WITHIN a single ontology level the regions are disjoint -- verified by the
+    identity sum(rollup at L) == root - sum(direct above L). It would NOT be
+    legitimate across levels, where a cell is counted in every ancestor.
+
+    trend=True fits the prior variance as a function of the mean (limma-trend)
+    instead of using one global prior. That matters: cell density's residual
+    variance rises with the mean (Spearman rho = +0.57 at level 8 on this
+    data), and with a global prior the number of survivors swings wildly with
+    an arbitrary log transform (11 vs 1 at level 7). With the trend the two
+    scales agree to within a couple of regions, which is the sign the prior is
+    no longer absorbing a mean-variance relationship it should be modelling.
+
+    MEASURED CALIBRATION -- read this before using it. The marginal p-values
+    are correct: under a simulated global null they reject at 5.2% (m=50),
+    5.0% (m=200), 5.0% (m=5000) against a nominal 5%, so the estimator itself
+    is right. But BH on top of them is NOT calibrated at the family sizes this
+    project has. Under the global null, P(at least one BH rejection) should be
+    <= 5%; measured over 1500 simulations at n=3 vs 3:
+
+        m=15  global prior 9.9%   trend 10.6%
+        m=30  global prior 7.7%   trend 14.9%
+        m=50  global prior 6.5%   trend 11.3%
+        m=200 global prior 5.3%   (converges as m grows)
+
+    The cause is that every region shares the same estimated prior (s0^2, d0),
+    which is a common-mode dependence BH does not absorb; the trend makes it
+    worse because it estimates more shared structure. For contrast, Welch on
+    the same data rejects at only 3.2-3.6% marginally -- it is CONSERVATIVE at
+    n=3. So the two bracket the truth rather than one being right:
+
+        welch + BH        conservative, misses real effects
+        moderated_t + BH  liberal, FWER 1.3-3x nominal at these family sizes
+
+    Regions found by both are the defensible ones. Do not report a
+    moderated_t-only hit as error-controlled.
+
+    Returns (p, info) where info records the fitted prior for the report.
+    """
+    n1, n2 = a.shape[1], b.shape[1]
+    d = n1 + n2 - 2
+    if d <= 0:
+        return np.ones(a.shape[0]), {}
+    s2 = ((n1 - 1) * np.nanvar(a, axis=1, ddof=1)
+          + (n2 - 1) * np.nanvar(b, axis=1, ddof=1)) / d
+    ok = np.isfinite(s2) & (s2 > 0)
+    p = np.ones(a.shape[0], dtype=float)
+    if ok.sum() < MIN_FEATURES_FOR_MODERATION:
+        return two_sample_ttest(a, b, test="welch"), {
+            "fallback": f"welch ({int(ok.sum())} regions < {MIN_FEATURES_FOR_MODERATION})"}
+
+    z = np.log(s2[ok])
+    e = z - special.digamma(d / 2) + np.log(d / 2)
+    means = np.nanmean(np.concatenate([a, b], axis=1), axis=1)[ok]
+
+    used_trend = bool(trend and ok.sum() >= MIN_FEATURES_FOR_TREND)
+    if used_trend:
+        from statsmodels.nonparametric.smoothers_lowess import lowess
+        loc = lowess(e, means, frac=lowess_frac, return_sorted=False)
+        resid = e - loc
+    else:
+        loc = np.full_like(e, e.mean())
+        resid = e - e.mean()
+
+    G = len(e)
+    rhs = float(np.mean(resid ** 2) * G / (G - 1) - special.polygamma(1, d / 2))
+    if rhs <= 0:
+        d0 = np.inf
+        s02 = np.exp(loc + special.digamma(d / 2) - np.log(d / 2))
+    else:
+        d0 = 2 * _inv_trigamma(rhs)
+        s02 = np.exp(loc + special.digamma(d0 / 2) - np.log(d0 / 2))
+
+    s2_mod = s02 if np.isinf(d0) else (d0 * s02 + d * s2[ok]) / (d0 + d)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t = (np.nanmean(b, axis=1)[ok] - np.nanmean(a, axis=1)[ok]) / np.sqrt(
+            s2_mod * (1.0 / n1 + 1.0 / n2))
+    df_total = d + (d0 if np.isfinite(d0) else 1e6)
+    p[ok] = 2 * sp_stats.t.sf(np.abs(t), df_total)
+    p[~np.isfinite(p)] = 1.0
+    return p, {"d0": float(d0), "df_total": float(df_total), "n_features": int(G),
+               "trend": used_trend}
+
+
 def holm(p):
     """Holm-Bonferroni step-down. Controls the family-wise error rate -- the
     probability of even one false positive -- and is uniformly more powerful
@@ -354,7 +475,7 @@ def adjust_pvalues(p, method):
     raise ValueError(f"unknown correction '{method}'; known: {CORRECTIONS}")
 
 
-TESTS = ("welch", "student")
+TESTS = ("welch", "student", "moderated_t")
 
 
 def two_sample_ttest(a, b, test="welch"):
@@ -419,7 +540,7 @@ def hedges_g(a, b):
 
 def run_level_tests(mat_a, mat_b, metadata, keep_orders, level, class_name, metric,
                     samples_a, samples_b, count_gate=None, correction="bh",
-                    test="welch", alpha=0.05):
+                    test="welch", alpha=0.05, variance_trend=True):
     """Test the regions of one ontology level, then BH-correct within that
     level alone -- each level is its own hypothesis family, and their sizes
     differ by an order of magnitude (18 regions at level 2, 324 at level 7)."""
@@ -441,13 +562,23 @@ def run_level_tests(mat_a, mat_b, metadata, keep_orders, level, class_name, metr
         fold = np.where(mean_a > 0, mean_b / mean_a, np.nan)
         log2fc = np.log2(fold, out=np.full_like(fold, np.nan), where=fold > 0)
 
-    p = two_sample_ttest(a, b, test=test)
+    mod_info = {}
+    if test == "moderated_t":
+        p, mod_info = moderated_ttest(a, b, trend=variance_trend)
+    else:
+        p = two_sample_ttest(a, b, test=test)
+    # The effect size stays on the raw per-region variance on purpose: it is a
+    # description of this region, not a test statistic, and shrinking it would
+    # make the reported effect depend on the other regions in the family.
     g, g_lo, g_hi = hedges_g(a, b)
 
     out = metadata.iloc[idx].reset_index(drop=True).copy()
     out["class_name"] = class_name
     out["metric"] = metric
-    out["test"] = test
+    out["test"] = "welch" if mod_info.get("fallback") else test
+    out["test_note"] = mod_info.get("fallback", "")
+    out["prior_df"] = mod_info.get("d0", np.nan)
+    out["test_df"] = mod_info.get("df_total", float(len(samples_a) + len(samples_b) - 2))
     out["n_a"] = np.sum(~np.isnan(a), axis=1)
     out["n_b"] = np.sum(~np.isnan(b), axis=1)
     out["mean_a"], out["mean_b"] = mean_a, mean_b
@@ -653,6 +784,22 @@ def run_all(cfg):
     test = str(stats_cfg.get("test", "welch")).lower()
     if test not in TESTS:
         raise ValueError(f"unknown stats.test '{test}'; known: {TESTS}")
+    variance_trend = bool(stats_cfg.get("variance_trend", True))
+    if test == "moderated_t":
+        print(f"  test=moderated_t: each family's per-region variance is shrunk toward a "
+              f"prior fitted across that family"
+              f"{' as a function of the mean (limma-trend)' if variance_trend else ''}. "
+              f"Valid because regions within one level are disjoint. Families smaller "
+              f"than {MIN_FEATURES_FOR_MODERATION} regions fall back to Welch, and the "
+              f"mean-variance trend needs {MIN_FEATURES_FOR_TREND}; see the `test` and "
+              f"`prior_df` columns for what each family actually used.")
+        print(f"  [WARN] moderated_t is ANTICONSERVATIVE at these family sizes. Simulated "
+              f"at n=3 vs 3 under the global null, BH's family-wise error rate came out "
+              f"6.5-15% against a nominal 5% (worse with variance_trend on), because "
+              f"every region shares one estimated prior. Welch is conservative on the "
+              f"same data (3.2-3.6% marginal vs 5% nominal). Treat the two as brackets: "
+              f"report regions found by BOTH as established, and moderated_t-only hits "
+              f"as leads. See moderated_ttest's docstring for the numbers.")
     default_corr = str(stats_cfg.get("correction", "bh")).lower()
     corr_by_level = {int(k): str(v).lower()
                      for k, v in (stats_cfg.get("correction_by_level") or {}).items()}
@@ -702,7 +849,8 @@ def run_all(cfg):
                     corr = corr_by_level.get(level, default_corr)
                     res = run_level_tests(ma, mb, metadata, open_orders, level, cls, metric,
                                           samples_a, samples_b, count_gate=gate,
-                                          correction=corr, test=test, alpha=alpha)
+                                          correction=corr, test=test, alpha=alpha,
+                                          variance_trend=variance_trend)
                     if not res.empty:
                         res["gated"] = gatekeeping
                         rows.append(res)
@@ -740,6 +888,7 @@ def run_all(cfg):
                 levels=levels,
                 min_coverage=min_cov, min_total_count=min_count,
                 exclude_mask=exclude_mask, alpha=alpha, gatekeeping=gatekeeping, test=test,
+                variance_trend=variance_trend,
                 correction=default_corr, correction_by_level=corr_by_level,
                 density_denominator=density_denominator,
                 metrics=metrics, classify_by=classify_by)
@@ -843,7 +992,8 @@ def write_outputs(r):
 
 
 _TEST_NAMES = {"welch": "Welch's unequal-variance t-test",
-               "student": "Student's pooled-variance t-test"}
+               "student": "Student's pooled-variance t-test",
+               "moderated_t": "empirical-Bayes moderated t-test (limma; Smyth 2004)"}
 _CORR_NAMES = {"bh": "Benjamini-Hochberg FDR",
                "holm": "Holm-Bonferroni (family-wise error rate)",
                "bonferroni": "Bonferroni (family-wise error rate)",
@@ -906,6 +1056,26 @@ def describe_methods(r):
 
     add("## Testing")
     add(f"- **Test**: {_TEST_NAMES[r['test']]}, two-sided, applied per region.")
+    if r["test"] == "moderated_t":
+        res = r.get("result")
+        dfs = ""
+        if res is not None and not res.empty and "test_df" in res.columns:
+            d = res["test_df"].dropna()
+            if not d.empty:
+                dfs = (f" Residual degrees of freedom rose from {na + nb - 2} to "
+                       f"{d.min():.1f}-{d.max():.1f} across families.")
+        add(f"  Each family's per-region variance was shrunk toward a prior estimated "
+            f"across the regions of that same family"
+            + (", fitted as a function of the region mean (limma-trend)"
+               if r.get("variance_trend") else " (a single global prior)")
+            + f".{dfs}")
+        add("  This borrows information across regions, which is what buys back the "
+            "degrees of freedom a 3-vs-3 design cannot supply. It is legitimate within "
+            "a level because regions at one ontology level are disjoint; it would not "
+            "be across levels, where each cell is counted in every ancestor. The prior "
+            "is estimated from tens of regions rather than the thousands this method "
+            "is usually applied to, so `prior_df` in the output should be read as an "
+            "estimate with its own uncertainty.")
     add(f"- **Effect size**: Hedges' g (bias-corrected standardised mean difference, "
         f"J = 1 - 3/(4N-9) = {1 - 3 / (4 * (na + nb) - 9):.2f} at N={na + nb}), with an "
         f"approximate 95% confidence interval.")

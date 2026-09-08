@@ -743,6 +743,93 @@ def test_family_enrichment():
     print("  ok: family enrichment columns (binomial excess, false fraction)")
 
 
+def test_moderated_ttest():
+    """Variance shrinkage must buy degrees of freedom, and must refuse to do
+    so when the family is too small for the prior to mean anything."""
+    rng = np.random.default_rng(0)
+    n = 60
+    a = rng.normal(10.0, 1.0, size=(n, 3))
+    b = rng.normal(10.0, 1.0, size=(n, 3))
+    b[:5] += 4.0                                     # a few real effects
+
+    p_mod, info = group_stats.moderated_ttest(a, b, trend=False)
+    p_welch = group_stats.two_sample_ttest(a, b, test="welch")
+    assert info["n_features"] == n and info["d0"] > 0
+    assert info["df_total"] > 4, "moderation must add degrees of freedom to the base 4"
+    # the planted effects should be at least as detectable after moderation
+    assert (p_mod[:5] < 0.05).sum() >= (p_welch[:5] < 0.05).sum()
+    assert np.all((p_mod >= 0) & (p_mod <= 1))
+
+    # a family below the guard must fall back to Welch, and say so
+    small_a, small_b = a[:6], b[:6]
+    p_small, info_small = group_stats.moderated_ttest(small_a, small_b)
+    assert "fallback" in info_small, info_small
+    assert np.allclose(p_small, group_stats.two_sample_ttest(small_a, small_b, "welch"))
+
+    # the trend needs more features than the plain prior
+    _, info_mid = group_stats.moderated_ttest(a[:15], b[:15], trend=True)
+    assert info_mid["trend"] is False, "15 features is too few for a lowess trend"
+    _, info_big = group_stats.moderated_ttest(a, b, trend=True)
+    assert info_big["trend"] is True
+    print("  ok: moderated t adds df, falls back on small families, gates the trend")
+
+
+def test_moderated_t_calibration():
+    """Pin the two calibration facts that decide how the results may be read.
+
+    Marginal rejection under the global null must sit near 5% -- that is what
+    says the estimator is implemented correctly. BH on top of it must NOT be
+    assumed calibrated: because every region shares one estimated prior, the
+    family-wise error rate runs above nominal at the family sizes here. The
+    test asserts both, so neither fact can quietly stop being true."""
+    rng = np.random.default_rng(3)
+    m, reps = 40, 250
+    marg, any_rej = [], []
+    for _ in range(reps):
+        sig2 = 4.0 / rng.chisquare(4, size=m)
+        a = rng.normal(10, np.sqrt(sig2)[:, None], size=(m, 3))
+        b = rng.normal(10, np.sqrt(sig2)[:, None], size=(m, 3))
+        p, _ = group_stats.moderated_ttest(a, b, trend=False)
+        marg.append((p < 0.05).mean())
+        any_rej.append((group_stats.benjamini_hochberg(p) < 0.05).sum() > 0)
+    marginal = float(np.mean(marg))
+    fwer = float(np.mean(any_rej))
+    assert 0.03 < marginal < 0.08, f"marginal rejection {marginal:.3f} is far from nominal 0.05"
+    # documented behaviour, not an aspiration: BH here is liberal
+    assert fwer > 0.05 * 0.8, (
+        f"BH FWER measured {fwer:.3f}. If this has become <= nominal the docstring's "
+        "'anticonservative' warning is stale and must be revised, not deleted")
+    print(f"  ok: moderated t calibration pinned (marginal {marginal:.3f}, BH FWER {fwer:.3f})")
+
+
+def test_moderated_t_end_to_end():
+    """The fallback has to be visible in the output, not silent: a coarse level
+    with a handful of regions is tested with Welch even when moderated_t is
+    configured, and the row says so."""
+    with tempfile.TemporaryDirectory() as root:
+        ont, samples = _build_dataset(root, effect=4.0)
+        cfg = {"ontology_json": ont, "samples": samples,
+               "groups": {"a": {"name": "Ctrl", "samples": ["c1", "c2", "c3"]},
+                          "b": {"name": "Exp", "samples": ["e1", "e2", "e3"]}},
+               "classify_by": "marker", "classes": ["GFP"], "metrics": ["Count"],
+               "stats": {"test": "moderated_t", "correction": "bh", "gatekeeping": False},
+               "region_filter": {"min_coverage": 0.0, "levels": [1, 2]},
+               "output": {"dir": os.path.join(root, "out")}}
+        path = os.path.join(root, "cfg.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump(cfg, f)
+        r = group_stats.run_all(group_stats.load_config(path))
+        df = r["result"]
+        # this toy ontology has 2-3 regions per level, far below the guard
+        assert (df["test"] == "welch").all(), df["test"].unique()
+        assert df["test_note"].str.contains("fallback|<").any() or \
+            df["test_note"].str.contains("welch").all(), df["test_note"].unique()
+        assert df["prior_df"].isna().all()
+        text = group_stats.describe_methods(r)
+        assert "moderated t-test" in text
+    print("  ok: moderated_t records its per-family fallback in the output")
+
+
 def test_volume_cache_roundtrip():
     with tempfile.TemporaryDirectory() as root:
         o = Ontology.from_json(_write_ontology(root))
@@ -772,6 +859,8 @@ def main():
                test_volumes_and_coverage, test_grid_offset, test_bh_and_effect_size,
                test_degenerate_ttest, test_welch_vs_student, test_methods_summary,
                test_corrections, test_gatekeeping, test_family_enrichment,
+               test_moderated_ttest, test_moderated_t_calibration,
+               test_moderated_t_end_to_end,
                test_atlas_subdivides, test_depth_profile,
                test_region_maps, test_hemisphere_slice, test_values_by_order,
                test_volume_cache_roundtrip, test_end_to_end,

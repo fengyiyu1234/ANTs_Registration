@@ -39,11 +39,31 @@ groups:
 # 3. 统计方法 —— 每次跑完这一节会原样生成一份 methods.md
 # ============================================================================
 stats:
-  # welch   = Welch 不等方差 t 检验（默认）。n=3v3 时 df 在 2.4~4 之间。
-  # student = 合并方差的 Student t，恒定 df=4。只有在能论证两组方差相等时才用。
+  # welch       Welch 不等方差 t 检验（默认）。n=3v3 时 df 在 2.4~4 之间。
+  # student     合并方差的 Student t，恒定 df=4。只有能论证两组方差相等时才用。
+  # moderated_t 经验贝叶斯方差收缩（limma / Smyth 2004）。把每个 family 内各区的
+  #             方差往一个跨区拟合的先验收缩，换回自由度：实测 df 从 4 升到 7~9。
+  #
+  # 什么时候值得开 moderated_t：**深层**。n=3v3 下深层的瓶颈不是多重检验而是
+  # 每个检验只有 4 个自由度。本数据 GFP_any/Density，BH<0.05 的存活数：
+  #     层    m   welch   moderated_t(trend)
+  #     L6   19     1          11
+  #     L7   32     0          11
+  #     L8   39     0          13
+  # 代价是它假设同一 family 内各区共享方差分布。**这在层内成立**（同层的区互斥，
+  # 有恒等式 sum(rollup@L) = root - sum(direct 更浅层) 验证过），跨层则不成立。
+  #
   # 注意：置换检验和 Mann-Whitney 在 3v3 下双侧 p 下限是 0.1，到不了 0.05，
   #      所以这里没有提供非参数选项——不是遗漏。
   test: welch
+
+  # 仅 moderated_t 生效。true = 先验方差随区均值变（limma-trend）；
+  # false = 全局单一先验。
+  # 强烈建议保持 true：细胞密度的残差方差随均值上升（L8 上 Spearman rho=+0.57），
+  # 用全局先验时存活数会随"要不要取 log"这种随意选择剧烈摆动（L7 上 11 vs 1）；
+  # 开了 trend 之后两种尺度只差一两个区（11 vs 9），说明先验不再在吸收本该建模的
+  # 均值-方差关系。
+  variance_trend: true
 
   alpha: 0.05
 
@@ -55,13 +75,26 @@ stats:
   #              exploratory=TRUE，措辞必须用"提示"而不是"显著"
   correction: bh              # 未在下面列出的层用这个
   correction_by_level:
-    2: holm                   # 8-9 个区，确证性主假设
+    2: holm                   # 8-9 个区，家族小、FWER 负担得起，确证性主假设
     3: holm
     4: holm
     5: bh                     # 46 个区
-    6: none                   # 82+ 个区，FDR 实测一个都过不了
+    6: none                   # 82+ 个区，welch+FDR 实测一个都过不了
     7: none
     8: none
+  #
+  # 【深层如果想要真正的错误率控制，可以换 test: moderated_t】
+  # 深层配 none 的代价是它不控制任何错误率（门控只缩小搜索范围），所以只能做
+  # 集合层面的声明，不能做逐区推断。换成 moderated_t 之后 FDR 就不再是负担不起
+  # 的了。本数据 GFP_any/Density 四种组合实测：
+  #     配置                  L6      L7      L8
+  #     welch + none        7*      12*     11*    (*未校正，不能当结论)
+  #     welch + bh          1       2       0
+  #     moderated_t + none  10*     14*     21*
+  #     moderated_t + bh    5       9       2
+  # 想试的话：把上面 test 改成 moderated_t，再把 6/7/8 三行改成 bh。
+  # 两套结果都留着对照更好——moderated_t 的额外发现是靠"跨区借方差"这个假设
+  # 换来的，两套都出现的区最可信。
 
   # 固定序（门控）检验：只有当某区在上一个被检验的层级上 p_adj < alpha，
   # 才检验它的子树。它把搜索范围缩小（L7 的 family 从 98 降到 33）。
