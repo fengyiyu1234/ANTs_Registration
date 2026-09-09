@@ -38,6 +38,7 @@ import argparse
 import math
 import os
 import re
+import shutil
 import sys
 import warnings
 
@@ -61,12 +62,20 @@ LOST_LABEL = "Lost cells"
 
 # ================= config =================
 
+# Where load_config records the file it came from, so run_all can copy it
+# next to the numbers. Leading underscore: it is provenance, not a setting,
+# and nothing may read it as one.
+CONFIG_PATH_KEY = "_config_path"
+CONFIG_COPY_NAME = "config_used.yaml"
+
+
 def load_config(path):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     for key in ("ontology_json", "samples", "groups"):
         if key not in cfg:
             raise ValueError(f"config is missing required key '{key}'")
+    cfg[CONFIG_PATH_KEY] = os.path.abspath(path)
     root = os.path.dirname(os.path.abspath(path))
 
     def _abs(p):
@@ -95,10 +104,64 @@ def load_config(path):
     return cfg
 
 
+def class_vocabulary(cfg):
+    """-> (base_classes, combined_classes, total_class) for this config.
+
+    Read by the plotting scripts, which must not hardcode either vocabulary: a
+    marker run has six mutually exclusive signatures (GFP, RFP, GFP_RFP, ...)
+    while a MADM run collapses the same cells into four (glia_MADM,
+    non_glia_MADM_Sox9, ...). A figure script that assumes one comes out empty
+    on the other.
+
+    `total_class` is the combined class whose members are exactly the base set,
+    i.e. "all the cells" under whichever vocabulary the run used. It is found by
+    comparing membership rather than by matching a name, because the name
+    differs between configs (all_cells vs MADM_all) and the other combined
+    classes overlap each other -- picking one of those as the total would double
+    count.
+    """
+    cmap = cfg.get("class_map")
+    base = list(cmap.keys()) if cmap else list(cfg.get("classes") or [])
+    combined_cfg = cfg.get("combined_categories") or {}
+    combined = list(combined_cfg.keys())
+    total = None
+    base_set = set(base)
+    for name, terms in combined_cfg.items():
+        members = {t["class"] for t in terms if t.get("sign", "+") == "+"}
+        if members == base_set:
+            total = name
+            break
+    return base, combined, total
+
+
+def save_config_copy(cfg, out_dir):
+    """Copy the config that produced this run into its output directory.
+
+    A results directory that does not carry its own settings is unreadable a
+    month later: the config file it came from has since been edited (this one
+    has been edited three times today), so the numbers on disk and the file
+    that supposedly made them no longer agree. The copy is byte-exact and
+    keeps the .yaml name, so re-running it is
+    `python -m stats.group_stats --config <out_dir>/config_used.yaml`.
+
+    -> the path written, or None if there was nothing to copy (a config built
+    in memory, e.g. by the tests) or the copy would overwrite the source.
+    """
+    src = cfg.get(CONFIG_PATH_KEY)
+    if not src or not os.path.exists(src):
+        return None
+    dst = os.path.join(out_dir, CONFIG_COPY_NAME)
+    if os.path.exists(dst) and os.path.samefile(src, dst):
+        return dst  # re-run straight from the copy; nothing to do
+    shutil.copyfile(src, dst)
+    print(f"Config copied into the output: {dst}  (source: {src})")
+    return dst
+
+
 # ================= counting =================
 
 def collect_counts(sample_dirs, classes, group_samples, ontology, classify_by,
-                   exclude_mask=None):
+                   exclude_mask=None, class_map=None):
     """-> (counts_df, direct_counts_df, totals_df).
 
     counts are hierarchical rollups; direct counts are not (they drive the
@@ -111,7 +174,7 @@ def collect_counts(sample_dirs, classes, group_samples, ontology, classify_by,
         for sample in samples:
             sdir = sample_dirs[sample]
             for cls in classes:
-                dirs = cell_tables.resolve_class_dirs(sdir, cls, classify_by)
+                dirs = cell_tables.resolve_class_dirs(sdir, cls, classify_by, class_map)
                 if not dirs:
                     print(f"  [warn] {sample}: no folder matching class '{cls}', treating as zero")
                 bins = np.zeros(ontology.n)
@@ -739,14 +802,25 @@ def run_all(cfg):
           f"below p={1.0 / n_perm:.3g} here; Welch's t-test is used, effect sizes reported.")
 
     classify_by = cfg.get("classify_by", "marker")
+    class_map = cell_tables.normalize_class_map(cfg.get("class_map"))
     classes = cell_tables.discover_classes(
-        [sample_dirs[s] for s in all_samples], classify_by, cfg.get("classes"))
-    print(f"classify_by={classify_by}; classes: {classes}")
-    for problem in cell_tables.check_class_resolution(sample_dirs, classes, classify_by):
+        [sample_dirs[s] for s in all_samples], classify_by, cfg.get("classes"), class_map)
+    if class_map:
+        # The map replaces the rule, so print the rule's name nowhere and the
+        # map everywhere: what got summed into what IS the class definition,
+        # and it is not recoverable from the class names alone.
+        print("classify_by=class_map; classes:")
+        for cls in classes:
+            print(f"  {cls} = {' + '.join(class_map.get(cls, []))}")
+    else:
+        print(f"classify_by={classify_by}; classes: {classes}")
+    for problem in cell_tables.check_class_resolution(
+            sample_dirs, classes, classify_by, class_map):
         print(f"  [WARN] {problem}")
 
     out_dir = (cfg.get("output") or {}).get("dir", "./stats_output")
     os.makedirs(out_dir, exist_ok=True)
+    config_copy = save_config_copy(cfg, out_dir)
 
     exclude_mask = build_exclude_mask(cfg, ontology)
 
@@ -760,7 +834,7 @@ def run_all(cfg):
 
     counts_df, direct_df, totals_df = collect_counts(
         sample_dirs, classes, {"a": samples_a, "b": samples_b}, ontology, classify_by,
-        exclude_mask=exclude_mask)
+        exclude_mask=exclude_mask, class_map=class_map)
 
     comb_counts, comb_totals, comb_direct, formulas = combine_categories(
         counts_df, totals_df, direct_df, cfg.get("combined_categories"), classes)
@@ -885,13 +959,14 @@ def run_all(cfg):
                 comb_counts=comb_counts, comb_direct=comb_direct, comb_totals=comb_totals,
                 formulas=formulas, volumes=volumes, region_tot=region_tot,
                 metadata=metadata, ontology=ontology, out_dir=out_dir,
+                config_path=cfg.get(CONFIG_PATH_KEY), config_copy=config_copy,
                 levels=levels,
                 min_coverage=min_cov, min_total_count=min_count,
                 exclude_mask=exclude_mask, alpha=alpha, gatekeeping=gatekeeping, test=test,
                 variance_trend=variance_trend,
                 correction=default_corr, correction_by_level=corr_by_level,
                 density_denominator=density_denominator,
-                metrics=metrics, classify_by=classify_by)
+                metrics=metrics, classify_by=classify_by, class_map=class_map)
 
 
 # ================= outputs =================
@@ -901,8 +976,21 @@ def _readme_frame(r):
         ("level", "Ontology depth from root (0 = whole brain, higher = finer)"),
         ("order", "Dense region index from stats/ontology.py (stable for one ontology JSON; "
                   "join across tools on 'id', not on this)"),
-        ("id / acronym / name", "CCF structure"),
-        ("class_name", f"Cell class. classify_by={r['classify_by']}: "
+        ("id / name / acronym", "CCF structure. The name is the readable one; the acronym is "
+                                "kept because it is what atlas figures and the napari viewers "
+                                "label regions with"),
+        ("parent_name", "The region one level up"),
+        ("L0_name ... L<n>_name", "This region's ancestor at each coarser ontology level, by full "
+                                  "name, so a level sheet can be read on its own: filter L5_name "
+                                  "to 'Isocortex' to see every level-7 subregion of it. Each "
+                                  "sheet carries only the levels above its own"),
+        ("path", "Full root-to-region chain of names, ' > ' separated -- the same ancestry in one "
+                 "cell, for pasting into a figure caption or searching as text"),
+        ("class_name", ("Cell class, defined by this run's class_map: "
+                        + "; ".join(f"{c} = {' + '.join(r['class_map'].get(c, []))}"
+                                    for c in r["classes"]))
+         if r.get("class_map") else
+         f"Cell class. classify_by={r['classify_by']}: "
                        "'marker' means the YOLO neuron/glia call is discarded and neuron_* and "
                        "glia_* of the same marker signature are summed"),
         ("formula", "Resolved +/- formula, for combined categories only (blank otherwise)"),
@@ -964,6 +1052,32 @@ def _readme_frame(r):
     return pd.DataFrame(rows, columns=["column", "description"])
 
 
+# Matches either spelling so switching Ontology.metadata_frame's ancestor_field
+# cannot silently stop the per-sheet trimming below (which would leave every
+# sheet carrying every level, most of them blank).
+_ANCESTOR_RE = re.compile(r"^L(\d+)_(?:name|acronym)$")
+
+
+def ancestor_cols(frame, upto=None):
+    """The L<k>_name (or L<k>_acronym) columns of `frame`, in level order;
+    with `upto`, only the levels strictly above it (a row's true ancestors)."""
+    found = []
+    for c in frame.columns:
+        m = _ANCESTOR_RE.match(str(c))
+        if m and (upto is None or int(m.group(1)) < upto):
+            found.append((int(m.group(1)), c))
+    return [c for _, c in sorted(found)]
+
+
+def trim_ancestors(sheet, level):
+    """Prepare one level's sheet: keep the ancestor columns above `level` and
+    drop the rest -- at and below a row's own depth they are a copy of `name`
+    or empty, and would just be noise on every sheet."""
+    keep = set(ancestor_cols(sheet, upto=level))
+    drop = [c for c in ancestor_cols(sheet) if c not in keep]
+    return sheet.drop(columns=drop) if drop else sheet
+
+
 def write_outputs(r):
     out_dir = r["out_dir"]
     df = r["result"]
@@ -978,8 +1092,9 @@ def write_outputs(r):
         pd.DataFrame({"Statistical methods": describe_methods(r).split("\n")}).to_excel(
             w, sheet_name="Methods", index=False)
         _readme_frame(r).to_excel(w, sheet_name="ReadMe", index=False)
-        cov = r["volumes"].merge(r["metadata"][["order", "id", "acronym", "name", "level"]],
-                                 on="order", how="left")
+        meta_cols = ["order", "id", "name", "acronym", "level"]
+        meta_cols += ancestor_cols(r["metadata"]) + ["path"]
+        cov = r["volumes"].merge(r["metadata"][meta_cols], on="order", how="left")
         (cov[cov["voxel_count"] > 0]
          .sort_values(["sample", "level", "order"])
          .to_excel(w, sheet_name="Region_Volumes", index=False))
@@ -987,7 +1102,8 @@ def write_outputs(r):
             sheet = df[df["level"] == level].sort_values(
                 ["class_name", "metric", "p_value"])
             if not sheet.empty:
-                sheet.to_excel(w, sheet_name=f"L{int(level):02d}", index=False)
+                trim_ancestors(sheet, int(level)).to_excel(
+                    w, sheet_name=f"L{int(level):02d}", index=False)
     print(f"Wrote workbook: {xlsx}")
 
 
@@ -1017,14 +1133,29 @@ def describe_methods(r):
     add("# Statistical methods")
     add("")
     add(f"Generated by stats/group_stats.py on the run in `{r['out_dir']}`.")
+    if r.get("config_copy"):
+        add("")
+        add(f"The settings below come from `{r.get('config_path')}`, copied verbatim into this "
+            f"directory as `{CONFIG_COPY_NAME}` -- that copy, not the original, is what produced "
+            "these numbers.")
     add("")
     add("## Design")
     add(f"- **Groups**: {r['name_a']} (n={na}: {', '.join(r['samples_a'])}) vs "
         f"{r['name_b']} (n={nb}: {', '.join(r['samples_b'])}).")
-    add(f"- **Cell classes**: `classify_by: {r['classify_by']}` -> "
-        f"{', '.join(r['classes'])}."
-        + (" YOLO's neuron/glia call is discarded; neuron_* and glia_* sharing a marker "
-           "signature are summed." if r["classify_by"] == "marker" else ""))
+    if r.get("class_map"):
+        # Spell the map out: it is a decision about what the classes MEAN, so
+        # it belongs in the methods rather than in a config file the reader of
+        # the methods does not have.
+        add("- **Cell classes**: defined by an explicit `class_map` over the detector's "
+            "output folders (the folder names carry the YOLO soma call and the marker "
+            "combination):")
+        for cls in r["classes"]:
+            add(f"    - `{cls}` = " + " + ".join(f"`{d}`" for d in r["class_map"].get(cls, [])))
+    else:
+        add(f"- **Cell classes**: `classify_by: {r['classify_by']}` -> "
+            f"{', '.join(r['classes'])}."
+            + (" YOLO's neuron/glia call is discarded; neuron_* and glia_* sharing a marker "
+               "signature are summed." if r["classify_by"] == "marker" else ""))
     if r["formulas"]:
         add(f"- **Aggregate classes**: " + "; ".join(f"{k} = {v}" for k, v in r["formulas"].items())
             + ".")
@@ -1176,8 +1307,9 @@ def write_volume_report(r):
     an absolute volume from a region that is only partly in the field of view
     is not a measurement of that structure, and those two columns are how you
     see it (e.g. s18 cerebellum: coverage 0.33, ratio to median 0.28)."""
-    vol = r["volumes"].merge(
-        r["metadata"][["order", "id", "acronym", "name", "level"]], on="order", how="left")
+    meta_cols = ["order", "id", "name", "acronym", "level"]
+    meta_cols += ancestor_cols(r["metadata"]) + ["path"]
+    vol = r["volumes"].merge(r["metadata"][meta_cols], on="order", how="left")
     vol = vol[vol["voxel_count"] > 0].copy()
 
     group_of = {s: r["name_a"] for s in r["samples_a"]}
@@ -1193,7 +1325,7 @@ def write_volume_report(r):
         piv.columns = [f"{prefix}:{c}" for c in piv.columns]
         wide = piv if wide is None else wide.join(piv)
 
-    meta = r["metadata"].set_index("order")[["id", "acronym", "name", "level"]]
+    meta = r["metadata"].set_index("order")[[c for c in meta_cols if c != "order"]]
     wide = meta.join(wide, how="right")
     for value, prefix in (("volume_mm3", "abs_mm3"), ("relative_pct", "rel_pct")):
         for gname, gsamples in ((r["name_a"], r["samples_a"]), (r["name_b"], r["samples_b"])):
@@ -1218,6 +1350,9 @@ def write_volume_report(r):
                               "mask. Below ~0.8 the absolute volume is not a measurement of the "
                               "structure, only of the part that was imaged"),
         ("min_coverage", "Lowest coverage across all samples for this region"),
+        ("L0_name ... L<n>_name / path", "Where this region sits in the hierarchy: its ancestor "
+                                         "at each coarser level, and the full root-to-region "
+                                         "chain of names"),
         ("CAVEAT", "The warped annotation follows the registration, which was guided by "
                    "hand-drawn masks on a few coarse structures. Volumes at and near those "
                    "structures carry manual-segmentation accuracy; deeper subregions are "
@@ -1228,7 +1363,8 @@ def write_volume_report(r):
         for level in sorted(wide["level"].unique()):
             sheet = wide[wide["level"] == level]
             if not sheet.empty:
-                sheet.to_excel(w, sheet_name=f"L{int(level):02d}", index=False)
+                trim_ancestors(sheet, int(level)).to_excel(
+                    w, sheet_name=f"L{int(level):02d}", index=False)
     print(f"Wrote volume workbook: {xlsx}")
 
 
@@ -1243,6 +1379,8 @@ def write_per_sample_tables(r):
     totals = pd.concat([r["totals_df"], r["comb_totals"]], ignore_index=True)
     meta = r["metadata"].set_index("order")
     orders = r["metadata"]["order"].to_numpy()
+    piece_meta_cols = (["id", "name", "acronym", "level"]
+                       + ancestor_cols(r["metadata"]) + ["path"])
     vol_col = "covered_volume_mm3" if r["density_denominator"] == "covered" else "volume_mm3"
 
     for sample in r["samples_a"] + r["samples_b"]:
@@ -1258,7 +1396,7 @@ def write_per_sample_tables(r):
         for cls, g in sub.groupby("class_name"):
             count = g.set_index("order")["count"].reindex(orders).fillna(0.0)
             tv = float(tot.get(cls, 0) or 0)
-            piece = meta.loc[orders, ["id", "acronym", "name", "level"]].copy()
+            piece = meta.loc[orders, piece_meta_cols].copy()
             piece["order"] = orders
             piece["class_name"] = cls
             piece["formula"] = r["formulas"].get(cls, "")
@@ -1280,7 +1418,8 @@ def write_per_sample_tables(r):
             for level in sorted(table["level"].unique()):
                 sheet = table[table["level"] == level].sort_values(["class_name", "order"])
                 if not sheet.empty:
-                    sheet.to_excel(w, sheet_name=f"L{int(level):02d}", index=False)
+                    trim_ancestors(sheet, int(level)).to_excel(
+                        w, sheet_name=f"L{int(level):02d}", index=False)
         print(f"Wrote per-sample summary: {path}")
 
 

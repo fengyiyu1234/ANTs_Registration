@@ -84,7 +84,20 @@ def test_ontology():
     assert rolled[o.root_order] == 10
     assert list(o.order_of_ids([999])) == [-1]
     assert len(o.descendants_of([10])) == 3
-    print("  ok: ontology (order, levels, rollup, unknown ids, subtree)")
+
+    # every row carries its own ancestry, so a level sheet reads on its own
+    m = o.metadata_frame().set_index("acronym")
+    # Full NAMES, not acronyms: these columns exist to be read, and an acronym
+    # ancestry is unreadable without the ontology memorised.
+    assert list(m.loc["A1", ["L0_name", "L1_name", "L2_name"]]) == ["root", "Area A", "Area A1"]
+    # a region shallower than the column's level has no ancestor there
+    assert m.loc["A", "L2_name"] == ""
+    assert m.loc["A1", "path"] == "root > Area A > Area A1"
+    assert m.loc["A1", "parent_name"] == "Area A"
+    # acronyms stay available for anyone who wants the compact form
+    assert list(o.metadata_frame("acronym").set_index("acronym")
+                .loc["A1", ["L1_acronym", "L2_acronym"]]) == ["A", "A1"]
+    print("  ok: ontology (order, levels, rollup, unknown ids, subtree, ancestry)")
 
 
 def test_marker_recoding():
@@ -156,6 +169,107 @@ def test_class_resolution_guard():
             {"good": good, "half": half}, ["GFP"], "marker")
         assert any("different number of folders" in p for p in problems), problems
     print("  ok: class-resolution guard catches collapsed and asymmetric classes")
+
+
+def test_class_map_guard():
+    """An explicit class_map is checked for the three ways it can be wrong,
+    all of which are silent: a folder claimed twice, a folder claimed by
+    nobody, a folder a sample does not have."""
+    with tempfile.TemporaryDirectory() as root:
+        sdir = os.path.join(root, "s1")
+        for c in CLASSES:                      # neuron/glia x GFP/GFP_Sox9
+            _write_cells(sdir, c, [100], ["Area A1"])
+        dirs = {"s1": sdir}
+
+        good = {"glia_MADM": ["glia_GFP"], "glia_MADM_Sox9": ["glia_GFP_Sox9"],
+                "non_glia_MADM": ["neuron_GFP"], "non_glia_MADM_Sox9": ["neuron_GFP_Sox9"]}
+        assert cell_tables.check_class_resolution(
+            dirs, list(good), "marker", good) == []
+
+        # A folder in no class: those cells vanish from every count and every
+        # denominator, and nothing downstream looks wrong -- so it is an error.
+        partial = {k: v for k, v in good.items() if k != "non_glia_MADM_Sox9"}
+        problems = cell_tables.check_class_resolution(dirs, list(partial), "marker", partial)
+        assert any("in no class_map entry" in p and "neuron_GFP_Sox9" in p
+                   for p in problems), problems
+
+        # The same folder in two classes: double counting, and the classes
+        # stop being mutually exclusive.
+        overlap = dict(good)
+        overlap["non_glia_MADM"] = ["neuron_GFP", "glia_GFP"]
+        problems = cell_tables.check_class_resolution(dirs, list(overlap), "marker", overlap)
+        assert any("counted twice" in p for p in problems), problems
+
+        typo = dict(good, glia_MADM=["glia_GFPP"])
+        problems = cell_tables.check_class_resolution(dirs, list(typo), "marker", typo)
+        assert any("does not have" in p for p in problems), problems
+
+        # Naming variants still resolve, same as everywhere else.
+        vdir = os.path.join(root, "s2")
+        for c in ("glia_3_GFP", "glia_GFP_Sox9", "neuron_3_GFP", "neuron_GFP_Sox9"):
+            _write_cells(vdir, c, [100], ["Area A1"])
+        assert cell_tables.resolve_class_dirs(
+            vdir, "glia_MADM", "marker", good) == ["glia_3_GFP"]
+    print("  ok: class_map guard catches double-claimed, unclaimed and missing folders")
+
+
+def test_class_map_end_to_end():
+    """The 2x2 (soma call x Sox9) grouping the TSC config uses: four classes
+    that are mutually exclusive AND exhaust the detector's folders, so each
+    one is the sum of its own folders and RegionProportion closes to 100%."""
+    with tempfile.TemporaryDirectory() as root:
+        ont, samples = _build_dataset(root)
+        class_map = {
+            "glia_MADM": ["glia_GFP"], "glia_MADM_Sox9": ["glia_GFP_Sox9"],
+            "non_glia_MADM": ["neuron_GFP"], "non_glia_MADM_Sox9": ["neuron_GFP_Sox9"]}
+        cfg = {
+            "ontology_json": ont, "samples": samples,
+            "groups": {"a": {"name": "Control", "samples": ["c1", "c2", "c3"]},
+                       "b": {"name": "Exp", "samples": ["e1", "e2", "e3"]}},
+            "class_map": class_map,
+            "combined_categories": {
+                "glia_all": [{"sign": "+", "class": "glia_MADM"},
+                             {"sign": "+", "class": "glia_MADM_Sox9"}]},
+            "metrics": ["Count", "RegionProportion"],
+            "region_filter": {"levels": [2]},
+            "output": {"dir": os.path.join(root, "out_map")},
+        }
+        cfg_path = os.path.join(root, "cfg_map.yaml")
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump(cfg, f)
+        r = group_stats.run_all(group_stats.load_config(cfg_path))
+        df = r["result"]
+
+        assert r["classes"] == list(class_map), r["classes"]
+        # marker mode would have collapsed neuron_* and glia_* together; the
+        # map must keep the soma call, which is the whole point here.
+        base = df[df["formula"] == ""]
+        assert set(base["class_name"]) == set(class_map), set(base["class_name"])
+
+        # Each class is exactly its own folder's cells.
+        cnt = df[(df["metric"] == "Count") & (df["name"] == "Area A1")]
+        raw = cell_tables.read_cell_registration(
+            cell_tables.class_csv_path(samples["c1"]["dir"], "glia_GFP"))
+        n_a1 = int((raw["region_id"] == 100).sum())
+        got = cnt[cnt["class_name"] == "glia_MADM"]["c1"].iloc[0]
+        assert got == n_a1, (got, n_a1)
+
+        # Mutually exclusive and exhaustive -> the four proportions close.
+        prop = df[(df["metric"] == "RegionProportion") & (df["formula"] == "")]
+        tot = prop.groupby("order")["mean_a"].sum()
+        assert np.allclose(tot.to_numpy(), 100.0), tot.to_dict()
+
+        # The marginal sum is still exact after the rollup.
+        g_all = df[(df["metric"] == "Count") & (df["class_name"] == "glia_all")
+                   & (df["name"] == "Area A1")]["mean_a"].iloc[0]
+        parts = cnt[cnt["class_name"].isin(["glia_MADM", "glia_MADM_Sox9"])]["mean_a"].sum()
+        assert np.isclose(g_all, parts), (g_all, parts)
+
+        # The definition has to survive into the methods, or the numbers are
+        # unreadable six months from now.
+        methods = group_stats.describe_methods(r)
+        assert "class_map" in methods and "glia_GFP" in methods, methods[:400]
+    print("  ok: class_map keeps the soma call, sums its folders, closes to 100%")
 
 
 def test_background_filter():
@@ -347,8 +461,18 @@ def test_end_to_end():
         group_stats.write_per_sample_trees(r)
         out = cfg["output"]["dir"]
         for f in ["region_stats.csv", "region_stats_by_level.xlsx",
-                  "per_sample/c1_region_summary.xlsx", "per_sample/c1_region_tree.xlsx"]:
+                  "per_sample/c1_region_summary.xlsx", "per_sample/c1_region_tree.xlsx",
+                  group_stats.CONFIG_COPY_NAME]:
             assert os.path.exists(os.path.join(out, f)), f
+        # The copy has to be byte-exact and re-runnable: a results directory
+        # whose settings have drifted from the file that made them is worse
+        # than one with no settings at all.
+        copy = os.path.join(out, group_stats.CONFIG_COPY_NAME)
+        assert open(copy, "rb").read() == open(cfg_path, "rb").read()
+        again = group_stats.load_config(copy)
+        assert again["output"]["dir"] == cfg["output"]["dir"]
+        # Re-running straight from the copy must not try to overwrite itself.
+        assert group_stats.save_config_copy(again, out) == copy
     print("  ok: end-to-end run, marker collapse, planted effect, outputs")
 
 
@@ -854,6 +978,7 @@ def main():
     print("stats/ smoke tests")
     for fn in (test_ontology, test_marker_recoding,
                test_real_naming_conventions_map_1to1, test_class_resolution_guard,
+               test_class_map_guard, test_class_map_end_to_end,
                test_background_filter, test_exclusion_before_rollup,
                test_relative_volume_excludes,
                test_volumes_and_coverage, test_grid_offset, test_bh_and_effect_size,

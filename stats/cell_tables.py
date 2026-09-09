@@ -12,6 +12,9 @@ Two differences from the ClearMap-era reader this replaces:
 
 * Cell classes can be collapsed by marker signature (`classify_by="marker"`),
   dropping the YOLO neuron/glia call. See marker_signature().
+
+* Or grouped by an explicit `class_map` when neither rule expresses the
+  grouping that matters -- see normalize_class_map().
 """
 import os
 import re
@@ -173,14 +176,49 @@ def class_csv_path(sample_dir, class_dir):
     return os.path.join(sample_dir, "cell_registration", class_dir, "cell_registration.csv")
 
 
-def resolve_class_dirs(sample_dir, class_label, classify_by="marker"):
+def normalize_class_map(raw):
+    """Config `class_map` -> {label: [folder, ...]}, or None if unset.
+
+    An explicit map is the third classification mode, next to 'marker' (drop
+    the soma call, group by marker signature) and 'full' (one class per
+    folder). Those two are RULES; a map is a decision. It exists because the
+    biologically meaningful grouping is not always derivable from the folder
+    name: in the TSC/MADM data every folder is GFP+ and/or RFP+, so which
+    reporter fired carries no information, and what does carry information is
+    the pair (soma call, Sox9) -- a 2x2 that neither rule can express.
+
+    Folder names are matched through normalize_class_key, so the numeric-token
+    naming variants ('neuron_3_GFP') resolve the same way they do everywhere
+    else and a map written against one sample's spelling still works.
+    """
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("class_map must be a mapping {class label: [folder, ...]}")
+    out = {}
+    for label, folders in raw.items():
+        if isinstance(folders, str):
+            folders = [folders]
+        if not folders:
+            raise ValueError(f"class_map['{label}'] is empty")
+        out[str(label)] = [str(f) for f in folders]
+    return out
+
+
+def resolve_class_dirs(sample_dir, class_label, classify_by="marker", class_map=None):
     """Every on-disk class folder in this sample that belongs to `class_label`.
 
     In marker mode a label like 'GFP_RFP' resolves to BOTH neuron_*_GFP_RFP
     and glia_*_GFP_RFP, and their counts get summed -- that summation is the
     whole point of marker mode, so it happens here rather than being left to
-    the caller. In full mode at most one folder matches."""
+    the caller. In full mode at most one folder matches. With a class_map the
+    label's folders are listed outright and everything else is ignored --
+    which is why check_class_resolution reports folders the map leaves out.
+    """
     actual = list_sample_classes(sample_dir)
+    if class_map is not None:
+        wanted = {normalize_class_key(f) for f in class_map.get(class_label, [])}
+        return [d for d in actual if normalize_class_key(d) in wanted]
     if classify_by == "marker":
         key = normalize_class_key(marker_signature(class_label))
         return [d for d in actual if normalize_class_key(marker_signature(d)) == key]
@@ -190,7 +228,7 @@ def resolve_class_dirs(sample_dir, class_label, classify_by="marker"):
     return [d for d in actual if normalize_class_key(d) == key]
 
 
-def check_class_resolution(sample_dirs, classes, classify_by="marker"):
+def check_class_resolution(sample_dirs, classes, classify_by="marker", class_map=None):
     """Guard the fuzzy class matching. Returns a list of human-readable
     problems, empty when everything resolves cleanly.
 
@@ -206,6 +244,9 @@ def check_class_resolution(sample_dirs, classes, classify_by="marker"):
        samples -- one sample contributing neuron+glia and another only neuron
        makes the group comparison an apples-to-oranges one.
     """
+    if class_map is not None:
+        return _check_class_map(sample_dirs, classes, class_map)
+
     problems = []
     per_sample = {}
     for sample, sdir in sample_dirs.items():
@@ -231,12 +272,72 @@ def check_class_resolution(sample_dirs, classes, classify_by="marker"):
     return problems
 
 
-def discover_classes(sample_dirs, classify_by="marker", explicit=None):
+def _check_class_map(sample_dirs, classes, class_map):
+    """The map-mode half of check_class_resolution.
+
+    A map cannot be checked the way a rule can: merging several folders of the
+    same soma type is the POINT here, so that guard would fire on every
+    correct map. What can still go wrong, and silently, is the arithmetic
+    around the map:
+
+    1. A folder claimed by two labels -- its cells would be counted twice, and
+       the classes would no longer be mutually exclusive, which is what
+       RegionProportion's denominator and every 'sums to the total' statement
+       rest on.
+    2. A folder ON DISK that no label claims -- those cells just disappear
+       from the analysis. This is the one a typo produces, and nothing
+       downstream would look wrong.
+    3. A folder a label names that a sample does not have -- that class is
+       then built from fewer populations in that sample than in the others.
+    """
+    problems = []
+    unknown = [c for c in classes if c not in class_map]
+    if unknown:
+        problems.append(f"classes {unknown} are not defined in class_map "
+                        f"(defined: {sorted(class_map)})")
+
+    owner = {}
+    for label in classes:
+        for folder in class_map.get(label, []):
+            key = normalize_class_key(folder)
+            if key in owner:
+                problems.append(
+                    f"folder '{folder}' is claimed by both '{owner[key]}' and '{label}' -- "
+                    "its cells would be counted twice and the classes would overlap")
+            else:
+                owner[key] = label
+
+    for sample, sdir in sample_dirs.items():
+        actual = list_sample_classes(sdir)
+        actual_keys = {normalize_class_key(d): d for d in actual}
+        missing = [f for label in classes for f in class_map.get(label, [])
+                   if normalize_class_key(f) not in actual_keys]
+        if missing:
+            problems.append(f"{sample}: class_map names folder(s) {sorted(missing)} that this "
+                            f"sample does not have (it has {sorted(actual)})")
+        unclaimed = sorted(d for k, d in actual_keys.items() if k not in owner)
+        if unclaimed:
+            problems.append(
+                f"{sample}: folder(s) {unclaimed} are on disk but in no class_map entry -- "
+                "those cells are silently absent from every count, every total and every "
+                "denominator. Add them to a class, or list them under exclude to say so "
+                "on purpose")
+    return problems
+
+
+def discover_classes(sample_dirs, classify_by="marker", explicit=None, class_map=None):
     """Canonical class labels across samples. Folder names are grouped by
     normalize_class_key so naming variants collapse into one label; the
-    shortest name in each group becomes the label."""
+    shortest name in each group becomes the label.
+
+    A class_map states the labels outright, so nothing is discovered: the map's
+    own keys are the classes, in the order they were written (an explicit
+    `classes` list may still narrow it, which check_class_resolution then
+    validates against the map)."""
     if explicit:
         return list(explicit)
+    if class_map is not None:
+        return list(class_map)
     names = sorted({n for d in sample_dirs for n in list_sample_classes(d)})
     if classify_by == "marker":
         names = sorted({marker_signature(n) for n in names})

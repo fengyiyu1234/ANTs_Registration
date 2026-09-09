@@ -131,17 +131,66 @@ class Ontology:
         counts = np.bincount(orders[orders >= 0], minlength=self.n).astype(float)
         return counts, unknown
 
-    def metadata_frame(self):
+    def ancestor_labels(self, field="name"):
+        """-> dict {"L<k>_<field>": array over orders} for every level k in the
+        tree: each region's ancestor at depth k, itself at its own depth, and
+        "" for levels below it.
+
+        A per-level sheet on its own does not say where its regions sit: at
+        level 6, "SSp-bfd" and "CA1" are just two rows. These columns put the
+        whole ancestry on every row, so a level sheet can be read (and
+        filtered, and pivoted) without cross-referencing a coarser one.
+
+        `field` is "name" (the default -- full structure names, which is what
+        these columns exist to be READ) or "acronym" (compact, for a sheet
+        that will be pivoted rather than read). Acronyms lose the point here:
+        "CTXpl" tells you nothing you did not already know from the row's own
+        acronym unless you have the ontology memorised.
+        """
+        values = {"name": self.names, "acronym": self.acronyms}.get(field)
+        if values is None:
+            raise ValueError(f"field must be 'name' or 'acronym', got {field!r}")
+        cols = {}
+        for k in range(int(self.levels.max()) + 1):
+            anc = self.ancestor_at_level(k)
+            # anc = -1 for regions shallower than k; clip before indexing so
+            # the -1 does not silently read the last element of the array.
+            got = values[np.clip(anc, 0, None)]
+            cols[f"L{k}_{field}"] = np.where(anc >= 0, got, "").astype(object)
+        return cols
+
+    def name_paths(self, sep=" > "):
+        """-> array over orders: the full root-to-region chain of names.
+        One forward pass; pre-order guarantees the parent is built first."""
+        paths = np.empty(self.n, dtype=object)
+        for o in range(self.n):
+            p = self.parent_order[o]
+            paths[o] = self.names[o] if p < 0 else f"{paths[p]}{sep}{self.names[o]}"
+        return paths
+
+    def metadata_frame(self, ancestor_field="name"):
+        """Order-indexed region metadata, ancestry included.
+
+        `name` comes before `acronym` on purpose: the name is what gets read,
+        the acronym is kept as the one short label that joins these tables to
+        atlas tools and to the acronyms printed on atlas figures.
+        """
         import pandas as pd
 
-        return pd.DataFrame({
+        cols = {
             "order": np.arange(self.n),
             "id": self.ids,
-            "acronym": self.acronyms,
             "name": self.names,
+            "acronym": self.acronyms,
             "level": self.levels,
+            "parent_name": np.where(
+                self.parent_order >= 0,
+                self.names[np.clip(self.parent_order, 0, None)], "").astype(object),
             "parent_id": np.where(self.parent_order >= 0, self.ids[self.parent_order], -1),
-        })
+        }
+        cols.update(self.ancestor_labels(ancestor_field))
+        cols["path"] = self.name_paths()
+        return pd.DataFrame(cols)
 
     def descendants_of(self, ids):
         """All orders in the subtree(s) rooted at the given structure ids

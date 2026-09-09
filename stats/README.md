@@ -83,6 +83,33 @@ GFP | RFP | GFP_RFP | GFP_Sox9 | RFP_Sox9 | GFP_RFP_Sox9
 
 `classify_by: full` 可以退回 12 类原样比较。
 
+#### `class_map`：规则表达不了的分组就写死
+
+`classify_by` 是**规则**（`marker` = 按 marker 签名合并、丢掉 soma 判定；`full` =
+一个文件夹一类）。有些分组是**决定**，从文件夹名推不出来，这时用 `class_map`
+显式写清楚哪些文件夹合成哪一类，它优先于 `classify_by`：
+
+```yaml
+class_map:
+  glia_MADM:          [glia_GFP, glia_RFP, glia_GFP_RFP]
+  glia_MADM_Sox9:     [glia_GFP_Sox9, glia_RFP_Sox9, glia_GFP_RFP_Sox9]
+  non_glia_MADM:      [neuron_GFP, neuron_RFP, neuron_GFP_RFP]
+  non_glia_MADM_Sox9: [neuron_GFP_Sox9, neuron_RFP_Sox9, neuron_GFP_RFP_Sox9]
+```
+
+这就是 `configs/tsc_group_analysis.yaml` 用的口径：MADM 的两个 reporter 在那套样本里
+等价（12 个文件夹全是 GFP+ 和/或 RFP+，没有双阴的），所以真正携带信息的是
+`{glia, non_glia} × {Sox9−, Sox9+}` 这个 2×2 —— `marker` 会把 soma 判定整个丢掉，
+`full` 又保留 GFP/RFP 的无谓区分，两条规则都表达不出来。类名刻意叫 `non_glia`
+而不是 `neuron`：发育期 glia 形态像 neuron，YOLO 的 neuron 判定不可信。
+
+文件夹名按 `normalize_class_key` 匹配，所以 `glia_3_GFP` 那种拼法照样命中。
+启动时 `check_class_resolution` 检查三件都会静默出错的事，任何一条都会打 WARN：
+一个文件夹被两个类认领（重复计数、类之间不再互斥）、**一个文件夹没被任何类认领**
+（那批细胞从所有计数和所有分母里消失，打字错误就是这个后果）、某个样本没有 map
+里点名的文件夹。map 定义会原样写进 `methods.md` 和 ReadMe sheet —— 合了什么就是
+类的定义本身，光看类名恢复不出来。
+
 ### 关于类名里的 `3`（已在磁盘上改名，此节留作背景）
 
 曾经 s11/s12q/s12t 的类名是 `neuron_3_GFP`，s8/s10/s18 是 `neuron_GFP`。原因是那三个
@@ -345,7 +372,112 @@ config 里声明的 `batch` 分开。当前数据上它会报出两件事：
    完美的 3/3 分割本身就有 1/10 的概率偶然出现，目前按巧合处理，记在这里免得
    下次看到又重新惊讶一遍。
 
+## 组会用图：一条命令出全套
+
+```bash
+conda activate antsreg
+./scripts/make_figures.sh stats/configs/tsc_marker_ungated.yaml      # marker 6 类
+./scripts/make_figures.sh stats/configs/tsc_group_analysis.yaml      # MADM 4 类
+./scripts/make_figures.sh stats/configs/tsc_full_ungated.yaml        # 胞体 x marker 12 类
+```
+
+图落在 `<output.dir>/figures/` 下面按类型分的子目录里，每张同时出 PNG（贴幻灯片）
+和 PDF（矢量，进 Illustrator 还能改字）：
+
+```
+figures/
+  00_index/       summary_<指标>.png —— 从这里开始看
+  bars/           体积 / 计数 / 密度 / 覆盖率 / 类别组成
+  density/        逐样本密度图，一个类一张（最多的就是这些）
+  significance/   组间显著性图，只有真有东西的 family 才出现在这里
+  volcano/        火山图，一个类一张
+  forest/         效应量图，要手动跑才有
+```
+
+平铺一个目录到三十来个文件就没法找了，而全展开那一版有一百五十张。`density/` 单独
+分出来是因为它是一个类一层一张，数量上压过其他所有类型。
+
+**默认画遍 config 里的每一个细胞类**：marker 口径 11 个，MADM 口径 8 个。脚本不认死
+任何一套类名——base 类从 `class_map` 的 key（有的话）或 `classes` 列表读，"全部细胞"
+那个 combined 类靠比较成员集合找出来，不靠猜名字（`group_stats.class_vocabulary`）。
+所以同一条命令在两个口径上都能跑。设 `CLASS=<类名>` 可以只画一个类，调试时方便，
+但**全画才是该用的默认**：看完 p 值再挑要画的类，和看完 p 值再挑 `include_ids` 是
+同一种 p-hacking。
+
+### 先看 `summary_Density.png`
+
+一次全画会出五十来张图，没有索引根本没法用。那张图就是索引：一行一个细胞类，一列
+一个层级，格子里写"过校正的区数 / 被检验的区数"，有东西的格子才染蓝。打开任何一张
+图谱图之前先看它，就知道哪几个格子值得看。
+
+**它本身不是结果。** 一个格子就是一个校正 family，校正发生在格子内部；整张表里有
+七八十个 family，这件事没有被任何东西校正过。它是"去哪儿看"的地图，不是"发现了
+什么"的清单。
+
+三个脚本，共用 `stats/plot_style.py` 里的配色，所以对照组在哪张图上都是蓝的。
+
+| 脚本 | 出什么 |
+|---|---|
+| `plot_bars.py` | 体积 / 计数 / 密度柱状图，逐样本点叠在柱上；覆盖率图；类别组成堆叠图 |
+| `plot_atlas_panels.py` | 冠状面：逐样本密度图，和"显著区上红下蓝"的组间图 |
+| `plot_effects.py` | 索引图、火山图（默认出）和 forest 图（要手动跑，见下） |
+
+```bash
+# 柱状图：volume / cortex-count / cortex-density / composition
+python -m stats.plot_bars --config ... --preset all --region "Cerebral cortex"
+# 换任意区、任意指标
+python -m stats.plot_bars --config ... --regions "Hippocampal formation,Isocortex" \
+       --metric Density --classes GFP_any
+
+# 图谱切面：--n-coronal 1 是中央那一刀（幻灯片用），调大出一排 survey。
+# --all-classes 一次画完所有类，图谱只加载一次，比在 shell 里套循环快得多
+python -m stats.plot_atlas_panels --config ... --mode both \
+       --all-classes --metric Density --levels 3,5
+python -m stats.plot_atlas_panels --config ... --mode both \
+       --class-name GFP_any --metric Density --level 5      # 只要一个类
+
+# 索引图和火山图
+python -m stats.plot_effects --config ... --kind summary --metric Density
+python -m stats.plot_effects --config ... --kind volcano --all-classes \
+       --metric Density --levels 2,3,5
+# forest 图：横轴就是 Hedges' g，所以不在 make_figures.sh 的默认清单里，
+# 需要一张效应量图时再手动跑
+python -m stats.plot_effects --config ... --kind forest --metric Density --level 5 --top 20
+```
+
+### 这几张图里被刻意设计过的地方
+
+* **柱状图一定画出每一只。** n=3v3，柱+误差棒只是两个数字装成分布的样子，看不出
+  差异是不是一只动物扛起来的。点的形状按样本固定，同一只在每张图上都是同一个形状。
+  误差棒是 SD 不是 SEM——SEM 在 n=3 时只有三分之一长，看着像根本没有的精度。
+* **小多图，不是一根共享坐标轴。** GFP 的细胞数是 GFP_RFP_Sox9 的十倍，摆一起画
+  小的那些就只剩一条缝。每个 panel 自己一根从 0 起的轴。
+* **体积图后面永远跟一张覆盖率图。** 半脑是手切的，"体积小"可能是脑小，也可能是
+  切得多。覆盖率是把这两件事分开的唯一依据，不放上去等于请人把解剖误差读成生物学。
+* **图谱上只有一种灰。** 灰 = 测了但没到 raw p < alpha，这是一个结果。根本没测的区
+  留白，因为它没有可报告的东西——给它上色只会让人把"没有结果"读成"没有差异"。
+* **显著性图分两档，靠描边不是靠第二套颜色。** 填色 + 黑描边 = 过了 family 校正；
+  只填色不描边 = 只到 raw p < alpha，没扛住校正。两档共用同一条发散色标，所以效应
+  大小可以直接跨档比。没描边的区是**线索不是结论**——它是这个 family 测的几十个区
+  里的一个，校正的意义恰恰就是这类区里有一部分是碰运气碰出来的。
+* **两档都空的 family 根本不出图。** 一整张均匀的灰不比索引图多说任何事，还会把
+  `significance/` 淹掉。这个目录里出现的每一张，都是真有东西可看的。
+* **火山图上那条虚线不是 p=0.05。** 是该 family 的校正实际要求的原始 p（BH 下就是
+  过关行里最大的那个 raw p）。画 0.05 等于展示一条从没用过的门槛。
+* **柱状图上不打星号，也不写 g。** 只打 `p_adj`，不显著就明写 n.s.；原始 p 过 0.05
+  但校正后没过的，写成 `n.s. (raw p = ...)`。要看效应量就去看 forest 图。
+* **没被检验的区一律不画。** 柱状图里 `root`（比最浅的检验层还浅）和被
+  `region_filter` 丢掉的区直接不出 panel，图谱上留白。一根没有 p 值的柱子摆在有
+  p 值的柱子旁边，等于请人把两种不同性质的陈述当成一回事比。真要看，
+  `plot_bars.py --include-untested` 会把它们加回来并标明为什么没有检验。
+* **L6 及更深的显著图标题里会加一句"按 family 读"。** 深层是一次全脑自由搜索，
+  染色的区是线索不是逐区结论。
+
 ## 热图
+
+下面这两个是**探索**工具，和上一节的组会用图分工不同：`plot_heatmaps.py` 一次铺开
+冠状+矢状十张切面用来找线索，napari 那个用来现场翻；要往幻灯片上放的是上一节的
+`plot_atlas_panels.py`。三者共用 `region_maps.py`，颜色含义一致。
 
 **静态图**（`stats/plot_heatmaps.py`）：把某个 (level, 类别, 指标) 的统计量画到图谱
 切面上，冠状面和矢状面各一行。
@@ -395,7 +527,12 @@ python tools/stats_view.py
 ├── qc_depth_sinks.csv            真丢失沉淀在哪些区
 ├── qc_per_sample.csv / qc_marker_composition.csv / qc_separation.csv
 ├── region_stats.csv              长表，全部结果
-├── region_stats_by_level.xlsx    ReadMe + 每层一个 sheet + 分区体积
+├── region_stats_by_level.xlsx    ReadMe + 每层一个 sheet + 分区体积。每个 sheet 都带上级
+│                                 层的 `L<k>_name` 列（**全名**，只到本层之上）和 `path`
+│                                 全名链，所以 L07 sheet 里能直接把 L05_name 筛成
+│                                 "Isocortex"，看这个大区下面的所有子区，不用回头对照粗
+│                                 层 sheet。要紧凑的缩写版就把 Ontology.metadata_frame
+│                                 的 ancestor_field 改成 "acronym"
 ├── region_volumes.csv / .xlsx    逐区体积报告：每样本绝对 mm³ + 相对 % + 覆盖率，
 │                                 加两组均值/SD。被排除的区不在其中
 ├── per_sample_region_direct_volumes.csv
