@@ -17,7 +17,13 @@
 #   右上的打分曲线要有一个清楚的峰；far_gap 越大说明位置越确定。曲线平或者多峰时，
 #   位置是不可信的，后面 SyN 贴得再好也没用。
 
-output_dir: /path/to/output/sections2d
+# 【批量】给数据文件夹：里面每个 *.tif / *.tiff 都是一张切片，名字 = 文件名去掉扩展名。
+# 也可以不写在这里，命令行给：--input-dir /path/to/sections（这时输出默认到 <文件夹>/registration）。
+# 不给 input_dir 时，才需要在下面 sections 里逐张列出 image。
+input_dir: /path/to/sections
+# input_pattern: "*.tif"     # 只要文件夹里的一部分文件时用，例如 "*_s01*.tif"
+
+output_dir: /path/to/output/sections2d   # 可省略：默认 <input_dir>/registration
 
 atlas:
   # 图谱预设名（configs/atlas_presets_local.yaml）、custom、或 brainglobe。
@@ -76,13 +82,17 @@ section_defaults:
   # 能被发现。确实是例外的切片，在它自己那条里覆盖 anterior / dorsal。
   anterior: left
   dorsal: up
+  # true = 只搜上面给定的朝向 ±20°，不试另外 7 种。装片方向确定时用：错的朝向有时反而打分更好。
+  # lock_orientation: true
 
   cells_x_col: x             # cells_csv 里细胞坐标列名，单位是【原图像素】
   cells_y_col: y
 
+# 有 input_dir 时这里【可以整段不写】；写了的条目按 name（文件名去掉扩展名）覆盖那张切片的字段，
+# 不用写 image。文件夹里没有、但写了 image 的条目会额外加进来。
 sections:
   - name: m1_sec03
-    image: /path/to/m1_sec03.tif
+    image: /path/to/m1_sec03.tif   # 有 input_dir 时不用写
 
     # 朝向用 section_defaults 里的 anterior: left / dorsal: up。
     # 想对某张切片做完全不设前提的朝向搜索（两种镜像 × 12 个旋转），在这里写 anterior: null 和 dorsal: null。

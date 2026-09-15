@@ -373,12 +373,17 @@ def orientation_inits(sec):
     hinted pose with a +-20 degree wobble, plus the seven other 90-degree /
     mirror poses once each, so a section mounted flipped or turned is still
     found -- and reported against the hint (matches_hint) rather than forced
-    into it. Without hints: both mirror states x 12 rotations."""
+    into it. lock_orientation: only the hinted pose and its wobble -- for
+    batches whose mounting is known, where a wrong pose can still outscore the
+    right one (seen: a Keyence P30 section, olfactory bulb plainly on the left,
+    won at 180 degrees). Without hints: both mirror states x 12 rotations."""
     base = _hint_matrix(sec)
     if base is not None:
+        wobble = [_rot(th) @ base for th in (-20, -10, 0, 10, 20)]
+        if sec.get("lock_orientation"):
+            return wobble
         others = [_rot(k * 90) @ np.diag([1.0, s]) for s in (1.0, -1.0) for k in range(4)]
-        return [_rot(th) @ base for th in (-20, -10, 0, 10, 20)] + \
-            [M for M in others if not np.allclose(M, base)]
+        return wobble + [M for M in others if not np.allclose(M, base)]
     return [_rot(th) @ np.diag([1.0, s]) for s in (1.0, -1.0) for th in range(0, 360, 30)]
 
 

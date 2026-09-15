@@ -27,9 +27,28 @@ _TIFF_SUFFIXES = {".tif", ".tiff", ".lsm", ".btf", ".tf8"}
 _VENDOR_SUFFIXES = {".czi", ".nd2", ".lif", ".oib", ".oir", ".vsi", ".ims"}
 _EDITOR_DPI = {72.0, 96.0, 150.0, 300.0, 600.0}
 _UM_PER = {"µm": 1.0, "um": 1.0, "micron": 1.0, "microns": 1.0, "\\u00b5m": 1.0, "nm": 1e-3, "mm": 1e3}
+IMAGE_PATTERNS = ("*.tif", "*.tiff")
 
 
 # ----------------------------------------------------------------- reading
+
+def find_section_images(folder, patterns=None):
+    """Image files directly inside folder (subfolders, e.g. a registration
+    output folder, are not searched), sorted by name. patterns: a glob or a
+    list of globs, default IMAGE_PATTERNS."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"not a folder: {folder}")
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    found = {}
+    for pattern in patterns or IMAGE_PATTERNS:
+        for p in folder.glob(pattern):
+            # Skip macOS resource forks (._x.tif) and Office/Photoshop lock files (~$x.tif).
+            if p.is_file() and not p.name.startswith(("._", "~$")):
+                found.setdefault(str(p).lower(), p)     # case-insensitive filesystems match twice
+    return sorted(found.values(), key=lambda p: p.name)
+
 
 def _pixel_size(tf, page):
     """{'pixel_size_um': float | None, 'pixel_size_note': str}."""

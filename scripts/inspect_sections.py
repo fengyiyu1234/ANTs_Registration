@@ -8,6 +8,7 @@ src/registration_ants/section_io.py.
 
 Usage (antsreg env):
 
+    python scripts/inspect_sections.py /path/to/sections --png-dir /tmp/inspect      # a whole folder
     python scripts/inspect_sections.py /path/to/sections/*.tif --png-dir /tmp/inspect
     python scripts/inspect_sections.py --config configs/my_sections.yaml --png-dir /tmp/inspect
 
@@ -86,7 +87,7 @@ def _snippet(info):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paths", nargs="*", help="image files or globs")
+    ap.add_argument("paths", nargs="*", help="image files, globs, or folders (every *.tif / *.tiff in it)")
     ap.add_argument("--config", help="a sections config: inspect every section image it lists")
     ap.add_argument("--png-dir", help="write a thumbnail sheet per file here")
     ap.add_argument("--z-projection", default="max")
@@ -95,7 +96,10 @@ def main():
 
     files = []
     for p in args.paths:
-        files += sorted(glob.glob(p)) or [p]
+        if Path(p).is_dir():
+            files += [str(x) for x in section_io.find_section_images(p)]
+        else:
+            files += sorted(glob.glob(p)) or [p]
     if args.config:
         import register_sections_2d as cli
         files += [s["image"] for s in cli.load_sections_config(args.config)["sections"]]

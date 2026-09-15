@@ -42,9 +42,10 @@ found first, then the section is registered in 2D onto that plane:
    section; cell centroids mapped to 3D atlas coordinates and region ids.
 
 ```bash
-python scripts/inspect_sections.py /path/to/sections/*.tif --png-dir /tmp/inspect   # first: what are these files?
+python scripts/inspect_sections.py /path/to/sections --png-dir /tmp/inspect   # first: what are these files?
 cp configs/sections2d.example.yaml configs/my_sections.yaml   # then edit
-python scripts/register_sections_2d.py configs/my_sections.yaml
+# every *.tif / *.tiff in the folder, named by file name; results in <folder>/registration
+python scripts/register_sections_2d.py configs/my_sections.yaml --input-dir /path/to/sections
 python tests/test_section2d_smoke.py                          # synthetic recovery test
 ```
 
