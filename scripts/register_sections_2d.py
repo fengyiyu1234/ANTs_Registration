@@ -22,7 +22,11 @@ a section that fails is reported and the rest still run.
 Per section, <output_dir>/<name>/ gets qc.png (look at it first), plane.json,
 search_candidates.csv, labels_in_section_{affine,syn}.nii.gz, the transforms,
 and cells_registered.csv when cells_csv is given. <output_dir>/summary.csv
-collects plane.json across sections.
+collects plane.json across sections, and <output_dir>/viewer/ holds the whole
+batch stacked for Registration_toolkit/single_sample.py (z slider = section;
+see src/registration_ants/section_viewer.py):
+
+    python <Registration_toolkit>/single_sample.py <output_dir>/viewer/single_sample.yaml
 """
 import argparse
 import json
@@ -45,7 +49,7 @@ import pandas as pd
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from registration_ants import atlas_utils, config as config_mod, section2d, section_io  # noqa: E402
+from registration_ants import atlas_utils, config as config_mod, section2d, section_io, section_viewer  # noqa: E402
 
 _HINTS = set(section2d._IMAGE_DIRS)
 
@@ -158,6 +162,8 @@ def main():
                                       f"(default {' and '.join(section_io.IMAGE_PATTERNS)})")
     ap.add_argument("--only", action="append", default=[], help="section name to run (repeatable)")
     ap.add_argument("--overwrite", action="store_true", help="redo sections that already have results")
+    ap.add_argument("--no-viewer", action="store_true",
+                    help="skip writing <output_dir>/viewer/ (the copy Registration_toolkit/single_sample.py opens)")
     args = ap.parse_args()
 
     cfg = load_sections_config(args.config, args.input_dir, args.output_dir, args.pattern)
@@ -209,6 +215,13 @@ def main():
             new = pd.concat([old[~old["name"].isin(new["name"])], new], ignore_index=True)
         new.to_csv(out, index=False)
         print(f"\nwrote {out}")
+    if not args.no_viewer:
+        try:
+            section_viewer.export_for_viewer(cfg)
+        except Exception:
+            traceback.print_exc()
+            print("viewer export FAILED -- the registration results are unaffected; "
+                  "rerun scripts/export_sections_for_viewer.py once fixed")
     if failed:
         sys.exit(f"{len(failed)} section(s) failed: {', '.join(failed)} (tracebacks above)")
 

@@ -47,6 +47,8 @@ python scripts/inspect_sections.py /path/to/sections --png-dir /tmp/inspect   # 
 cp configs/sections2d.example.yaml configs/my_sections.yaml   # then edit
 # every *.tif / *.tiff in the folder, named by file name; results in <folder>/registration
 python scripts/register_sections_2d.py configs/my_sections.yaml --input-dir /path/to/sections
+# the batch also writes <folder>/registration/viewer/ for Registration_toolkit (z slider = section)
+python ../Registration_toolkit/single_sample.py /path/to/sections/registration/viewer/single_sample.yaml
 python tests/test_section2d_smoke.py                          # synthetic recovery test
 ```
 
