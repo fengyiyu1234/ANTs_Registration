@@ -137,12 +137,33 @@ def main():
     print("RGB unmixing: DAPI recovered exactly; inseparable panel rejected")
     check_multichannel_and_inspection(rgb_path, dapi8, out_dir)
 
-    # The usual mounting hint (anterior left, dorsal up) on a section that is in
-    # fact mirrored and turned 110 degrees: the pose must still be found, and
-    # flagged as not matching the hint.
+    # anterior/dorsal is used as stated (+-20 degree wobble), never swapped for
+    # another 90-degree / mirror pose, and cannot be left out.
+    def rot_diff(a, b):
+        return abs((a - b + 180) % 360 - 180)
+
+    hinted = {"anterior": "left", "dorsal": "up"}
+    want = section2d.describe_matrix(section2d._hint_matrix(hinted))
+    for M in section2d.orientation_inits(hinted):
+        got = section2d.describe_matrix(M)
+        assert got["mirrored"] == want["mirrored"] and rot_diff(got["rotation_deg"], want["rotation_deg"]) <= 20 + 1e-6, got
+    try:
+        section2d.orientation_inits({"anterior": None, "dorsal": None})
+        raise AssertionError("a section without anterior/dorsal was accepted")
+    except ValueError:
+        pass
+    print("orientation: anterior/dorsal kept as given (only +-20 degree wobble), required")
+
+    # The phantom section is mirrored and turned ROTATION_DEG: state the
+    # 90-degree mounting nearest to that, the wobble + Similarity cover the rest.
+    dirs = list(section2d._IMAGE_DIRS)
+    mountings = [{"anterior": a, "dorsal": d} for a in dirs for d in dirs
+                 if {a, d} not in ({"left", "right"}, {"up", "down"}) and a != d]
+    mounting = min((m for m in mountings if section2d.describe_matrix(section2d._hint_matrix(m))["mirrored"]),
+                   key=lambda m: rot_diff(section2d.describe_matrix(section2d._hint_matrix(m))["rotation_deg"],
+                                          ROTATION_DEG))
     sec_cfg = {"name": "phantom", "image": str(rgb_path), "pixel_size_um": PIXEL_UM, "channel": "DAPI",
-               "panel_colors": colors, "cells_csv": str(out_dir / "cells.csv"),
-               "anterior": "left", "dorsal": "up"}
+               "panel_colors": colors, "cells_csv": str(out_dir / "cells.csv"), **mounting}
     search = {**section2d.SEARCH_DEFAULTS, "search_res_um": 80, "fine_top_k": 2, "n_workers": 4}
     reg = {**section2d.REGISTRATION_DEFAULTS, "register_res_um": RES, "reg_iterations": [40, 20, 10]}
     summary = section2d.process_section(sec_cfg, atlas, search, reg, out_dir, structures, overwrite=True)
@@ -153,7 +174,6 @@ def main():
     assert abs(summary["yaw_deg"] - TRUTH.yaw_deg) <= 3, summary["yaw_deg"]
     assert abs(summary["roll_deg"] - TRUTH.roll_deg) <= 3, summary["roll_deg"]
     assert summary["mirrored"], "mirror not recovered"
-    assert summary["orientation_matches_hint"] is False, "a pose contradicting the hint was not flagged"
     assert abs(summary["size_ratio"] - SIZE_RATIO) < 0.05, summary["size_ratio"]
     assert abs((summary["rotation_deg"] - ROTATION_DEG + 180) % 360 - 180) < 5, summary["rotation_deg"]
 

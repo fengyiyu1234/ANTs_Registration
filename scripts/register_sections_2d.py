@@ -120,14 +120,11 @@ def load_sections_config(path, input_dir=None, output_dir=None, pattern=None):
             # Fails here, before the atlas loads, if the colours are not separable.
             section_io.rgb_unmix_weights(sec["panel_colors"], channel)
         hints = [sec.get("anterior"), sec.get("dorsal")]
-        if sec.get("lock_orientation") and not all(hints):
-            raise ValueError(f"sections[{sec['name']}]: lock_orientation needs both anterior and dorsal")
-        if any(hints):
-            if not all(h in _HINTS for h in hints):
-                raise ValueError(f"sections[{sec['name']}]: anterior and dorsal must both be one of "
-                                 f"{sorted(_HINTS)} (or both left out for a full orientation search)")
-            if set(hints) in ({"left", "right"}, {"up", "down"}) or hints[0] == hints[1]:
-                raise ValueError(f"sections[{sec['name']}]: anterior and dorsal must be perpendicular")
+        if not all(h in _HINTS for h in hints):
+            raise ValueError(f"sections[{sec['name']}]: anterior and dorsal must both be one of {sorted(_HINTS)} "
+                             "(set them in section_defaults)")
+        if set(hints) in ({"left", "right"}, {"up", "down"}) or hints[0] == hints[1]:
+            raise ValueError(f"sections[{sec['name']}]: anterior and dorsal must be perpendicular")
         sections.append(sec)
     cfg["sections"] = sections
     return cfg

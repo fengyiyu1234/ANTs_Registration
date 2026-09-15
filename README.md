@@ -31,8 +31,9 @@ For ordinary immunofluorescence sections rather than a light-sheet volume.
 ANTs has no slice-to-volume registration, so each section's atlas plane is
 found first, then the section is registered in 2D onto that plane:
 
-1. **Orientation** — in-plane rotation and mirror state, from `anterior`/`dorsal`
-   hints if given, otherwise a full search.
+1. **Orientation** — in-plane rotation and mirror state as stated by the
+   required `anterior`/`dorsal` (only a ±20° wobble is searched; the mounting
+   is never guessed).
 2. **Plane search** — a Similarity registration (rotation + one scale) against
    every candidate plane on a grid of distance-from-midline × yaw × roll,
    scored by mutual information; then a finer grid around the best few.

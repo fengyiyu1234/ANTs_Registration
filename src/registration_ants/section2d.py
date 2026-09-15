@@ -356,35 +356,17 @@ def _hint_matrix(sec):
     return np.column_stack([-a, -d])
 
 
-def matches_hint(M, sec, tol_deg=45.0):
-    """Whether plane->section matrix M has the hinted mirror state and a
-    rotation within tol_deg of the hinted one (None without hints)."""
+def orientation_inits(sec):
+    """Starting plane->section matrices for the orientation stage: the pose
+    `anterior` + `dorsal` state (where they point in the displayed image) with
+    a +-20 degree wobble for a section laid down slightly crooked. The
+    mounting is given, never guessed: a wrong pose can outscore the right one
+    (seen: a Keyence P30 section, olfactory bulb plainly on the left, won at
+    180 degrees when the other 90-degree / mirror poses competed)."""
     base = _hint_matrix(sec)
     if base is None:
-        return None
-    got, want = describe_matrix(M), describe_matrix(base)
-    diff = abs((got["rotation_deg"] - want["rotation_deg"] + 180) % 360 - 180)
-    return got["mirrored"] == want["mirrored"] and diff <= tol_deg
-
-
-def orientation_inits(sec):
-    """Starting plane->section matrices for the orientation stage. With
-    `anterior` + `dorsal` hints (where they point in the displayed image): the
-    hinted pose with a +-20 degree wobble, plus the seven other 90-degree /
-    mirror poses once each, so a section mounted flipped or turned is still
-    found -- and reported against the hint (matches_hint) rather than forced
-    into it. lock_orientation: only the hinted pose and its wobble -- for
-    batches whose mounting is known, where a wrong pose can still outscore the
-    right one (seen: a Keyence P30 section, olfactory bulb plainly on the left,
-    won at 180 degrees). Without hints: both mirror states x 12 rotations."""
-    base = _hint_matrix(sec)
-    if base is not None:
-        wobble = [_rot(th) @ base for th in (-20, -10, 0, 10, 20)]
-        if sec.get("lock_orientation"):
-            return wobble
-        others = [_rot(k * 90) @ np.diag([1.0, s]) for s in (1.0, -1.0) for k in range(4)]
-        return wobble + [M for M in others if not np.allclose(M, base)]
-    return [_rot(th) @ np.diag([1.0, s]) for s in (1.0, -1.0) for th in range(0, 360, 30)]
+        raise ValueError(f"section {sec.get('name')!r}: anterior and dorsal are required")
+    return [_rot(th) @ base for th in (-20, -10, 0, 10, 20)]
 
 
 # --------------------------------------------------------------- the search
@@ -571,13 +553,8 @@ def search_plane(section, tissue, keep, atlas, sec, cfg, seed, log=print):
         rows += o_rows
         best_o = min(o_rows, key=lambda r: r["score"])
         R = _orthogonal_part(_row_M(best_o))
-        hint_ok = matches_hint(_row_M(best_o), sec)
         log(f"  orientation: rotation {best_o['rotation_deg']:.0f} deg, mirrored={best_o['mirrored']} "
             f"({len(o_rows)} starts)")
-        if hint_ok is False:
-            log(f"  WARNING: this section scores best in a pose that does NOT match anterior={sec['anterior']} / "
-                f"dorsal={sec['dorsal']} -- mounted flipped or turned? Using the better-scoring pose; check "
-                "qc.png, and set this section's own anterior/dorsal if the hint was right after all.")
 
         angles = [float(a) for a in cfg["coarse_angles_deg"]]
         step = float(cfg["coarse_ml_step_um"])
@@ -627,7 +604,6 @@ def search_plane(section, tissue, keep, atlas, sec, cfg, seed, log=print):
     far = ranked[(ranked["ml_um"] - best["ml_um"]).abs() >= cfg["far_um"]]
     best["far_gap"] = float(far["score"].iloc[0] - best["score"]) if len(far) else float("nan")
     best["n_candidates"] = int(len(df))
-    best["orientation_matches_hint"] = hint_ok
     return df, best
 
 
@@ -787,8 +763,7 @@ def process_section(sec, atlas, search_cfg, reg_cfg, out_dir, structures=None, o
 
     regs = register_to_plane(section, keep, atlas, best, reg_cfg, str(out / "transforms" / f"{name}_"))
     summary = {"name": name, **{k: best[k] for k in ("ml_um", "yaw_deg", "roll_deg", "score", "size_ratio",
-                                                     "rotation_deg", "mirrored", "far_gap", "n_candidates",
-                                                     "orientation_matches_hint")}}
+                                                     "rotation_deg", "mirrored", "far_gap", "n_candidates")}}
     labels = {}
     for key, reg in regs.items():
         if reg is None:

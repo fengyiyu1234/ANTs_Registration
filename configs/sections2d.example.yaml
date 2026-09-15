@@ -77,13 +77,9 @@ section_defaults:
   #   GFP: [0, 255, 0]
 
   # 切片在图上的朝向（第 0 行在上）：一般前(anterior)在左、上(dorsal)在上。
-  # 另外 7 种 90° 旋转 / 镜像也会各试一次；如果某张切片在别的朝向上打分更好，会用那个朝向
-  # 并在日志里 WARNING，plane.json 里 orientation_matches_hint = false —— 装片翻面/转向的切片
-  # 能被发现。确实是例外的切片，在它自己那条里覆盖 anterior / dorsal。
+  # 必填，按这里给的方向用，只在 ±20° 内微调角度。代码不会猜朝向：实测错的朝向有时打分反而更好。
   anterior: left
   dorsal: up
-  # true = 只搜上面给定的朝向 ±20°，不试另外 7 种。装片方向确定时用：错的朝向有时反而打分更好。
-  # lock_orientation: true
 
   cells_x_col: x             # cells_csv 里细胞坐标列名，单位是【原图像素】
   cells_y_col: y
@@ -94,8 +90,6 @@ sections:
   - name: m1_sec03
     image: /path/to/m1_sec03.tif   # 有 input_dir 时不用写
 
-    # 朝向用 section_defaults 里的 anterior: left / dorsal: up。
-    # 想对某张切片做完全不设前提的朝向搜索（两种镜像 × 12 个旋转），在这里写 anterior: null 和 dorsal: null。
 
     # 【可选】组织 mask。默认对降采样后的 log 图像做 Otsu；看 qc.png 左上的青色轮廓，
     # 不对就给固定阈值（原始强度单位），或者直接给一张手画的 mask。
@@ -110,11 +104,6 @@ sections:
     # 【可选】细胞坐标 CSV（原图像素）。输出 cells_registered.csv：平面坐标、3D 图谱坐标、
     # 距中线距离、脑区 id / 缩写 / 名称
     # cells_csv: /path/to/m1_sec03_cells.csv
-
-  - name: m1_sec07
-    image: /path/to/m1_sec07.tif
-    anterior: right            # 例外：这张装片时前后反了
-    dorsal: up
 
 search:
   search_res_um: 40            # 搜索分辨率；实测 2D Similarity 一次约 0.15 s
