@@ -1,0 +1,140 @@
+# 2D 矢状切片 → 3D 图谱的配准配置。
+#   conda activate antsreg
+#   python scripts/register_sections_2d.py configs/my_sections.yaml
+#
+# 流程（细节见 src/registration_ants/section2d.py 顶部 docstring）：
+#   1. 朝向：切片在图上怎么摆（旋转 / 是否镜像）
+#   2. 粗搜索：在一组候选矢状面（距中线距离 × yaw × roll）上各跑一次 Similarity
+#      （旋转 + 单一缩放 + 平移），按 MI 打分
+#   3. 细搜索：在最好的几个候选附近加密网格
+#   4. 在选中的平面上：Affine → SyN
+#
+# 为什么搜索用 Similarity 而不是 Affine：越靠外侧的矢状面越小。切片像素尺寸已知时，
+# 单一缩放 size_ratio 本身就是区分平面的信息；Affine 能各向异性拉伸去"凑"任何一个面，
+# 打分曲线会被抹平。所以 Affine 只在选定平面上跑一次。
+#
+# 每张切片输出在 <output_dir>/<name>/，【先看 qc.png】：
+#   右上的打分曲线要有一个清楚的峰；far_gap 越大说明位置越确定。曲线平或者多峰时，
+#   位置是不可信的，后面 SyN 贴得再好也没用。
+
+output_dir: /path/to/output/sections2d
+
+atlas:
+  # 图谱预设名（configs/atlas_presets_local.yaml）、custom、或 brainglobe。
+  # 【必须】转成规范方向：轴0 = 左→右，轴1 = 前→后，轴2 = 上→下。
+  # devccf_p04 预设自带的 orientation [1, -3, 2] 就是这个方向；别的图谱在这里覆盖
+  # orientation。启动时会用本体（嗅球 vs 小脑、皮层 L1 vs 下丘脑）自动检查前后、上下，
+  # 方向错了直接退出。左右无法检查，也不影响（矢状面分不出是哪个半球）。
+  #
+  # 【图谱年龄要和切片匹配】：size_ratio 是靠绝对尺寸区分平面的，P4 图谱配成年切片
+  # 会全部落在 scale_range 外面直接报错。
+  source: demba_p5
+  # demba_p5 预设（DeMBA_P5_reference.tif）本身没有 orientation。实测读进来是
+  # 轴0 = 左右（镜像重合 0.986）、轴1 = 上→下（皮层 L1 149 < 下丘脑 279）、
+  # 轴2 = 前→后（嗅球 63 < 小脑 470），所以转成规范方向是 [1, 3, 2]。
+  # 写在这里而不是预设里：3D 样本配置按各自成像方位用不同的 orientation。
+  orientation: [1, 3, 2]
+  # source: devccf_p04       # 预设自带 [1, -3, 2]，不用再写 orientation
+  # source: brainglobe
+  # resolution_um: 25        # brainglobe 时必填（Allen CCF 成年鼠）
+  # midline_voxel: 283       # 默认取组织包络在轴0 的中心
+
+# 所有切片共用的字段，单张切片里写了同名字段会覆盖这里
+section_defaults:
+  # 【先跑诊断】再填下面这些：
+  #   python scripts/inspect_sections.py /path/to/sections/*.tif --png-dir /tmp/inspect
+  # 它会报每个文件是 多通道灰度(CYX) / RGB 融合图(YXS) / 带 Z 层、位深、像素尺寸能不能信、
+  # 每个通道的覆盖度和饱和，给出建议的配准通道，并出一张每个通道的缩略图。
+
+  # 原图像素尺寸（µm）。Photoshop 等软件存的 TIFF 常写 72 dpi，那不是标定，诊断会报 UNKNOWN；
+  # 这时从共聚焦原始文件（.lsm/.czi/.nd2 元数据）里读。
+  pixel_size_um: 0.65
+
+  # 配准用哪个信号。选 DAPI / 自发荧光这种铺满组织的，不要用稀疏 marker。
+  #   整数       第几个平面：多通道灰度图的第几个通道；RGB 融合图的 R/G/B 之一
+  #   通道名     多通道灰度图：文件元数据里的通道名（OME / ImageJ Labels，诊断会列出来）
+  #              RGB 融合图：panel_colors 里的 marker 名，按颜色线性解混
+  #   sum        所有平面加起来（所有 marker 一起）
+  channel: 0
+
+  # 带 Z 层的文件怎么压成 2D：max / mean / 第几层（整数）
+  # z_projection: max
+
+  # 【只有 RGB 融合图才需要】每个 marker 融合时分配的显示颜色（满强度 [R, G, B]，0-255）。
+  # 解混的前提：目标 marker 的颜色不能是其他 marker 颜色的组合。例如 DAPI 蓝 +
+  # Sox9 品红 + GFP 绿可以分（DAPI = B − R）；再加一个纯红就分不开了
+  # （品红 = 红 + 蓝），启动时直接报错，这时改用 channel: sum 或单独导出 DAPI 灰度图。
+  # 融合图有饱和（被截到 255）的像素时解混不精确，日志里会报比例。
+  # panel_colors:
+  #   DAPI: [0, 0, 255]
+  #   Sox9: [255, 0, 255]
+  #   GFP: [0, 255, 0]
+
+  # 切片在图上的朝向（第 0 行在上）：一般前(anterior)在左、上(dorsal)在上。
+  # 另外 7 种 90° 旋转 / 镜像也会各试一次；如果某张切片在别的朝向上打分更好，会用那个朝向
+  # 并在日志里 WARNING，plane.json 里 orientation_matches_hint = false —— 装片翻面/转向的切片
+  # 能被发现。确实是例外的切片，在它自己那条里覆盖 anterior / dorsal。
+  anterior: left
+  dorsal: up
+
+  cells_x_col: x             # cells_csv 里细胞坐标列名，单位是【原图像素】
+  cells_y_col: y
+
+sections:
+  - name: m1_sec03
+    image: /path/to/m1_sec03.tif
+
+    # 朝向用 section_defaults 里的 anterior: left / dorsal: up。
+    # 想对某张切片做完全不设前提的朝向搜索（两种镜像 × 12 个旋转），在这里写 anterior: null 和 dorsal: null。
+
+    # 【可选】组织 mask。默认对降采样后的 log 图像做 Otsu；看 qc.png 左上的青色轮廓，
+    # 不对就给固定阈值（原始强度单位），或者直接给一张手画的 mask。
+    # tissue_threshold: 900
+    # tissue_mask: /path/to/m1_sec03_tissue.tif
+
+    # 【可选】破损 mask：非零 = 撕裂/折叠/气泡，这些像素不参与 metric。
+    # 视野要和原图一致，分辨率随意（会按比例对齐）。
+    # 注意别拿组织轮廓当这个用：那样 Affine 就不肯把切片放大去填满图谱（3D 里实测过）。
+    # damage_mask: /path/to/m1_sec03_damage.tif
+
+    # 【可选】细胞坐标 CSV（原图像素）。输出 cells_registered.csv：平面坐标、3D 图谱坐标、
+    # 距中线距离、脑区 id / 缩写 / 名称
+    # cells_csv: /path/to/m1_sec03_cells.csv
+
+  - name: m1_sec07
+    image: /path/to/m1_sec07.tif
+    anterior: right            # 例外：这张装片时前后反了
+    dorsal: up
+
+search:
+  search_res_um: 40            # 搜索分辨率；实测 2D Similarity 一次约 0.15 s
+  ml_range_um: [0, null]       # 平面中心距中线的范围；null = 到图谱组织外缘。知道大概位置就收窄
+  coarse_ml_step_um: 200
+  coarse_angles_deg: [-10, -5, 0, 5, 10]   # yaw 和 roll 各取这些值（5 个 = 25 种倾斜组合）
+  fine_ml_step_um: 40
+  fine_angle_step_deg: 2.5
+  fine_top_k: 3                # 细搜索围绕几个互不相邻的粗搜索候选（防止困在局部最优）
+  scale_range: [0.75, 1.3]     # 切片/图谱尺寸比的允许范围；null = 不限制
+  n_workers: 8                 # 并行进程数，每个进程单线程 + 固定随机种子
+  far_um: 300                  # far_gap：最优解和距离 ≥ 这么远的最好候选之间的分差
+  # 最后一步：从最好的几个候选出发做局部 pattern search（ml/yaw/roll 三维 26 邻域，
+  # 没有改进就步长减半）。网格本身不够：打分的"坑"很窄而且 ML 和 roll 耦合，
+  # DevCCF 合成切片上真值打分最好，网格却落在 100 µm / 3.7° 之外的错误平面上。
+  refine_starts: 3             # 0 = 跳过
+  refine_min_ml_step_um: 10
+  refine_min_angle_step_deg: 0.5
+
+registration:
+  register_res_um: 20          # Affine / SyN 的分辨率，一般等于图谱分辨率
+  syn: true                    # false = 只做 Affine（切片几乎没有形变时可以先这样看）
+  # mattes（MI）或 CC。免疫荧光和图谱模板的对比度常常不是局部线性关系，CC 会被带偏：
+  # DevCCF 合成切片上细胞 3D 误差中位数 Affine 26/18 µm，SyN+CC 38/34 µm（比不做还差），
+  # SyN+mattes 26/18 µm（面内误差降到 10~12 µm）。
+  syn_metric: mattes
+  syn_sampling: 32             # mattes = 直方图 bin 数；改 CC 时这里是半径（像素），填 4
+  reg_iterations: [100, 70, 30]
+  grad_step: 0.1
+  flow_sigma: 3                # 形变场平滑；切片形变小，可以调大（4~5）让 SyN 更保守
+  random_seed: 42              # ANTs 同样输入跑两次结果会不同，固定种子 + 单线程才能复现
+  n4_bias_correction: true
+  intensity_clip_percentiles: [0.5, 99.5]

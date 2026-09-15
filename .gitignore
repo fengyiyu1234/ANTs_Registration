@@ -7,8 +7,7 @@ __pycache__/
 venv/
 .DS_Store
 configs/*.yaml
-!configs/config.example.yaml
-!configs/atlas_presets.example.yaml
+!configs/*.example.yaml
 data/
 atlas/
 # stats/ working configs, same convention as configs/ above: the tracked
