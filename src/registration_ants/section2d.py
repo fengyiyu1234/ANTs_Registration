@@ -47,7 +47,7 @@ import tifffile
 from scipy import ndimage
 from skimage.filters import threshold_otsu
 
-from . import atlas_utils, transforms
+from . import atlas_utils, section_io, transforms
 
 SEARCH_DEFAULTS = {
     "search_res_um": 40,
@@ -229,19 +229,6 @@ def check_canonical_orientation(annotation, structures):
 
 # ----------------------------------------------------------------- section IO
 
-def load_section_array(path, channel=None):
-    """(rows, cols) float32 from a 2D TIFF, or one channel of a multichannel
-    one (channel axis = the shortest axis)."""
-    arr = np.squeeze(tifffile.imread(str(path)))
-    if arr.ndim == 3:
-        if channel is None:
-            raise ValueError(f"{path} has shape {arr.shape} (multichannel) -- set `channel` (e.g. the DAPI index)")
-        arr = np.take(arr, int(channel), axis=int(np.argmin(arr.shape)))
-    elif arr.ndim != 2:
-        raise ValueError(f"{path}: expected a 2D image or 2D + channels, got shape {arr.shape}")
-    return arr.astype(np.float32)
-
-
 def downsample_section(arr_rc, pixel_size_um, target_um):
     """(rows, cols) raw pixels -> ANTs 2D image (x = column, y = row) at
     target_um. Integer block-mean first (anti-aliasing), then a linear
@@ -358,18 +345,40 @@ def describe_matrix(M):
             "mirrored": bool(mirrored)}
 
 
+def _hint_matrix(sec):
+    """Plane->section orientation the anterior/dorsal hints describe, or None."""
+    anterior, dorsal = sec.get("anterior"), sec.get("dorsal")
+    if not (anterior and dorsal):
+        return None
+    a, d = np.array(_IMAGE_DIRS[anterior]), np.array(_IMAGE_DIRS[dorsal])
+    # Plane +x is posterior, +y ventral: the columns say where those two
+    # directions point in the section image.
+    return np.column_stack([-a, -d])
+
+
+def matches_hint(M, sec, tol_deg=45.0):
+    """Whether plane->section matrix M has the hinted mirror state and a
+    rotation within tol_deg of the hinted one (None without hints)."""
+    base = _hint_matrix(sec)
+    if base is None:
+        return None
+    got, want = describe_matrix(M), describe_matrix(base)
+    diff = abs((got["rotation_deg"] - want["rotation_deg"] + 180) % 360 - 180)
+    return got["mirrored"] == want["mirrored"] and diff <= tol_deg
+
+
 def orientation_inits(sec):
     """Starting plane->section matrices for the orientation stage. With
-    `anterior` + `dorsal` hints (where they point in the displayed image)
-    the mirror state is known and only a +-20 degree wobble is tried;
-    without, both mirror states x 12 rotations."""
-    anterior, dorsal = sec.get("anterior"), sec.get("dorsal")
-    if anterior and dorsal:
-        a, d = np.array(_IMAGE_DIRS[anterior]), np.array(_IMAGE_DIRS[dorsal])
-        # Plane +x is posterior, +y ventral: the columns say where those two
-        # directions point in the section image.
-        base = np.column_stack([-a, -d])
-        return [_rot(th) @ base for th in (-20, -10, 0, 10, 20)]
+    `anterior` + `dorsal` hints (where they point in the displayed image): the
+    hinted pose with a +-20 degree wobble, plus the seven other 90-degree /
+    mirror poses once each, so a section mounted flipped or turned is still
+    found -- and reported against the hint (matches_hint) rather than forced
+    into it. Without hints: both mirror states x 12 rotations."""
+    base = _hint_matrix(sec)
+    if base is not None:
+        others = [_rot(k * 90) @ np.diag([1.0, s]) for s in (1.0, -1.0) for k in range(4)]
+        return [_rot(th) @ base for th in (-20, -10, 0, 10, 20)] + \
+            [M for M in others if not np.allclose(M, base)]
     return [_rot(th) @ np.diag([1.0, s]) for s in (1.0, -1.0) for th in range(0, 360, 30)]
 
 
@@ -557,8 +566,13 @@ def search_plane(section, tissue, keep, atlas, sec, cfg, seed, log=print):
         rows += o_rows
         best_o = min(o_rows, key=lambda r: r["score"])
         R = _orthogonal_part(_row_M(best_o))
+        hint_ok = matches_hint(_row_M(best_o), sec)
         log(f"  orientation: rotation {best_o['rotation_deg']:.0f} deg, mirrored={best_o['mirrored']} "
             f"({len(o_rows)} starts)")
+        if hint_ok is False:
+            log(f"  WARNING: this section scores best in a pose that does NOT match anterior={sec['anterior']} / "
+                f"dorsal={sec['dorsal']} -- mounted flipped or turned? Using the better-scoring pose; check "
+                "qc.png, and set this section's own anterior/dorsal if the hint was right after all.")
 
         angles = [float(a) for a in cfg["coarse_angles_deg"]]
         step = float(cfg["coarse_ml_step_um"])
@@ -608,6 +622,7 @@ def search_plane(section, tissue, keep, atlas, sec, cfg, seed, log=print):
     far = ranked[(ranked["ml_um"] - best["ml_um"]).abs() >= cfg["far_um"]]
     best["far_gap"] = float(far["score"].iloc[0] - best["score"]) if len(far) else float("nan")
     best["n_candidates"] = int(len(df))
+    best["orientation_matches_hint"] = hint_ok
     return df, best
 
 
@@ -738,7 +753,8 @@ def process_section(sec, atlas, search_cfg, reg_cfg, out_dir, structures=None, o
     ants.config.set_ants_deterministic(True, seed)
 
     px = float(sec["pixel_size_um"])
-    raw = load_section_array(sec["image"], sec.get("channel"))
+    raw = section_io.load_registration_image(sec["image"], sec.get("channel"), sec.get("panel_colors"),
+                                             sec.get("z_projection", "max"), log)
     img = downsample_section(raw, px, reg_cfg["register_res_um"])
     if sec.get("tissue_mask"):
         tissue = _load_mask_on(sec["tissue_mask"], raw.shape, px, img)
@@ -766,7 +782,8 @@ def process_section(sec, atlas, search_cfg, reg_cfg, out_dir, structures=None, o
 
     regs = register_to_plane(section, keep, atlas, best, reg_cfg, str(out / "transforms" / f"{name}_"))
     summary = {"name": name, **{k: best[k] for k in ("ml_um", "yaw_deg", "roll_deg", "score", "size_ratio",
-                                                     "rotation_deg", "mirrored", "far_gap", "n_candidates")}}
+                                                     "rotation_deg", "mirrored", "far_gap", "n_candidates",
+                                                     "orientation_matches_hint")}}
     labels = {}
     for key, reg in regs.items():
         if reg is None:

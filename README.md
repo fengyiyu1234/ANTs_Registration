@@ -42,6 +42,7 @@ found first, then the section is registered in 2D onto that plane:
    section; cell centroids mapped to 3D atlas coordinates and region ids.
 
 ```bash
+python scripts/inspect_sections.py /path/to/sections/*.tif --png-dir /tmp/inspect   # first: what are these files?
 cp configs/sections2d.example.yaml configs/my_sections.yaml   # then edit
 python scripts/register_sections_2d.py configs/my_sections.yaml
 python tests/test_section2d_smoke.py                          # synthetic recovery test
@@ -51,7 +52,15 @@ The atlas must be in the canonical orientation (axis0 left→right, axis1
 anterior→posterior, axis2 dorsal→ventral — the `devccf_p04` preset already
 is); it is checked against the ontology at start-up. A sagittal section does
 not say which hemisphere it came from, so positions are reported as distance
-from the midline. Look at each section's `qc.png` before trusting it: the
+from the midline. DeMBA P5 (`demba_p5` preset) needs `orientation: [1, 3, 2]`
+in the sections config. `section_io.py` reads sections by their stored axes
+(`scripts/inspect_sections.py` reports them, plus bit depth, whether the pixel
+size is a real calibration, saturation and per-plane coverage): multichannel
+greyscale files take a channel index or metadata name; RGB composites (each
+marker already assigned a colour) are unmixed back to one marker with
+`channel: DAPI` + `panel_colors`, as long as that marker's colour is not a mix
+of the others' — otherwise `channel: sum`; Z stacks are projected
+(`z_projection`). Look at each section's `qc.png` before trusting it: the
 score-vs-position curve needs one clear peak (`far_gap` in `summary.csv`
 quantifies it). Calling `section2d.process_section` from your own script needs
 an `if __name__ == "__main__":` guard (worker processes are spawned).

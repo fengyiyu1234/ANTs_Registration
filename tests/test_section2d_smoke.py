@@ -22,7 +22,7 @@ from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ants  # noqa: E402
-from registration_ants import section2d  # noqa: E402
+from registration_ants import section2d, section_io  # noqa: E402
 
 RES = 40.0
 TRUTH = section2d.PlaneParams(ml_um=1000.0, yaw_deg=6.0, roll_deg=-4.0)
@@ -68,6 +68,48 @@ def make_section(atlas, out_dir):
     return path, A, c, sec
 
 
+def make_rgb_composite(gray_tif, colors, out_dir):
+    """8-bit additive composite: the grey section as DAPI plus sparse blobs for
+    the other markers, scaled so no channel clips. Returns (path, DAPI 0-150)."""
+    gray = tifffile.imread(gray_tif).astype(np.float32)
+    dapi = np.clip(np.round(gray / gray.max() * 150), 0, 150)
+    rng = np.random.default_rng(4)
+    rgb = dapi[..., None] * (np.array(colors["DAPI"]) / 255.0)
+    for name in colors:
+        if name == "DAPI":
+            continue
+        blobs = ndimage.gaussian_filter((rng.random(gray.shape) > 0.999).astype(np.float32), 3)
+        blobs = np.round(blobs / blobs.max() * 100)
+        rgb += blobs[..., None] * (np.array(colors[name]) / 255.0)
+    path = out_dir / "section_rgb.tif"
+    tifffile.imwrite(path, np.clip(np.round(rgb), 0, 255).astype(np.uint8), photometric="rgb")
+    return path, dapi
+
+
+def check_multichannel_and_inspection(rgb_path, dapi8, out_dir):
+    """The other common form: separate 8-bit greyscale channels (CYX) with
+    ImageJ calibration and channel names -- plus the RGB file's 72 dpi, which
+    must NOT come back as a pixel size."""
+    rgb = tifffile.imread(rgb_path)
+    markers = np.stack([rgb[..., 1], dapi8.astype(np.uint8), rgb[..., 0]])   # GFP, DAPI, Sox9 planes
+    mc_path = out_dir / "section_cyx.tif"
+    tifffile.imwrite(mc_path, markers, imagej=True, resolution=(1 / PIXEL_UM, 1 / PIXEL_UM),
+                     metadata={"axes": "CYX", "unit": "um", "Labels": ["GFP", "DAPI", "Sox9"]})
+    by_name = section_io.load_registration_image(mc_path, "DAPI", log=lambda *_: None)
+    assert np.array_equal(by_name, dapi8.astype(np.float32)), "multichannel channel-by-name mismatch"
+    assert np.array_equal(section_io.load_registration_image(mc_path, 1, log=lambda *_: None), by_name)
+    info, _, _ = section_io.inspect_image(mc_path)
+    assert info["kind"] == "channels" and info["n_planes"] == 3, info
+    assert abs(info["pixel_size_um"] - PIXEL_UM) < 1e-6, info["pixel_size_um"]
+    assert info["channel_names"] == ["GFP", "DAPI", "Sox9"], info["channel_names"]
+    assert info["suggested_channel"] == 1, [(s["label"], s["coverage_pct"], s["sparseness"]) for s in info["planes"]]
+
+    tifffile.imwrite(out_dir / "rgb_72dpi.tif", rgb, photometric="rgb", resolution=(72, 72), resolutionunit=2)
+    info, _, _ = section_io.inspect_image(out_dir / "rgb_72dpi.tif")
+    assert info["kind"] == "rgb" and info["pixel_size_um"] is None, (info["kind"], info["pixel_size_um"])
+    print("multichannel CYX: read by name/index, calibration + names parsed, DAPI suggested; 72 dpi rejected")
+
+
 def main():
     out_dir = Path(tempfile.mkdtemp(prefix="section2d_smoke_"))
     tmpl, ann, structures = make_phantom()
@@ -81,7 +123,26 @@ def main():
     cells = pd.DataFrame({"x": cols[pick], "y": rows[pick]})
     cells.to_csv(out_dir / "cells.csv", index=False)
 
-    sec_cfg = {"name": "phantom", "image": str(tif), "pixel_size_um": PIXEL_UM, "cells_csv": str(out_dir / "cells.csv")}
+    # Registration runs on an RGB composite (DAPI blue + two markers), the way
+    # confocal images usually come out, so the unmixing is exercised end to end.
+    colors = {"DAPI": [0, 0, 255], "Sox9": [255, 0, 255], "GFP": [0, 255, 0]}
+    rgb_path, dapi8 = make_rgb_composite(tif, colors, out_dir)
+    unmixed = section_io.load_registration_image(rgb_path, "DAPI", colors)
+    assert np.abs(unmixed - dapi8).max() <= 1.0, np.abs(unmixed - dapi8).max()
+    try:
+        section_io.rgb_unmix_weights({**colors, "Red": [255, 0, 0]}, "DAPI")
+        raise AssertionError("inseparable colours (magenta = red + blue) were accepted")
+    except ValueError:
+        pass
+    print("RGB unmixing: DAPI recovered exactly; inseparable panel rejected")
+    check_multichannel_and_inspection(rgb_path, dapi8, out_dir)
+
+    # The usual mounting hint (anterior left, dorsal up) on a section that is in
+    # fact mirrored and turned 110 degrees: the pose must still be found, and
+    # flagged as not matching the hint.
+    sec_cfg = {"name": "phantom", "image": str(rgb_path), "pixel_size_um": PIXEL_UM, "channel": "DAPI",
+               "panel_colors": colors, "cells_csv": str(out_dir / "cells.csv"),
+               "anterior": "left", "dorsal": "up"}
     search = {**section2d.SEARCH_DEFAULTS, "search_res_um": 80, "fine_top_k": 2, "n_workers": 4}
     reg = {**section2d.REGISTRATION_DEFAULTS, "register_res_um": RES, "reg_iterations": [40, 20, 10]}
     summary = section2d.process_section(sec_cfg, atlas, search, reg, out_dir, structures, overwrite=True)
@@ -92,6 +153,7 @@ def main():
     assert abs(summary["yaw_deg"] - TRUTH.yaw_deg) <= 3, summary["yaw_deg"]
     assert abs(summary["roll_deg"] - TRUTH.roll_deg) <= 3, summary["roll_deg"]
     assert summary["mirrored"], "mirror not recovered"
+    assert summary["orientation_matches_hint"] is False, "a pose contradicting the hint was not flagged"
     assert abs(summary["size_ratio"] - SIZE_RATIO) < 0.05, summary["size_ratio"]
     assert abs((summary["rotation_deg"] - ROTATION_DEG + 180) % 360 - 180) < 5, summary["rotation_deg"]
 

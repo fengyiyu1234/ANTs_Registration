@@ -62,6 +62,13 @@ def load_sections_config(path):
         for key in ("image", "tissue_mask", "damage_mask", "cells_csv"):
             if sec.get(key) and not Path(sec[key]).exists():
                 raise FileNotFoundError(f"sections[{sec['name']}].{key} not found: {sec[key]}")
+        channel = sec.get("channel")
+        # A marker name is a channel name on multichannel greyscale files (checked
+        # when the file is read) and an unmixing target on RGB composites -- only
+        # the latter can be checked this early, and only when panel_colors is given.
+        if isinstance(channel, str) and channel != "sum" and sec.get("panel_colors"):
+            # Fails here, before the atlas loads, if the colours are not separable.
+            section2d.section_io.rgb_unmix_weights(sec["panel_colors"], channel)
         hints = [sec.get("anterior"), sec.get("dorsal")]
         if any(hints):
             if not all(h in _HINTS for h in hints):
