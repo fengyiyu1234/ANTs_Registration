@@ -100,6 +100,122 @@ def test_ontology():
     print("  ok: ontology (order, levels, rollup, unknown ids, subtree, ancestry)")
 
 
+def test_laminar():
+    """Layers of two areas pooled into bins: shares close to 1 per readout, a
+    layer left out of a scheme stops the run, the ACAv-style label without the
+    word 'layer' is still a layer, and a bin an area has no label for is
+    undefined in area_mean rather than zero."""
+    from stats import laminar
+
+    ont_json = {"msg": [{"id": 1, "name": "root", "acronym": "root", "children": [
+        {"id": 315, "name": "Isocortex", "acronym": "Isocortex", "children": [
+            {"id": 10, "name": "Sensory area", "acronym": "SEN", "children": [
+                {"id": 11, "name": "Sensory area, layer 1", "acronym": "SEN1", "children": []},
+                {"id": 12, "name": "Sensory area, layer 2/3", "acronym": "SEN2/3", "children": []},
+                {"id": 13, "name": "Sensory area, layer 4", "acronym": "SEN4", "children": []},
+                {"id": 14, "name": "Sensory area, layer 5", "acronym": "SEN5", "children": []},
+                {"id": 15, "name": "Sensory area, layer 6a", "acronym": "SEN6a", "children": []},
+                {"id": 16, "name": "Sensory area, layer 6b", "acronym": "SEN6b", "children": []}]},
+            {"id": 20, "name": "Motor area", "acronym": "MOT", "children": [
+                {"id": 21, "name": "Motor area, Layer 1", "acronym": "MOT1", "children": []},
+                {"id": 22, "name": "Motor area, layer 2/3", "acronym": "MOT2/3", "children": []},
+                {"id": 24, "name": "Motor area, layer 5", "acronym": "MOT5", "children": []},
+                {"id": 25, "name": "Motor area, ventral part, 6a", "acronym": "MOT6a", "children": []},
+                {"id": 26, "name": "Motor area, ventral part, 6b", "acronym": "MOT6b", "children": []}]}]},
+        {"id": 900, "name": "Striatum", "acronym": "STR", "children": []}]}]}
+    names = {11: "Sensory area, layer 1", 12: "Sensory area, layer 2/3",
+             13: "Sensory area, layer 4", 14: "Sensory area, layer 5",
+             15: "Sensory area, layer 6a", 16: "Sensory area, layer 6b",
+             21: "Motor area, Layer 1", 22: "Motor area, layer 2/3",
+             24: "Motor area, layer 5", 25: "Motor area, ventral part, 6a",
+             26: "Motor area, ventral part, 6b", 10: "Sensory area", 900: "Striatum"}
+    # cells per label per class, identical for every animal except the KO
+    # animals move half of the glia L6a cells in SEN up to L2/3
+    base = {"glia_GFP": {11: 10, 12: 40, 13: 20, 14: 60, 15: 80, 16: 10, 21: 5,
+                         22: 30, 24: 50, 25: 60, 26: 5, 10: 7, 900: 99},
+            "neuron_GFP": {12: 100, 13: 50, 14: 100, 15: 100, 22: 80, 24: 90, 25: 90}}
+    with tempfile.TemporaryDirectory() as root:
+        ont_path = os.path.join(root, "ont.json")
+        with open(ont_path, "w") as f:
+            json.dump(ont_json, f)
+        samples = {}
+        for s in ["c1", "c2", "c3", "e1", "e2", "e3"]:
+            sdir = os.path.join(root, s)
+            samples[s] = {"dir": sdir}
+            jitter = {"c1": 0, "c2": 2, "c3": 4, "e1": 0, "e2": 2, "e3": 4}[s]
+            for cls, per in base.items():
+                per = dict(per)
+                if cls == "glia_GFP":
+                    per[11] += jitter
+                    if s.startswith("e"):
+                        per[15] -= 40
+                        per[12] += 40
+                ids = [rid for rid, n in per.items() for _ in range(n)]
+                _write_cells(sdir, cls, ids, [names[i] for i in ids])
+        cfg = {
+            "ontology_json": ont_path, "samples": samples,
+            "groups": {"a": {"name": "Control", "samples": ["c1", "c2", "c3"]},
+                       "b": {"name": "Exp", "samples": ["e1", "e2", "e3"]}},
+            "class_map": {"glia": ["glia_GFP"], "non_glia": ["neuron_GFP"]},
+            "combined_categories": {"all": [{"sign": "+", "class": "glia"},
+                                            {"sign": "+", "class": "non_glia"}]},
+            "laminar": {"area_min_cells": 1},
+            "output": {"dir": os.path.join(root, "out")},
+        }
+        cfg_path = os.path.join(root, "cfg.yaml")
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump(cfg, f)
+        r = laminar.run(group_stats.load_config(cfg_path))
+
+        lm = r["layer_map"].set_index("id")
+        assert lm.loc[25, "token"] == "6a" and lm.loc[25, "bin_three_bin"] == "L6", lm.loc[25]
+        assert lm.loc[21, "bin_three_bin"] == "upper"
+        assert pd.isna(lm.loc[10, "token"])
+        # Striatum is outside the root and never counted
+        assert 900 not in r["long"].merge(lm.reset_index()[["order", "id"]])["id"].values
+
+        v = r["values"]
+        sh = v[(v["metric"] == "LaminarShare") & (v["pooling"] == "pooled")]
+        closes = sh.groupby(["scheme", "readout"])[["c1", "e3"]].sum()
+        assert np.allclose(closes.to_numpy(), 1.0), closes
+
+        # glia in c1: bins exclude the 7 cells on the area parent (unassigned)
+        glia_c1 = sh[(sh["scheme"] == "three_bin") & (sh["readout"] == "glia")].set_index("bin")["c1"]
+        upper = 10 + 40 + 20 + 5 + 30
+        total = upper + (60 + 50) + (80 + 10 + 60 + 5)
+        assert np.isclose(glia_c1["upper"], upper / total), glia_c1
+
+        # the planted shift: KO glia have more upper and less L6
+        t = r["tests"]
+        row = t[(t["role"] == "primary") & (t["readout"] == "glia")].set_index("bin")
+        assert row.loc["upper", "log2fc"] > 0 and row.loc["L6", "log2fc"] < 0, row
+        assert "log2fc_without_c1" in t.columns and t.columns.get_loc("c1") > t.columns.get_loc("mean_b")
+
+        # MOT has no layer 4: in a scheme with its own L4 bin, area_mean must
+        # average L4 over SEN only, not count MOT as 0
+        cfg4 = group_stats.load_config(cfg_path)
+        cfg4["laminar"]["schemes"] = {"five": {"L1": ["1"], "L23": ["2/3"], "L4": ["4"],
+                                               "L5": ["5"], "L6": ["6a", "6b"]}}
+        r4 = laminar.run(cfg4, out_dir=os.path.join(root, "out4"))
+        v4 = r4["values"]
+        l4 = v4[(v4["metric"] == "LaminarShare") & (v4["pooling"] == "area_mean")
+                & (v4["readout"] == "non_glia") & (v4["bin"] == "L4")]["c1"].iloc[0]
+        assert np.isclose(l4, 50 / 350), l4
+
+        # a scheme that forgets 6b stops the run
+        cfg_bad = group_stats.load_config(cfg_path)
+        cfg_bad["laminar"]["schemes"] = {"x": {"upper": ["1", "2/3", "4"], "deep": ["5", "6a"]}}
+        try:
+            laminar.run(cfg_bad, out_dir=os.path.join(root, "bad"))
+        except ValueError as e:
+            assert "6b" in str(e), e
+        else:
+            raise AssertionError("scheme without 6b should fail")
+        assert os.path.exists(os.path.join(root, "out", "laminar_tests.csv"))
+    print("  ok: laminar bins close to 1, ACAv-style names, L4 undefined where absent, "
+          "forgotten layer fails")
+
+
 def test_marker_recoding():
     assert cell_tables.marker_signature("neuron_3_GFP_RFP_Sox9") == "GFP_RFP_Sox9"
     assert cell_tables.marker_signature("glia_GFP_RFP_Sox9") == "GFP_RFP_Sox9"
@@ -452,6 +568,11 @@ def test_end_to_end():
         parts = df[(df["class_name"].isin(["GFP", "GFP_Sox9"])) & (df["metric"] == "Count")
                    & (df["name"] == "Area A1")]["mean_a"].sum()
         assert np.isclose(allc, parts), (allc, parts)
+
+        # Volume does not depend on the class: exactly one row per region
+        vol = df[df["metric"] == "Volume"]
+        assert set(vol["class_name"]) == {group_stats.REGION_CLASS}, set(vol["class_name"])
+        assert not vol["order"].duplicated().any()
 
         # only the requested levels were tested
         assert set(df["level"]) <= {1, 2}, set(df["level"])
@@ -989,7 +1110,7 @@ def main():
                test_atlas_subdivides, test_depth_profile,
                test_region_maps, test_hemisphere_slice, test_values_by_order,
                test_volume_cache_roundtrip, test_end_to_end,
-               test_coverage_masking, test_min_total_count):
+               test_coverage_masking, test_min_total_count, test_laminar):
         fn()
     print("all passed")
 

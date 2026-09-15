@@ -83,12 +83,14 @@ def warp_labels_to_sample(sample_reference_img, reg):
                            origin=warped.origin, direction=warped.direction)
 
 
-def transform_cell_points(points_df, reg, direction="atlas_to_sample"):
+def transform_cell_points(points_df, reg, direction="atlas_to_sample", dim=3):
     """Transform cell centroid coordinates through the registration's transforms.
 
-    points_df: DataFrame with columns x, y, z in physical units (same units
-        as the image spacing used during registration, typically microns).
+    points_df: DataFrame with columns x, y, z (just x, y when dim=2) in
+        physical units (same units as the image spacing used during
+        registration, typically microns).
     direction: 'atlas_to_sample' or 'sample_to_atlas'.
+    dim: 3, or 2 for a 2D section registration (section2d).
 
     ants.apply_transforms_to_points warps points in the OPPOSITE direction of
     ants.apply_transforms on images (see its own docstring: "point mapping
@@ -113,7 +115,7 @@ def transform_cell_points(points_df, reg, direction="atlas_to_sample"):
     # apply_transforms). Only invtransforms (sample_to_atlas) needs this;
     # fwdtransforms is already correct un-inverted regardless.
     whichtoinvert = _mat_entries_to_invert(transformlist) if direction == "sample_to_atlas" else None
-    return ants.apply_transforms_to_points(dim=3, points=points_df, transformlist=transformlist,
+    return ants.apply_transforms_to_points(dim=dim, points=points_df, transformlist=transformlist,
                                             whichtoinvert=whichtoinvert)
 
 

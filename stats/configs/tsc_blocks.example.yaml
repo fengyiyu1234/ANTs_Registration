@@ -1,0 +1,65 @@
+# stats/block_stats.py 的配置。固定图谱空间小块的组间比较，不做全脑分区。
+#
+#   conda activate antsreg
+#   python -m stats.block_stats --config stats/configs/tsc_blocks.yaml
+#
+# 块由 Registration_toolkit 的 tools/pick_blocks.py 产生，这里只读那份
+# blocks.json，不重新布点 —— 块的位置必须在看到分组结果之前固定下来。
+# 只用来做路径校验和区名查询，块本身已经带了区名。
+ontology_json: ../../atlas/DeMBA/CCF_v3_ontology.json
+
+blocks_json: /data/hdd12tb-1/fengyi/COMBINe/stats/blocks_ctx600/blocks.json
+
+output:
+  dir: /data/hdd12tb-1/fengyi/COMBINe/stats/0910_blocks_ctx600
+
+samples:
+  s10:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s10/DeMBA_0904}
+  s18:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s18/DeMBA_0902_repos}
+  s11:  {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s11/DeMBA_0902}
+  s8:   {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s8/DeMBA_0904}
+  s12q: {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12q/DeMBA_0830_mask2}
+  s12t: {dir: /data/hdd12tb-1/fengyi/COMBINe/Registration/TSC_ants/s12t/DeMBA_0828}
+
+groups:
+  a: {name: Control,      samples: [s10, s18, s11]}
+  b: {name: Experimental, samples: [s8, s12q, s12t]}
+
+# 发育期 glia 形态像 neuron，YOLO 的 neuron 判定不可信，所以类名叫 non_glia。
+# 四个基础类互斥，是 RegionProportion 之外所有分母的来源。
+class_map:
+  glia_MADM:          [glia_GFP, glia_RFP, glia_GFP_RFP]
+  glia_MADM_Sox9:     [glia_GFP_Sox9, glia_RFP_Sox9, glia_GFP_RFP_Sox9]
+  non_glia_MADM:      [neuron_GFP, neuron_RFP, neuron_GFP_RFP]
+  non_glia_MADM_Sox9: [neuron_GFP_Sox9, neuron_RFP_Sox9, neuron_GFP_RFP_Sox9]
+
+# 四类的聚合。它们彼此重叠，所以永远不当分母。
+combined_categories:
+  MADM_all:     [{sign: "+", class: glia_MADM}, {sign: "+", class: glia_MADM_Sox9},
+                 {sign: "+", class: non_glia_MADM}, {sign: "+", class: non_glia_MADM_Sox9}]
+  glia_all:     [{sign: "+", class: glia_MADM}, {sign: "+", class: glia_MADM_Sox9}]
+  non_glia_all: [{sign: "+", class: non_glia_MADM}, {sign: "+", class: non_glia_MADM_Sox9}]
+  Sox9_pos:     [{sign: "+", class: glia_MADM_Sox9}, {sign: "+", class: non_glia_MADM_Sox9}]
+
+# Density 的分母是常数，所以它和 Count 的 p、g 必然一样，留着只是因为报告里
+# 写的是密度。真正可能不同的是 CoveredDensity，它除以块内实际有组织的体积。
+#
+# Share（一块的计数 / 同一样本在所有块里的总数）不在这个列表里，它是无条件算的：
+# 它问的是另一个问题 —— 细胞是不是换了地方 —— 而块的平均值对这个问题永远看不见。
+metrics: [Count, Density, CoveredDensity]
+
+# 块的成像质量检查。暗 = 低于该样本自己块内组织中位强度的 dark_rel 倍；这是相对
+# 阈值，因为 warped 图是逐样本归一化的（这六个的中位强度 0.088–0.152）。别用 Otsu，
+# 它在 light-sheet 上只圈亮细胞。dark_frac 超过 dark_max 的块被标记。
+#
+# action: report 只报告；drop_block 把它从**所有**样本里剔除。不提供逐样本剔除：
+# 那样每个样本的块平均算在不同的块集合上，两组的均值就不可比了。
+qc:
+  dark_rel: 0.25
+  dark_max: 0.10
+  action: report
+
+stats:
+  test: welch        # n=3 vs 3，不假设两组等方差
+  correction: bh
+  alpha: 0.05

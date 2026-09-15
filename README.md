@@ -25,6 +25,37 @@ ANTs-based registration of LSFM brain samples to the Allen CCF atlas, plus tools
   takes a result back onto the original geometry for QC.
 - `config.py` — loads and validates the pipeline YAML config.
 
+## 2D sagittal sections (`section2d.py`)
+
+For ordinary immunofluorescence sections rather than a light-sheet volume.
+ANTs has no slice-to-volume registration, so each section's atlas plane is
+found first, then the section is registered in 2D onto that plane:
+
+1. **Orientation** — in-plane rotation and mirror state, from `anterior`/`dorsal`
+   hints if given, otherwise a full search.
+2. **Plane search** — a Similarity registration (rotation + one scale) against
+   every candidate plane on a grid of distance-from-midline × yaw × roll,
+   scored by mutual information; then a finer grid around the best few.
+   Similarity rather than Affine on purpose: lateral planes are smaller, and
+   with the pixel size known that single scale is what tells planes apart.
+3. **Affine → SyN** on the chosen plane; atlas labels warped back onto the
+   section; cell centroids mapped to 3D atlas coordinates and region ids.
+
+```bash
+cp configs/sections2d.example.yaml configs/my_sections.yaml   # then edit
+python scripts/register_sections_2d.py configs/my_sections.yaml
+python tests/test_section2d_smoke.py                          # synthetic recovery test
+```
+
+The atlas must be in the canonical orientation (axis0 left→right, axis1
+anterior→posterior, axis2 dorsal→ventral — the `devccf_p04` preset already
+is); it is checked against the ontology at start-up. A sagittal section does
+not say which hemisphere it came from, so positions are reported as distance
+from the midline. Look at each section's `qc.png` before trusting it: the
+score-vs-position curve needs one clear peak (`far_gap` in `summary.csv`
+quantifies it). Calling `section2d.process_section` from your own script needs
+an `if __name__ == "__main__":` guard (worker processes are spawned).
+
 ## Annotation, visualization and evaluation → `../GT_tool_for_registration`
 
 Everything that opens a napari window (painting masks, placing landmarks,

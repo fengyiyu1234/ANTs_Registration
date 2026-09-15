@@ -56,6 +56,11 @@ from stats.region_volumes import build_per_sample_volumes, build_reference_volum
 
 METRICS = ("Count", "Percentage", "Density", "RegionProportion",
            "Volume", "RelativeVolume")
+# Metrics that describe the region, not any cell class: testing them once per
+# class wrote the same row (same p, same g) up to 9 times. They are tested once,
+# under this class_name.
+CLASS_FREE_METRICS = ("Volume", "RelativeVolume")
+REGION_CLASS = "region"
 CORRECTIONS = ("bh", "holm", "bonferroni", "none")
 LOST_LABEL = "Lost cells"
 
@@ -849,6 +854,15 @@ def run_all(cfg):
         if m not in METRICS:
             raise ValueError(f"unknown metric '{m}'; known: {METRICS}")
     density_denominator = cfg.get("density_denominator", "covered")
+    # Optional: test only these classes. Every base class is still counted, so
+    # RegionProportion's denominator stays "all cells of all base classes".
+    test_classes = cfg.get("test_classes") or None
+    if test_classes:
+        unknown = set(test_classes) - set(classes) - set(formulas or {})
+        if unknown:
+            raise ValueError(f"test_classes {sorted(unknown)} are neither base classes "
+                             f"{classes} nor combined categories {list(formulas or {})}")
+    tested = (lambda names: [c for c in names if not test_classes or c in test_classes])
 
     cov_a = coverage_matrix(volumes, samples_a, ontology)
     cov_b = coverage_matrix(volumes, samples_b, ontology)
@@ -892,6 +906,53 @@ def run_all(cfg):
               f"regions, about {0.05 * 150:.0f} will reach p<0.05 by chance alone. Turn on "
               f"stats.gatekeeping, or treat those rows as descriptive only.")
 
+    def _run_levels(ma, mb, cls, metric, gate):
+        rows = []
+        # Gatekeeping runs down the tested levels within one
+        # (class, metric) chain: each level narrows what the next one
+        # may look at, which is what makes an uncorrected deep level
+        # defensible -- it is a description of a branch already
+        # established at a coarse level, not a fresh search.
+        open_orders = keep_orders.copy()
+        for level in levels:
+            corr = corr_by_level.get(level, default_corr)
+            res = run_level_tests(ma, mb, metadata, open_orders, level, cls, metric,
+                                  samples_a, samples_b, count_gate=gate,
+                                  correction=corr, test=test, alpha=alpha,
+                                  variance_trend=variance_trend)
+            if not res.empty:
+                res["gated"] = gatekeeping
+                rows.append(res)
+            if gatekeeping:
+                sig = (res["order"][res["p_adj"] < alpha].tolist()
+                       if not res.empty else [])
+                open_orders = keep_orders & ontology.subtree_mask(sig)
+        return rows
+
+    class_metrics = [m for m in metrics if m not in CLASS_FREE_METRICS]
+    region_metrics = [m for m in metrics if m in CLASS_FREE_METRICS]
+
+    def _compare_regions():
+        """Volume / RelativeVolume, once per region. The count gate uses all
+        cells of all base classes, so the family is every region that holds
+        enough cells to be analysed at all."""
+        gate = None
+        if min_count > 0:
+            tot = (region_tot.pivot(index="order", columns="sample", values="region_total")
+                   .reindex(index=np.arange(ontology.n), columns=samples_a + samples_b))
+            gate = np.nansum(tot.to_numpy(dtype=float), axis=1) >= min_count
+        rows = []
+        for metric in region_metrics:
+            # the class argument is ignored for these metrics
+            ma = apply_coverage_mask(metric_matrix(
+                counts_df, totals_df, volumes, region_tot, classes[0], metric, "a",
+                samples_a, ontology, density_denominator), cov_a, min_cov)
+            mb = apply_coverage_mask(metric_matrix(
+                counts_df, totals_df, volumes, region_tot, classes[0], metric, "b",
+                samples_b, ontology, density_denominator), cov_b, min_cov)
+            rows += _run_levels(ma, mb, REGION_CLASS, metric, gate)
+        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
     def _compare(cdf, tdf, names):
         rows = []
         for cls in names:
@@ -906,39 +967,25 @@ def run_all(cfg):
                 cb = metric_matrix(cdf, tdf, volumes, region_tot, cls, "Count", "b",
                                    samples_b, ontology, density_denominator)
                 gate = (np.nansum(ca, axis=1) + np.nansum(cb, axis=1)) >= min_count
-            for metric in metrics:
+            for metric in class_metrics:
                 ma = apply_coverage_mask(metric_matrix(
                     cdf, tdf, volumes, region_tot, cls, metric, "a", samples_a,
                     ontology, density_denominator), cov_a, min_cov)
                 mb = apply_coverage_mask(metric_matrix(
                     cdf, tdf, volumes, region_tot, cls, metric, "b", samples_b,
                     ontology, density_denominator), cov_b, min_cov)
-                # Gatekeeping runs down the tested levels within one
-                # (class, metric) chain: each level narrows what the next one
-                # may look at, which is what makes an uncorrected deep level
-                # defensible -- it is a description of a branch already
-                # established at a coarse level, not a fresh search.
-                open_orders = keep_orders.copy()
-                for level in levels:
-                    corr = corr_by_level.get(level, default_corr)
-                    res = run_level_tests(ma, mb, metadata, open_orders, level, cls, metric,
-                                          samples_a, samples_b, count_gate=gate,
-                                          correction=corr, test=test, alpha=alpha,
-                                          variance_trend=variance_trend)
-                    if not res.empty:
-                        res["gated"] = gatekeeping
-                        rows.append(res)
-                    if gatekeeping:
-                        sig = (res["order"][res["p_adj"] < alpha].tolist()
-                               if not res.empty else [])
-                        open_orders = keep_orders & ontology.subtree_mask(sig)
+                rows += _run_levels(ma, mb, cls, metric, gate)
         return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
-    result = _compare(counts_df, totals_df, classes)
+    result = _compare(counts_df, totals_df, tested(classes))
+    if region_metrics:
+        regions = _compare_regions()
+        if not regions.empty:
+            result = pd.concat([result, regions], ignore_index=True) if not result.empty else regions
     if not result.empty:
         result["formula"] = ""
     if formulas:
-        combined = _compare(comb_counts, comb_totals, list(formulas))
+        combined = _compare(comb_counts, comb_totals, tested(list(formulas)))
         if not combined.empty:
             combined["formula"] = combined["class_name"].map(formulas)
             result = pd.concat([result, combined], ignore_index=True) if not result.empty else combined
@@ -966,7 +1013,8 @@ def run_all(cfg):
                 variance_trend=variance_trend,
                 correction=default_corr, correction_by_level=corr_by_level,
                 density_denominator=density_denominator,
-                metrics=metrics, classify_by=classify_by, class_map=class_map)
+                metrics=metrics, test_classes=test_classes,
+                classify_by=classify_by, class_map=class_map)
 
 
 # ================= outputs =================
@@ -1001,7 +1049,9 @@ def _readme_frame(r):
                    "warped region volume. "
                    "RegionProportion = % of all cells of all base classes in that same region "
                    "(immune to per-sample detection-efficiency differences). "
-                   "Volume = the region volume itself, mm^3"),
+                   "Volume = the region volume itself, mm^3. "
+                   f"Volume and RelativeVolume do not depend on the cell class, so they are "
+                   f"tested once per region under class_name = '{REGION_CLASS}'"),
         ("n_a / n_b", f"Samples actually contributing (a={r['name_a']}, b={r['name_b']}); "
                       "below the group size where coverage masking dropped a sample"),
         ("mean_a / mean_b / sd_a / sd_b", "Group mean and SD of the metric"),
@@ -1078,9 +1128,23 @@ def trim_ancestors(sheet, level):
     return sheet.drop(columns=drop) if drop else sheet
 
 
+def samples_beside_means(df, samples):
+    """Move the per-sample columns right after mean_a/mean_b.
+
+    At n=3 vs 3 the six values are what gets read, and at the far right of a
+    50-column table nobody finds them. Only the order changes; every reader of
+    these files goes by column name."""
+    if "mean_b" not in df.columns:
+        return df
+    samples = [s for s in samples if s in df.columns]
+    rest = [c for c in df.columns if c not in samples]
+    at = rest.index("mean_b") + 1
+    return df[rest[:at] + samples + rest[at:]]
+
+
 def write_outputs(r):
     out_dir = r["out_dir"]
-    df = r["result"]
+    df = samples_beside_means(r["result"], list(r["samples_a"]) + list(r["samples_b"]))
     out_cfg_long = os.path.join(out_dir, "region_stats.csv")
     df.to_csv(out_cfg_long, index=False)
     print(f"Wrote long-format table: {out_cfg_long} ({len(df)} rows)")
@@ -1159,6 +1223,9 @@ def describe_methods(r):
     if r["formulas"]:
         add(f"- **Aggregate classes**: " + "; ".join(f"{k} = {v}" for k, v in r["formulas"].items())
             + ".")
+    if r.get("test_classes"):
+        add(f"- **Classes tested**: {', '.join(r['test_classes'])} only. The other base classes "
+            f"were counted but not tested; they still enter RegionProportion's denominator.")
     add(f"- **Metrics**: {', '.join(r['metrics'])}. Density uses each sample's own warped "
         f"region volume"
         + (", restricted to tissue inside its brain mask" if r["density_denominator"] == "covered"
@@ -1182,7 +1249,10 @@ def describe_methods(r):
             f"many contributed.")
     if r["min_total_count"] > 0:
         add(f"- **Minimum count**: a region was tested for a class only if it held at least "
-            f"{r['min_total_count']:.0f} cells of that class summed across all samples.")
+            f"{r['min_total_count']:.0f} cells of that class summed across all samples."
+            + (f" Volume metrics, which are tested once per region rather than per class, "
+               f"used the same threshold on all cells of all base classes."
+               if any(m in CLASS_FREE_METRICS for m in r["metrics"]) else ""))
     add("")
 
     add("## Testing")
@@ -1211,7 +1281,8 @@ def describe_methods(r):
         f"J = 1 - 3/(4N-9) = {1 - 3 / (4 * (na + nb) - 9):.2f} at N={na + nb}), with an "
         f"approximate 95% confidence interval.")
     add(f"- **Families**: each (cell class, metric, ontology level) combination is corrected "
-        f"as its own family. Levels tested: {', '.join(str(v) for v in sorted(r['levels']))}.")
+        f"as its own family (Volume and RelativeVolume: one family per metric and level, "
+        f"not per class). Levels tested: {', '.join(str(v) for v in sorted(r['levels']))}.")
     corr_lines = []
     for lv in sorted(r["levels"]):
         c = r["correction_by_level"].get(lv, r["correction"])

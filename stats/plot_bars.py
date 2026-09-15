@@ -168,7 +168,19 @@ def item_from_volumes(run, region, label=None, test_levels=(2, 3, 4, 5, 6, 7, 8)
                 note=note)
 
 
-def draw_panel(ax, run, item, metric, alpha):
+def both_p_text(item, alpha):
+    """Raw and adjusted p, always both, for the per-region figures.
+
+    ps.p_label collapses to 'n.s.' once nothing survives the correction, which
+    is the right default on a summary slide but hides exactly the number that
+    is wanted when going region by region."""
+    if not np.isfinite(item.p_raw):
+        return "not tested"
+    adj = f"{item.p_adj:.3g}" if np.isfinite(item.p_adj) else "n/a"
+    return f"p = {item.p_raw:.3g}\np_adj = {adj}"
+
+
+def draw_panel(ax, run, item, metric, alpha, p_text=None):
     """One item: two bars, six dots, one annotation."""
     import matplotlib.pyplot as plt  # noqa: F401
 
@@ -204,21 +216,28 @@ def draw_panel(ax, run, item, metric, alpha):
     ax.set_xlim(-0.62, 1.62)
     ax.set_xticks(xs)
     ax.set_xticklabels([run.group_name["a"], run.group_name["b"]], fontsize=9)
-    ax.set_title(item.label, fontsize=10, pad=14)
     ax.yaxis.grid(True, zorder=0)
     ax.set_axisbelow(True)
 
-    txt = ps.p_label(item.p_adj, item.p_raw, alpha)
+    txt = p_text(item, alpha) if p_text else ps.p_label(item.p_adj, item.p_raw, alpha)
     sig = np.isfinite(item.p_adj) and item.p_adj < alpha
-    ax.text(0.5, 0.965, txt, transform=ax.transAxes, ha="center", va="top",
-            fontsize=8.5, color=ps.INK if sig else ps.INK_SOFT,
-            fontweight="bold" if sig else "normal")
+    style = dict(transform=ax.transAxes, ha="center", fontsize=8.5,
+                 color=ps.INK if sig else ps.INK_SOFT,
+                 fontweight="bold" if sig else "normal")
+    if p_text:
+        # two lines do not fit in the headroom without landing on the top dot,
+        # so they go between the title and the axes
+        ax.set_title(item.label, fontsize=10, pad=34)
+        ax.text(0.5, 1.02, txt, va="bottom", **style)
+    else:
+        ax.set_title(item.label, fontsize=10, pad=14)
+        ax.text(0.5, 0.965, txt, va="top", **style)
     if item.note:
         ax.text(0.5, -0.30, item.note, transform=ax.transAxes, ha="center",
                 va="top", fontsize=7, color=ps.INK_SOFT)
 
 
-def figure(run, items, metric, title, out_path, ncols=None, alpha=0.05):
+def figure(run, items, metric, title, out_path, ncols=None, alpha=0.05, p_text=None):
     import matplotlib.pyplot as plt
 
     items = [i for i in items if i is not None]
@@ -233,7 +252,7 @@ def figure(run, items, metric, title, out_path, ncols=None, alpha=0.05):
     fig, axes = plt.subplots(nrows, ncols, figsize=(2.5 * ncols, 3.1 * nrows),
                              squeeze=False)
     for ax, item in zip(axes.ravel(), items):
-        draw_panel(ax, run, item, metric, alpha)
+        draw_panel(ax, run, item, metric, alpha, p_text=p_text)
     for ax in axes.ravel()[len(items):]:
         ax.axis("off")
     for r in range(nrows):
@@ -269,10 +288,12 @@ def preset_volume(run, out_dir, alpha, include_untested=False):
     bar with no p-value sitting next to bars that have one, which invites the
     reader to compare them as if they were the same kind of statement.
     `--include-untested` puts them back, labelled with why they have no test."""
-    cls = run.total_class or (run.base_classes[0] if run.base_classes else "all_cells")
+    # runs made before volume was tested once per region carry it under a class
+    legacy = run.total_class or (run.base_classes[0] if run.base_classes else "all_cells")
     items = []
     for name in VOLUME_REGIONS:
-        it = item_from_stats(run, name, "Volume", cls)
+        it = (item_from_stats(run, name, "Volume", "region")
+              or item_from_stats(run, name, "Volume", legacy))
         if it is None and include_untested:
             it = item_from_volumes(run, name, test_levels=run.test_levels)
         items.append(it)
@@ -480,13 +501,67 @@ def preset_region(run, out_dir, region, metric, alpha, classes=None):
            ncols=4, alpha=alpha)
 
 
+BY_REGION_METRICS = ("Count", "Density", "RegionProportion", "Volume", "RelativeVolume")
+# tested once per region, not per class (group_stats.REGION_CLASS)
+REGION_LEVEL_METRICS = ("Volume", "RelativeVolume")
+
+
+def _safe_dirname(text):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in text).strip("_")
+
+
+def preset_by_region(run, out_dir, alpha):
+    """One folder per tested level, one sub-folder per region, and in it one
+    figure per metric with a panel per tested class.
+
+    Built for going through regions one at a time, so every panel prints the
+    raw and the adjusted p even when nothing survives, and no g: the six dots
+    are the effect. A class a region was not tested for (below min_total_count)
+    has no row and therefore no panel. With no test_classes every class in the
+    run is drawn: the total, the other combined classes, then the base classes,
+    five panels to a row."""
+    classes = list(run.cfg.get("test_classes") or [])
+    if not classes:
+        combined = [c for c in run.combined_classes if c != run.total_class]
+        classes = ([run.total_class] if run.total_class else []) + combined + run.base_classes
+    metrics = [m for m in BY_REGION_METRICS if m in set(run.stats["metric"])]
+    top = min(int(lv) for lv in run.stats["level"].unique())
+    # a region below the shallowest tested level is filed under its ancestors
+    # from that level down (L06/Isocortex_Isocortex/MO_Somatomotor_areas), with
+    # the ancestor folders spelled exactly like their own folders one level up
+    acronym_of = dict(zip(run.stats["name"], run.stats["acronym"]))
+    ancestor_cols = [f"L{k}_name" for k in range(top, int(run.stats["level"].max()))]
+    cols = ["level", "name", "acronym"] + [c for c in ancestor_cols if c in run.stats]
+    regions = (run.stats[run.stats["class_name"].isin(classes)][cols]
+               .drop_duplicates().sort_values(["level", "name"]))
+    for row in regions.itertuples(index=False):
+        level, name, acronym = int(row.level), row.name, row.acronym
+        parts = [f"L{level:02d}"]
+        for k in range(top, level):
+            anc = getattr(row, f"L{k}_name", None)
+            if isinstance(anc, str) and anc:
+                parts.append(_safe_dirname(f"{acronym_of[anc]}_{anc}"
+                                           if anc in acronym_of else anc))
+        region_dir = os.path.join(out_dir, *parts, _safe_dirname(f"{acronym}_{name}"))
+        for i, metric in enumerate(metrics, 1):
+            if metric in REGION_LEVEL_METRICS:
+                items = [item_from_stats(run, name, metric, "region", label=metric)]
+                ncols = 1
+            else:
+                items = [item_from_stats(run, name, metric, c, label=c) for c in classes]
+                ncols = min(len(classes), 5)
+            figure(run, items, metric, f"{name} ({acronym}) — {metric}",
+                   os.path.join(region_dir, f"{i}_{metric}.png"),
+                   ncols=ncols, alpha=alpha, p_text=both_p_text)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True)
     ap.add_argument("--preset", default="all",
                     choices=["all", "volume", "cortex-count", "cortex-density",
-                             "composition", "none"])
+                             "composition", "by-region", "none"])
     ap.add_argument("--region", default="Cerebral cortex",
                     help="region for the count/density presets")
     ap.add_argument("--regions", default=None,
@@ -502,6 +577,10 @@ def main():
 
     ps.apply_rcparams()
     run = Run(args.config)
+    if args.preset == "by-region":
+        preset_by_region(run, os.path.join(args.out_dir or os.path.join(run.out_dir, "figures"),
+                                           "bars_by_region"), run.alpha)
+        return
     out_dir = ps.figure_dir(args.out_dir or os.path.join(run.out_dir, "figures"),
                             "bars")
 

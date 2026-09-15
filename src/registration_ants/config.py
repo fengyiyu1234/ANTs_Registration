@@ -18,6 +18,25 @@ def _load_atlas_presets():
     with open(_ATLAS_PRESETS_PATH) as f:
         return yaml.safe_load(f) or {}
 
+
+def resolve_atlas_preset(atlas_cfg):
+    """An atlas block whose source names a preset -> that preset's fields,
+    overridden by any other fields given next to source, with source set to
+    'custom'. 'brainglobe'/'custom' blocks come back unchanged. Shared by the
+    3D pipeline config and scripts/register_sections_2d.py."""
+    if atlas_cfg["source"] in ("brainglobe", "custom"):
+        return atlas_cfg
+    presets = _load_atlas_presets()
+    if atlas_cfg["source"] not in presets:
+        raise ValueError(
+            f"config.atlas.source {atlas_cfg['source']!r} is not 'brainglobe'/'custom' "
+            f"and not a known preset in {_ATLAS_PRESETS_PATH} (known: {sorted(presets)})"
+        )
+    resolved = {**presets[atlas_cfg["source"]], **{k: v for k, v in atlas_cfg.items() if k != "source"}}
+    resolved["source"] = "custom"
+    return resolved
+
+
 _DEFAULTS = {
     "atlas": {
         "source": "brainglobe",  # "brainglobe" (auto-fetch by resolution) or "custom" (your own files)
@@ -158,18 +177,7 @@ def load_config(path):
         if not Path(ch["raw_tiff"]).exists():
             raise FileNotFoundError(f"channel '{ch['name']}' raw_tiff not found: {ch['raw_tiff']}")
 
-    atlas_cfg = config["atlas"]
-    if atlas_cfg["source"] not in ("brainglobe", "custom"):
-        presets = _load_atlas_presets()
-        if atlas_cfg["source"] not in presets:
-            raise ValueError(
-                f"config.atlas.source {atlas_cfg['source']!r} is not 'brainglobe'/'custom' "
-                f"and not a known preset in {_ATLAS_PRESETS_PATH} (known: {sorted(presets)})"
-            )
-        atlas_cfg = {**presets[atlas_cfg["source"]],
-                     **{k: v for k, v in atlas_cfg.items() if k != "source"}}
-        atlas_cfg["source"] = "custom"
-        config["atlas"] = atlas_cfg
+    atlas_cfg = config["atlas"] = resolve_atlas_preset(config["atlas"])
 
     if atlas_cfg["source"] == "custom":
         for required in ("template_path", "annotation_path", "resolution_um"):
