@@ -2377,3 +2377,38 @@ blocks_ctx600_sep2/       同上，第二次
   同时检查两组皮层厚度有没有系统差异。
 - 预实验成立再全样本算相对深度、重跑层分布。
 - 可选：算每只动物"上层减深层"的 Sox9+ 占比差值，检验上层是否真的更强。
+
+---
+
+## 2026-09-17：2D 流程加 `<output_dir>/overlays/` —— 每张切片两个 PNG，打包就能发
+
+**做了什么**：
+- 新增 `src/registration_ants/section_overlays.py` + `scripts/export_overlays.py`，
+  `scripts/register_sections_2d.py` 每跑完一批自动写（`--no-overlays` 关掉）。
+  输出平铺在一个文件夹里，每张切片两张图：
+  - `<name>_atlas_outline.png` 图谱脑区【描边】画在原图上（图像本身看得见）
+  - `<name>_atlas_filled.png` 脑区【填色】（alpha 0.45）+ 描边压在上面
+  - 另有 `legend.png` / `regions.csv`（颜色 ↔ 脑区名 ↔ 面积）和 `README.txt`，
+    收图的人不用装这个仓库也看得懂颜色。
+- 配色用 ontology 自己的 `color_hex_triplet`（Allen CCF 配色，BrainGlobe 则是 `rgb_triplet`），
+  为此 `atlas_utils.load_ccf_ontology_json` 多带一个 `color_hex_triplet` 字段（纯新增，不影响既有调用）。
+- 背景默认是【原图】（`section_io` 按配准当时同样的方式读），block-mean 降采样到最长边 3000 px；
+  `--source prep` 则用 `section_prep.nii.gz`，完全不碰原文件。
+- 标签是按【物理坐标】贴到显示网格上的，不是按形状缩放 —— 原图和 20 µm 标签网格除不尽也对得上；
+  落在标签图外面的显示像素记成背景，不会把边缘那一列拖出去。
+- `tests/test_section_overlays_smoke.py`：物理坐标定位、CCF 大 id、渲染不碰背景三项，跑过。
+
+**遇到的问题**：
+- 第一版按 `max(structures)` 建稠密的 id→颜色查找表，直接卡死：CCF 的 id 最大到 **614454277**，
+  这张表是 1.8 GB、还要 Python 循环 6 亿次。改成 `encode_labels()`：把一张切片里实际出现的
+  （两三百个）id 用 `searchsorted` 重编号成 0..n-1，调色板就只有几百行，单张 5 秒。
+
+**已经跑出来的结果**：
+- `J:\NesMADMWW_5077_GFP\registration\overlays\`：24 张切片 × 2 + 3 个说明文件 = 51 个文件，85 MB，
+  每张 PNG 2500 × 1125 px。覆盖了整批 648 个脑区。
+- 看图确认：s001 描边贴合良好；s022（`syn_unlabelled_pct` 26%，全批最差）能直接看出图谱标签铺到了
+  组织外面（右侧小脑那块浮在黑背景上）—— 这是配准本身的问题，summary.csv 早就标出来了，不是渲染问题。
+
+**下一步（可选）**：
+- 脑区太细时用 `--level 6` 折叠到大结构，填色图会好读很多（`atlas_utils.collapse_labels_to_level`）。
+- s017/s020/s021/s022 这几张最外侧的切片值得回头看配准本身。

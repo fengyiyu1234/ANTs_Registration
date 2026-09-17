@@ -49,6 +49,8 @@ cp configs/sections2d.example.yaml configs/my_sections.yaml   # then edit
 python scripts/register_sections_2d.py configs/my_sections.yaml --input-dir /path/to/sections
 # the batch also writes <folder>/registration/viewer/ for Registration_toolkit (z slider = section)
 python ../Registration_toolkit/single_sample.py /path/to/sections/registration/viewer/single_sample.yaml
+# ... and <folder>/registration/overlays/: two PNGs per section to send on (re-render on their own:)
+python scripts/export_overlays.py configs/my_sections.yaml --level 6 --alpha 0.6
 python tests/test_section2d_smoke.py                          # synthetic recovery test
 ```
 
@@ -68,6 +70,18 @@ of the others' — otherwise `channel: sum`; Z stacks are projected
 score-vs-position curve needs one clear peak (`far_gap` in `summary.csv`
 quantifies it). Calling `section2d.process_section` from your own script needs
 an `if __name__ == "__main__":` guard (worker processes are spawned).
+
+Two outputs exist only to be looked at, and both are rewritten after every
+batch. `<output_dir>/viewer/` stacks the sections as one "sample" for
+`Registration_toolkit/single_sample.py` (z slider = section, hover for the
+region, region search) -- `section_viewer.py`. `<output_dir>/overlays/` is the
+flat folder to zip and mail: per section the atlas drawn on the ORIGINAL image
+as coloured region outlines and again with the regions filled in, in the
+ontology's own Allen CCF colours, plus `legend.png` / `regions.csv` as the
+colour key -- `section_overlays.py`. `scripts/export_overlays.py` re-renders
+them (`--level` to collapse to major structures, `--alpha`, `--max-px`,
+`--source prep` to skip reading the originals) without repeating a
+registration.
 
 ## Annotation, visualization and evaluation → `../GT_tool_for_registration`
 

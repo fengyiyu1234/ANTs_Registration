@@ -27,6 +27,11 @@ batch stacked for Registration_toolkit/single_sample.py (z slider = section;
 see src/registration_ants/section_viewer.py):
 
     python <Registration_toolkit>/single_sample.py <output_dir>/viewer/single_sample.yaml
+
+<output_dir>/overlays/ holds two PNGs per section to send on -- the atlas as
+coloured outlines on the original image, and the regions filled in -- plus the
+colour key (src/registration_ants/section_overlays.py; scripts/export_overlays.py
+re-renders them without repeating the registration).
 """
 import argparse
 import json
@@ -49,7 +54,8 @@ import pandas as pd
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from registration_ants import atlas_utils, config as config_mod, section2d, section_io, section_viewer  # noqa: E402
+from registration_ants import (atlas_utils, config as config_mod, section2d, section_io,  # noqa: E402
+                              section_overlays, section_viewer)
 
 _HINTS = set(section2d._IMAGE_DIRS)
 
@@ -164,6 +170,9 @@ def main():
     ap.add_argument("--overwrite", action="store_true", help="redo sections that already have results")
     ap.add_argument("--no-viewer", action="store_true",
                     help="skip writing <output_dir>/viewer/ (the copy Registration_toolkit/single_sample.py opens)")
+    ap.add_argument("--no-overlays", action="store_true",
+                    help="skip writing <output_dir>/overlays/ (the PNGs to send on; "
+                         "scripts/export_overlays.py rewrites them with other settings)")
     args = ap.parse_args()
 
     cfg = load_sections_config(args.config, args.input_dir, args.output_dir, args.pattern)
@@ -222,6 +231,13 @@ def main():
             traceback.print_exc()
             print("viewer export FAILED -- the registration results are unaffected; "
                   "rerun scripts/export_sections_for_viewer.py once fixed")
+    if not args.no_overlays:
+        try:
+            section_overlays.export_overlays(cfg)
+        except Exception:
+            traceback.print_exc()
+            print("overlay export FAILED -- the registration results are unaffected; "
+                  "rerun scripts/export_overlays.py once fixed")
     if failed:
         sys.exit(f"{len(failed)} section(s) failed: {', '.join(failed)} (tracebacks above)")
 

@@ -317,6 +317,10 @@ def load_ccf_ontology_json(path):
     e.g. alongside ClearMap's atlas resources) into a flat dict keyed by
     structure id, matching the shape of BrainGlobe's atlas.structures:
     {id: {'id', 'name', 'acronym', 'structure_id_path'}}.
+
+    'color_hex_triplet' is carried through when the file has it (the Allen
+    palette), for tools that draw regions in the atlas' own colours --
+    section_overlays.py reads either it or BrainGlobe's 'rgb_triplet'.
     """
     with open(path) as f:
         data = json.load(f)
@@ -330,6 +334,7 @@ def load_ccf_ontology_json(path):
             "name": node["name"],
             "acronym": node["acronym"],
             "structure_id_path": path_here,
+            "color_hex_triplet": node.get("color_hex_triplet"),
         }
         for child in node.get("children", []):
             _walk(child, path_here)

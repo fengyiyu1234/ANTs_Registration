@@ -16,6 +16,14 @@
 # 每张切片输出在 <output_dir>/<name>/，【先看 qc.png】：
 #   右上的打分曲线要有一个清楚的峰；far_gap 越大说明位置越确定。曲线平或者多峰时，
 #   位置是不可信的，后面 SyN 贴得再好也没用。
+#
+# 整批还会额外写两个"只拿来看"的文件夹，每次跑完都重写：
+#   <output_dir>/viewer/     Registration_toolkit/single_sample.py 的单样本视图（z 滑条 = 切片）：
+#                            python <Registration_toolkit>/single_sample.py <output_dir>/viewer/single_sample.yaml
+#   <output_dir>/overlays/   每张切片两个 PNG（图谱脑区【描边】/【填色】画在原图上，Allen CCF 配色）
+#                            + legend.png / regions.csv 颜色对照表。一个平铺的文件夹，直接打包发人。
+#                            重新渲染不用重跑配准：
+#                            python scripts/export_overlays.py <这份配置> --level 6 --alpha 0.6
 
 # 【批量】给数据文件夹：里面每个 *.tif / *.tiff 都是一张切片，名字 = 文件名去掉扩展名。
 # 也可以不写在这里，命令行给：--input-dir /path/to/sections（这时输出默认到 <文件夹>/registration）。
