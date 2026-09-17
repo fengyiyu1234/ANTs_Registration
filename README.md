@@ -240,6 +240,11 @@ badly *and* drags both its neighbours down with it.
 ## Config / project files
 
 - `configs/config.example.yaml` — template pipeline config (copy for real runs; real configs are gitignored).
+- `configs/reassign.example.yaml` — jobs list for `scripts/reassign_cells.py --jobs`, which re-runs
+  only the pipeline's `[6/6] assign_cells` step against registrations that already ran. Use it when
+  the cell_centroids changed but the registration did not — re-running the pipeline would also
+  re-run SyN, and ANTs is not run-to-run reproducible here, so the new numbers would mix "new
+  centroids" with "different transform". Copy to `configs/reassign_local.yaml` (gitignored).
 - `pyproject.toml` — package metadata (`registration_ants`, source in `src/`).
 - `requirements.txt` — dependencies for the `antsreg` conda env.
 

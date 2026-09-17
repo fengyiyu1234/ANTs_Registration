@@ -1,0 +1,34 @@
+# scripts/reassign_cells.py --jobs <this file>
+#
+# Re-runs ONLY the pipeline's [6/6] assign_cells step against registrations
+# that already ran. Use it when the cell_centroids CSVs changed but the
+# registration did not -- re-running the pipeline would also re-run SyN, and
+# ANTs is not run-to-run reproducible here (see PROGRESS_LOG), so the new
+# numbers would mix "new centroids" with "different transform".
+#
+# Copy to configs/reassign_local.yaml (gitignored) and edit the paths.
+#
+# Each job's source_run_dir must be a COMPLETED run: it needs the config yaml
+# the pipeline snapshotted there, transforms/, and <name>_fine_<N>um.nii.gz.
+# Pick it deliberately -- several samples have more than one dated run dir and
+# only one of them is the run the stats actually read.
+
+defaults:
+  # Optional. Merged into every job; a job's own key wins.
+  # centroids_dir: /path/shared/cell_centroids
+
+jobs:
+  - sample: s10                 # label only, for the log and --only
+    source_run_dir: /data/.../Registration/TSC_ants/s10/DeMBA_0904
+    new_output_dir: /data/.../Registration/TSC_ants/s10/DeMBA_0904_reassign_0917
+    # centroids_dir: overrides cells.cell_centroids_dir from the snapshotted
+    #   config. Leave it out when the centroids were updated in place, which
+    #   is the usual case -- the config path then already points at the new
+    #   files.
+    # config: use this yaml instead of the snapshot. Needed when the snapshot
+    #   names a path that has since moved (load_config validates those even
+    #   though this step never reads them).
+
+  - sample: s18
+    source_run_dir: /data/.../Registration/TSC_ants/s18/DeMBA_0902_repos
+    new_output_dir: /data/.../Registration/TSC_ants/s18/DeMBA_0902_repos_reassign_0917

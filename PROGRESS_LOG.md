@@ -2412,3 +2412,177 @@ blocks_ctx600_sep2/       同上，第二次
 **下一步（可选）**：
 - 脑区太细时用 `--level 6` 折叠到大结构，填色图会好读很多（`atlas_utils.collapse_labels_to_level`）。
 - s017/s020/s021/s022 这几张最外侧的切片值得回头看配准本身。
+
+---
+
+## 2026-09-17：四个样本按新质心重新 assign + 全局坐标复核
+
+**做了什么**：
+- `scripts/reassign_cells.py` 加了 `--jobs <yaml>`（配 `--only <sample>...` 只跑其中几个），
+  模板 `configs/reassign.example.yaml` 入 git，实际用的 `configs/reassign_local.yaml` 被
+  `.gitignore` 的 `*_local.yaml` 挡掉。单次调用的两个位置参数照旧可用。
+  ```bash
+  conda activate antsreg
+  python scripts/reassign_cells.py --jobs configs/reassign_local.yaml
+  ```
+  之所以把样本清单放进文件而不是 argv：要复查的正是"每个样本是拿哪一次配准重 assign 的"，
+  而好几个样本有不止一个日期目录（s12q 的 `DeMBA_0830` vs `DeMBA_0830_mask2`、
+  s18 的 `repos` vs `norepos`），手敲容易挑错。
+- **修了 `reassign_cells.py` 的一个真 bug**：它调 `assign_cell_regions` 时没传
+  `reposition_plan` / `reposition_fragments`，而 pipeline 的 [6/6] 是传的。s18 主线用的
+  `DeMBA_0902_repos` 带碎片复位，照旧跑会把碎片上的细胞按**复位前**坐标去查一张**复位后**
+  的配准图（碎片位移最大 ~980 µm）。现在直接 `from registration_ants.pipeline import
+  _load_reposition`，不另写一份，两个入口不可能算出不同结果。
+- 四个样本（s10 / s11 / s12q / s18，s8 和 s12t 的质心没动所以不在内）各按自己最后一次
+  / 统计在用的那次配准重 assign，输出为兄弟目录 `<原目录>_reassign_0917`，
+  未变的体积和 `transforms/` 走 symlink：
+  | 样本 | source_run_dir |
+  |---|---|
+  | s10 | `TSC_ants/s10/DeMBA_0904` |
+  | s11 | `TSC_ants/s11/DeMBA_0902` |
+  | s12q | `TSC_ants/s12q/DeMBA_0830_mask2` |
+  | s18 | `TSC_ants/s18/DeMBA_0902_repos` |
+- 全局坐标复核用 0916 那次的 `offset_scan.py`（本次 scratchpad 有副本，仍未入库）：
+  拿 marker+ 与 marker− 细胞在 `registration.tif` 上的平均强度比，扫细胞坐标的整体平移。
+  555 通道只对 RFP 有对比度，GFP 那一行整条曲线都在 1 附近，不作读数。
+
+**关键结果**：
+
+| 样本 | n 旧 → 新 | 最佳 dz 旧 → 新 | 峰值比 旧 → 新 | ratio@0 旧 → 新 | 未归区 旧 → 新 |
+|---|---|---|---|---|---|
+| s10 | 354,693 → 253,715 | **−56（贴扫描边界）→ −20** | 1.59 → 2.25 | 0.98 → 1.67 | 10.71% → 6.01% |
+| s12q | 374,218 → 270,476 | **−56（贴扫描边界）→ −20** | 1.51 → 2.29 | 1.00 → 1.62 | 5.68% → 7.16% |
+| s11 | 349,774 → 349,774 | −20 → −20 | 2.90 → 2.94 | 2.05 → 2.10 | 14.41% → 14.41% |
+| s18 | 204,277 → 204,277 | −20 → −20 | 2.55 → 2.53 | 1.92 → 1.89 | 7.64% → 7.64% |
+
+参照（质心未动）：s8 `DeMBA_0904` dz −20、峰值 2.97；s12t `DeMBA_0915` dz −28、峰值 1.86。
+
+- **只有 s10 和 s12q 是真的坏过，现在修好了。** 旧版这两只的 dz 曲线在整个扫描区间
+  (−56…+24 µm) 单调、峰值顶在 −56 的边界上，而且 `ratio@0` ≈ 1.00 —— 细胞坐标相对图像
+  基本等同随机，"最佳偏移"是伪的。新版曲线变成 −20 µm 处的单峰，形状和峰高都和
+  s8 / s11 / s18 一致。细胞数各掉 ~28%，新旧坐标集合只有 ~0.1% 重合，是**另一套质心**。
+- **s11 和 s18 的质心其实没变，只是行序变了。** 按坐标做集合比对：两只 100% 重合
+  （s11 有 1 个细胞进出），按坐标配对后 region_id **逐一相同**（100.000%）、`zr` 最大差 0 体素。
+  也就是说这次对它们是恒等重跑 —— 顺带证明 s18 的复位修复是对的：要是漏传 reposition，
+  碎片上那 ~1.4 万个细胞的归区不可能逐一对上。
+- **s12q 未归区从 5.68% 升到 7.16%，不算退步。** 旧坐标是随机的，随机点照样大量落在脑区里，
+  所以旧的 5.68% 没有意义。要和 s11 的口径比，还得把 damage 标签上的细胞从分母里剔掉，
+  这次没算。
+- 残留 dz ≈ −20 µm 是**全样本共有**的（含从没坏过的 s8 / s11 / s18），不到一个 z 步长（32 µm），
+  跟这次的修复无关，是另一件待查的事。
+
+**要注意的**：
+- **s11 / s18 的行序变了**，`qc/region_cells.py` 的判定是按 (class_name, row) 记的，
+  旧 run_dir 上记过的 verdicts 不能直接套到 `_reassign_0917` 目录上。
+- 统计要换成新目录的话，四只都要换（s11 / s18 换过去数值不变，但目录名要和 s10 / s12q 一致），
+  s8 和 s12t 仍指向各自原来的目录。
+
+**下一步**：
+- 把 `stats/configs/*.yaml` 里四只的 `dir` 指到 `_reassign_0917`，重跑 0913_01 / 0914_02 /
+  0914_03 这几条主线，看 s10 / s12q 换了 ~28% 的细胞之后结论动没动
+  —— 尤其是 Sox9+ 占比（s12q 是 KO 组的一只）和 s10 的 L1 伪差。
+- s12q 的未归区按 damage 口径重算一遍再和 s11 比。
+- 全样本 −20 µm 的 z 偏移单独查。
+
+---
+
+## 2026-09-17（续）：主线按新细胞表重跑（0917_01 / 02 / 03）
+
+**做了什么**：
+- `stats/configs/` 下 15 个工作 config（3 个 `*.example.yaml` 没动）的 `samples:` 块统一改指新目录：
+
+  | 样本 | 旧 | 新 |
+  |---|---|---|
+  | s10 | `DeMBA_0904` | `DeMBA_0904_reassign_0917` |
+  | s11 | `DeMBA_0902` | `DeMBA_0902_reassign_0917` |
+  | s12q | `DeMBA_0830_mask2` | `DeMBA_0830_mask2_reassign_0917` |
+  | s18 | `DeMBA_0902_repos` | `DeMBA_0902_repos_reassign_0917` |
+  | **s12t** | `DeMBA_0828` | **`DeMBA_0915`** |
+  | s8 | `DeMBA_0904` | 不变 |
+
+- **s12t 一起换了**，不在原计划里。所有 config 之前都指着 `DeMBA_0828`，而那个目录的细胞表是
+  8/28 用旧质心写的：实测 `ratio@0` 0.958、dz 曲线单调顶在 −56 边界、峰值只有 1.20，
+  是六只里最坏的一个（s10/s12q 坏的时候还有 1.5~1.6）。留着它重跑，差异就分不清是"新质心"
+  还是"s12t 仍然错位"。`DeMBA_0915` 是 0916 那次用 0828 的 SyN transform + 8/31 新质心
+  reassign 出来的，frame check 正常（dz −28、峰值 1.86）。
+- 三条主线换了输出目录重跑（旧的 0913/0914 完整保留）：
+  ```bash
+  python -m stats.group_stats --config stats/configs/tsc_regions_sox9_L56.yaml     # -> 0917_01
+  python -m stats.group_stats --config stats/configs/tsc_regions_all_cp_L56.yaml   # -> 0917_02
+  python -m stats.laminar     --config stats/configs/tsc_laminar.yaml              # -> 0917_03
+  python -m stats.plot_laminar --run /data/hdd12tb-1/fengyi/COMBINe/stats/0917_03_laminar_iso
+  ```
+  `output.volume_cache` 仍指 `0908_madm4/per_sample_region_direct_volumes.csv`，是对的：
+  新目录的 `labels_in_sample.nii.gz` 全是指向旧目录的 symlink，脑区体积没变。
+  （注意 `build_per_sample_volumes` 的缓存只按**样本名**匹配，不认 run_dir —— 这次凑巧安全，
+  以后换了会改变 labels 的 run 必须设 `force_recompute_volumes: true`。）
+
+**关键结果**：
+
+1. **s12t 的"偏深层"基本消失了，这是这次最大的变化。** 原始层标签占比：
+
+   | 样本 | L1 旧→新 | L5 旧→新 | L6a 旧→新 |
+   |---|---|---|---|
+   | s10 | 25.6 → 23.6 | 21.4 → 20.0 | 22.2 → 21.3 |
+   | s12q | 11.6 → 17.7 | 23.4 → 22.7 | 27.0 → 25.9 |
+   | **s12t** | **4.5 → 7.4** | **30.6 → 23.5** | **29.3 → 26.8** |
+   | s18 / s11 / s8 | 不变（11.6 / 15.8 / 11.5） | | |
+
+   s12t 现在和 s8（11.5 / 23.6 / 26.6）已经很接近。0915 日志里"s12t L1 只有 4.5%、
+   多出来的份额在 L5 +7.3 / L6 +3.7"那一整套现象，主要是坏坐标造成的，不是样本小。
+   **s10 的 L1 过高（23.6%）还在**，和用户说的"处理时皮层被压扁"一致，换质心治不了。
+
+2. **三个 bin 的 LaminarShare（主分析）本来就没有一项过 BH，现在趋势还整体变弱了。**
+   `MADM_all` upper g −1.17 → −0.90、L6 +1.54 → +1.12；`non_glia_all` upper −1.19 → −0.87、
+   L6 +1.56 → +1.08；`Sox9_neg` L6 +1.50 → +0.94。驱动来自 s12t 的 upper 占比
+   0.381 → 0.482（原来是极端低值）。**"KO 偏深层"这条现在更站不住了**，和 0915 的判断一致，
+   但归因要改：不只是 s10/s12t 的层标签错位，s12t 那一半直接是细胞坐标错的。
+
+3. **上层 Sox9+ 占比（two_bin / BinComposition / pooled，预先定义的次要分析）结论不变：**
+   - 旧：Ctrl 0.257 / 0.267 / 0.236 ‖ KO 0.227 / 0.198 / 0.181，g −2.05，raw p 0.042，p_adj 0.083，置换 1/10
+   - 新：Ctrl 0.282 / 0.267 / 0.236 ‖ KO 0.227 / 0.202 / 0.169，g −1.88，raw p 0.048，p_adj 0.095，置换 1/10
+
+   仍然两组完全分开、raw p < 0.05，效应略微变小。这是目前唯一撑得住的上层结果。
+
+4. **0917_01（Sox9 皮层 L5-6）方向不变、略微变强，仍无一项过 BH**（345 → 339 行）。
+   Isocortex `Sox9_pos` RegionProportion：g −1.87 → −2.07（raw p 0.081 → 0.062）；
+   `non_glia_MADM_Sox9` RegionProportion g −1.84 → −2.02（raw p 0.072 → 0.041）。
+   Density 类读数新旧都在 0 附近。
+
+5. **0917_02（全类别 CP L5-6）唯一那条过 BH 的结果没了**：旧的
+   `Hippocampal formation / non_glia_all / Density`（g +3.32、p_adj 0.034）在新表里不再显著，
+   全表 0 项过 BH。0914_02 那条"只有 HPF non_glia_all Density 过 BH"的记录**作废**。
+
+**关键决定**：
+- s8 保持 `DeMBA_0904`（它的质心从没坏过，frame check dz −20、峰值 2.97，是六只里最好的）。
+- 旧的 0913_01 / 0914_01 / 0914_02 / 0914_03 四个目录保留不删，作为"坏坐标版"的对照。
+  引用结果时必须写清楚是 0917_* 还是 0914_*。
+
+**图**（都是柱状图，一柱一组、六个样本点画在上面，标 raw p 和 p_adj、不标 g）：
+- `0917_01/figures/bars/`（13 张）+ `figures/bars_by_region/`（41 区 × 3 指标）
+- `0917_02/figures/bars/`（13 张）+ `figures/bars_by_region/`（30 区 × 5 指标）
+- `0917_03/figures/`（11 张，`plot_laminar` 出的）
+
+```bash
+python -m stats.plot_bars --config stats/configs/tsc_regions_sox9_L56.yaml --preset by-region
+# 泛用模式必须显式给 --classes：默认找的是 all_cells，这两个 run 都没有这个类，
+# 不给就静默 [skip] "nothing to draw"
+python -m stats.plot_bars --config stats/configs/tsc_regions_sox9_L56.yaml --preset none \
+    --regions Isocortex --classes Sox9_pos,glia_MADM_Sox9,non_glia_MADM_Sox9 --metric RegionProportion
+```
+`--preset volume` 在这两个 run 上画不出东西，不是 bug：`VOLUME_REGIONS` 是写死的全脑大区
+（root / Cerebrum / Brain stem …），而这两条主线只测皮层。要看体积用
+`--classes region --metric Volume` 指定区。
+
+图上能直接看出来的：
+- `0917_03/figures/00_layer_label_qc.png`：**L5 和 L6a 六只已经基本齐平**
+  （19.9~23.9 / 21.2~26.7），旧版 s12t 是 30.6 / 29.3 的突出值。**只剩 L1 还散**
+  （s10 23.5 最高、s12t 7.3 最低）。
+- `0917_02/figures/bars/bars_region_volume_by_region.png`：Isocortex / HPF / OLF 三个区
+  KO 体积都低于 Ctrl 但都 n.s.，和"Density 普遍升高来自 KO 脑缩小"的说法方向一致。
+
+**下一步**：
+- 0914_01（Sox9 CP L5-6）和其它几条（madm4、ctx_L5、marker、blocks）还没重跑，
+  config 已经指到新目录，直接跑即可。
+- 重跑一遍 `stats/qc_samples.py` / `qc_depth.py`，六只现在的细胞数变了（总量掉了约 20%）。
+- s10 的 L1 过高是几何问题不是坐标问题，仍然要等 730 通道的相对深度方案。
