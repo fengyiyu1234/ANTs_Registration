@@ -33,7 +33,7 @@ READOUT_ORDER = ["MADM_all", "glia_all", "non_glia_all", "Sox9_pos", "Sox9_neg",
                  "glia_MADM", "glia_MADM_Sox9", "non_glia_MADM", "non_glia_MADM_Sox9"]
 
 UNITS = {
-    "LaminarShare": "% of this class's\nisocortex cells",
+    "LaminarShare": "% of this class's\n{root} cells",
     "BinComposition": "% of all labelled\ncells in the bin",
     "Count": "cells",
 }
@@ -61,12 +61,43 @@ class LaminarRun:
         self.token_qc = pd.read_csv(os.path.join(run_dir, "laminar_token_qc.csv"),
                                     dtype={"token": str})
         self.schemes = (self.cfg.get("laminar") or {}).get("schemes") or {}
+        self.root = self._root_acronym(run_dir)
+        slab = (self.cfg.get("laminar") or {}).get("slab")
+        self.slab = self._slab_note(run_dir, slab) if slab else ""
+
+    def _slab_note(self, run_dir, slab):
+        """A run that counts only part of the root must say so on every figure:
+        the shares are of the slab, not of the whole structure."""
+        qc = pd.read_csv(os.path.join(run_dir, "laminar_slab_qc.csv"))
+        lo, hi = qc["lo"].min(), qc["hi"].max()
+        thick = qc["thickness_um"]
+        mode = str(slab.get("mode", "quantile"))
+        return (f"{slab.get('axis', 'yt')} {lo:.0f}-{hi:.0f} ({mode}), "
+                f"{thick.min():.0f}-{thick.max():.0f} um thick, "
+                f"{qc['frac_kept'].min() * 100:.0f}-{qc['frac_kept'].max() * 100:.0f}% of cells")
+
+    def _root_acronym(self, run_dir):
+        """The territory the whole run is inside, for the axis labels and titles.
+        Taken from the layer map rather than hard-coded: a run restricted to one
+        area must not be labelled 'Isocortex'."""
+        root_id = int((self.cfg.get("laminar") or {}).get("root_id", 315))
+        lmap = pd.read_csv(os.path.join(run_dir, "laminar_layer_map.csv"))
+        hit = lmap.loc[lmap["id"] == root_id, "acronym"]
+        return str(hit.iloc[0]) if len(hit) else f"id {root_id}"
+
+
+def _undefined(r, samples):
+    """area_mean leaves a row empty when no area clears `area_min_cells` in every
+    animal -- e.g. glia_MADM_Sox9 inside SS, where s12t holds 123 cells in all of
+    it. Draw the gap instead of crashing on the NaN."""
+    return all(pd.isna(r[s]) for s in samples)
 
 
 def _item(r, samples, scale):
-    note = f"perm rank {int(r['perm_rank'])}/{int(r['perm_of'])}"
+    note = (f"perm rank {int(r['perm_rank'])}/{int(r['perm_of'])}"
+            if pd.notna(r["perm_rank"]) else "")
     if not bool(r["loo_keeps_sign"]):
-        note += " · sign flips leaving one out"
+        note += (" · " if note else "") + "sign flips leaving one out"
     return Item(r["bin"], {s: float(r[s]) * scale for s in samples},
                 p_adj=float(r["p_adj"]), p_raw=float(r["p_value"]),
                 g=float(r["hedges_g"]), note=note)
@@ -92,20 +123,27 @@ def grid_figure(run, scheme, pooling, metric, out_path):
         for j, b in enumerate(bins):
             ax = axes[i, j]
             row = sub[(sub["readout"] == ro) & (sub["bin"] == b)]
-            if row.empty:
+            if row.empty or _undefined(row.iloc[0], run.samples):
                 ax.axis("off")
+                if not row.empty:
+                    ax.text(0.5, 0.5, f"{b}\nundefined:\nno area reaches\narea_min_cells\nin every animal",
+                            ha="center", va="center", fontsize=8, color=ps.INK_SOFT,
+                            transform=ax.transAxes)
                 continue
             draw_panel(ax, run, _item(row.iloc[0], run.samples, scale), metric,
                        run.alpha, p_text=both_p_text)
-        axes[i, 0].set_ylabel(f"{ro}\n{UNITS.get(metric, metric)}", fontsize=9.5)
+        root = f"{run.root} slab" if run.slab else run.root
+        axes[i, 0].set_ylabel(f"{ro}\n{UNITS.get(metric, metric).format(root=root)}",
+                              fontsize=9.5)
         axes[i, 0].yaxis.label.set_fontweight("bold")
 
     role = sub["role"].iloc[0]
     handles = _legend_handles(run)
     fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 8),
                bbox_to_anchor=(0.5, 0.0))
-    fig.suptitle(f"Isocortex laminar — {metric}, {scheme}, {pooling}  [{role}]\n"
-                 f"{SUBTITLE.get(metric, '')}; BH family = the bins of one row",
+    slab = f"\nslab: {run.slab}" if run.slab else ""
+    fig.suptitle(f"{run.root} laminar — {metric}, {scheme}, {pooling}  [{role}]\n"
+                 f"{SUBTITLE.get(metric, '')}; BH family = the bins of one row{slab}",
                  fontsize=12, y=1.0)
     fig.tight_layout(rect=(0, 0.025, 1, 0.985), h_pad=2.2)
     ps.savefig(fig, out_path)
@@ -134,8 +172,9 @@ def token_qc_figure(run, out_path):
         ax.set_title(f"layer {t}" if t != "unassigned" else t, fontsize=10)
         ax.yaxis.grid(True, zorder=0)
         ax.set_axisbelow(True)
-    axes[0, 0].set_ylabel("% of the animal's\nisocortex cells")
-    fig.suptitle("Isocortex — cells on each ORIGINAL layer label, per animal "
+    axes[0, 0].set_ylabel(f"% of the animal's\n{run.root} cells"
+                          + (" in the slab" if run.slab else ""))
+    fig.suptitle(f"{run.root} — cells on each ORIGINAL layer label, per animal "
                  f"({run.group_name['a']} blue, {run.group_name['b']} orange)\n"
                  "a thin-layer registration / detection problem shows up here; "
                  "once layers are binned it no longer can", fontsize=11)

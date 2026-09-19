@@ -59,17 +59,24 @@ def _clean_name(raw):
     return s.strip()
 
 
-def valid_region_ids(df):
-    """Structure ids of cells that actually landed inside the atlas.
+def valid_region_mask(df):
+    """Row mask of cells that actually landed inside the atlas.
 
     Filters on BOTH the name and the id: a cell outside the atlas is written
     with region_id 0 and name "background", and id 0 is not a real CCF
     structure, so either test alone would do -- but a file hand-edited by
     scripts/relabel_cells.py can carry an id whose name lookup failed, and
-    those must not be counted as if they were assigned."""
+    those must not be counted as if they were assigned.
+
+    Callers that also filter on the warped coordinates need the mask, not just
+    the ids, so that the two filters line up row by row."""
     name = df["region_name"].astype(str).str.strip().str.lower()
-    ok = (~name.isin(BACKGROUND_NAMES)) & (df["region_id"] > 0)
-    return df.loc[ok, "region_id"].to_numpy(dtype=np.int64)
+    return (~name.isin(BACKGROUND_NAMES)) & (df["region_id"] > 0)
+
+
+def valid_region_ids(df):
+    """Structure ids of the rows valid_region_mask keeps."""
+    return df.loc[valid_region_mask(df), "region_id"].to_numpy(dtype=np.int64)
 
 
 def class_counts(csv_path, ontology, exclude_mask=None):
