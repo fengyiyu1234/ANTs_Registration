@@ -196,6 +196,7 @@ def main():
         raise SystemExit(f"{args.run} 没有切片板，没什么可画的")
     lam = cfg.get("laminar") or {}
     slab = lam.get("slab") or {}
+    centered = str(slab.get("placement", "cover")).lower() == "center"
     if slab.get("axis", "yr") != "yr":
         raise SystemExit("这张图画的是冠状板，需要 slab.axis: yr")
 
@@ -219,6 +220,8 @@ def main():
         lo, hi = float(row["lo"]), float(row["hi"])
 
         img, rm, cm = sample_panel(sdir, root_ids, cov)
+        if centered:
+            cm = np.zeros_like(cm)
         draw(axes[r][0], img, rm, cm, lo, hi, colour,
              f"{s} — own image · yr {lo:.0f}-{hi:.0f} · {row['thickness_um']:.0f} um · "
              f"{row['root_volume_in_slab_mm3']:.2f} mm3 {root_acr} · "
@@ -227,18 +230,22 @@ def main():
         ann, ref = atlas_paths(sdir, atlas_dir)
         alo, ahi, resid = slab_in_atlas(sdir, root_ids, lo, hi)
         aimg, arm, acm = atlas_panel(ann, ref, root_ids, cov)
+        if centered:
+            acm = np.zeros_like(acm)
         draw(axes[r][1], aimg, arm, acm, alo, ahi, colour,
              f"{s} — atlas {os.path.basename(ann).split('annotation_')[1][:12]} · "
              f"yt {alo:.0f}-{ahi:.0f} (approx, fit residual {resid:.0f} um)")
         axes[r][0].set_ylabel(s, fontsize=10, color=colour, fontweight="bold")
 
+    placement_note = (
+        "slab centred on the root AP extent" if centered else
+        f"blue = {'+'.join(cov_names)} (positions the slab only)")
     fig.suptitle(
         f"Sampled range, per animal — left: the animal's own image (exact) · "
         f"right: its atlas variant (approximate)\n"
         f"sagittal at the plane richest in {'+'.join(cov_names)} · "
-        f"yellow = {root_acr} (counted) · blue = {'+'.join(cov_names)} "
-        f"(positions the slab only) · "
-        f"anterior left", fontsize=11.5)
+        f"yellow = {root_acr} (counted) · {placement_note} · anterior left",
+        fontsize=11.5)
     fig.tight_layout(rect=(0, 0, 1, 1 - 0.30 / len(order)))
     out = args.out or os.path.join(args.run, "figures", "00_slab_sagittal.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)

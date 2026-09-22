@@ -107,6 +107,21 @@ def test_laminar():
     undefined in area_mean rather than zero."""
     from stats import laminar
 
+    # A centred length slab is defined by the root label's anatomical endpoints.
+    root_profile = np.zeros(40, dtype=int)
+    root_profile[10:30] = 1
+    lo, hi, coverage = laminar.place_length_slab(
+        root_profile, np.zeros_like(root_profile), 0.10, placement="center")
+    assert (lo, hi) == (19, 20), (lo, hi)
+    assert np.isnan(coverage)
+    try:
+        laminar.place_length_slab(
+            root_profile, np.zeros_like(root_profile), 0.10, placement="somewhere")
+    except ValueError as e:
+        assert "center" in str(e) and "cover" in str(e), e
+    else:
+        raise AssertionError("an unknown length-slab placement should fail")
+
     ont_json = {"msg": [{"id": 1, "name": "root", "acronym": "root", "children": [
         {"id": 315, "name": "Isocortex", "acronym": "Isocortex", "children": [
             {"id": 10, "name": "Sensory area", "acronym": "SEN", "children": [

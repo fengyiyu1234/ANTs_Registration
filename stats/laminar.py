@@ -315,7 +315,7 @@ def place_volume_slab(reference, cover_profile, fraction=None, target=None):
     return best[1], best[2], best[3]
 
 
-def place_length_slab(root_profile, cover_profile, fraction):
+def place_length_slab(root_profile, cover_profile, fraction, placement="cover"):
     """-> (lo, hi, coverage) planes, inclusive, whose THICKNESS is `fraction` of
     the root's own extent along the axis.
 
@@ -325,7 +325,13 @@ def place_length_slab(root_profile, cover_profile, fraction):
     those: it is set by the two ends of the structure, and a hole in the middle
     does not move them. The cost is that the animals then contribute different
     amounts of tissue, so it trades a volume artefact for a volume difference.
-    Run it beside the volume sizing rather than instead of it."""
+    Run it beside the volume sizing rather than instead of it.
+
+    ``placement: center`` fixes the slab at the geometric midpoint between the
+    root's first and last occupied planes. It uses the warped root label rather
+    than cell extrema: missing detections and isolated cells must not move an
+    anatomical sampling window. The legacy ``cover`` mode moves the same-width
+    slab to maximise a positioning structure."""
     present = np.flatnonzero(root_profile > 0)
     if present.size == 0:
         raise ValueError("the root has no voxels in this sample")
@@ -333,6 +339,13 @@ def place_length_slab(root_profile, cover_profile, fraction):
     width = int(round(fraction * extent))
     if width < 1:
         raise ValueError(f"fraction {fraction} of {extent} planes rounds to nothing")
+    placement = str(placement).lower()
+    if placement == "center":
+        centre = (float(present[0]) + float(present[-1])) / 2.0
+        lo = int(np.floor(centre - (width - 1) / 2.0 + 0.5))
+        return lo, lo + width - 1, np.nan
+    if placement != "cover":
+        raise ValueError(f"length slab placement '{placement}' must be 'center' or 'cover'")
     if cover_profile.sum() == 0:
         raise ValueError("the cover structures have no voxels in this sample")
     planes = np.arange(len(root_profile))
@@ -390,8 +403,12 @@ def count_cells(cfg, ontology, lmap, class_map, slab=None):
     in_root = np.zeros(ontology.n, dtype=bool)
     in_root[lmap["order"].to_numpy()] = True
     is_volume = bool(slab) and str(slab.get("mode", "")).lower() == "volume"
-    cids = cover_ids(ontology, (slab or {}).get("cover") or []) if is_volume else None
-    if is_volume and not len(cids):
+    cover_names = (slab or {}).get("cover") or []
+    cids = cover_ids(ontology, cover_names) if is_volume else None
+    size_by = str((slab or {}).get("size_by", "volume")).lower()
+    placement = str((slab or {}).get("placement", "cover")).lower()
+    needs_cover = not (size_by == "length" and placement == "center")
+    if is_volume and needs_cover and not len(cids):
         raise ValueError("a volume slab needs `cover`: the structures that decide "
                          "where along the axis it sits")
     frames, qc, vols = [], [], []
@@ -415,11 +432,12 @@ def count_cells(cfg, ontology, lmap, class_map, slab=None):
                     ref_prof = ref
                 else:
                     raise ValueError(f"slab reference '{sized_on}' must be 'sample' or 'root'")
-                if str(slab.get("size_by", "volume")).lower() == "length":
+                if size_by == "length":
                     if sized_on != "root":
                         raise ValueError("size_by: length measures the root's own extent, "
                                          "so it needs reference: root")
-                    lo, hi, worst = place_length_slab(ref_prof, cov, float(slab["fraction"]))
+                    lo, hi, worst = place_length_slab(
+                        ref_prof, cov, float(slab["fraction"]), placement=placement)
                 else:
                     target = slab.get("volume_mm3")
                     lo, hi, worst = place_volume_slab(
@@ -461,7 +479,8 @@ def count_cells(cfg, ontology, lmap, class_map, slab=None):
                        "volume_frac_of_sample": vol_frac,
                        "cover_coverage": worst,
                        "sized_on": sized_on,
-                       "sized_by": str(slab.get("size_by", "volume")).lower(),
+                       "sized_by": size_by,
+                       "placement": placement if is_volume else "",
                        "sized_volume_mm3": sized_mm3,
                        "root_extent_um": root_extent_um,
                        "thickness_frac_of_root_extent":
@@ -707,9 +726,12 @@ def main():
                                       "log2fc", "hedges_g", "p_value", "p_adj",
                                       "perm_rank", "loo_keeps_sign"]]
     if r["primary_metric"] == "Count":
+        if r["slab"] and str(r["slab"].get("size_by", "volume")).lower() == "length":
+            detail = "板厚是每只 root 前后长度的同一比例，板内组织量不强制相等"
+        else:
+            detail = "板按每只自己的 root 体积等比例切"
         print(f"\n主分析：{r['primary']}，pooled Count"
-              f"（板内每个箱的细胞数；板按每只自己的 root 体积等比例切，所以这是"
-              f"“同一份额的皮层里有多少细胞”）")
+              f"（板内每个箱的细胞数；{detail}）")
     elif r["primary_metric"] == "Density":
         print(f"\n主分析：{r['primary']}，pooled Density"
               f"（板内每个箱的细胞数 / 该箱在这只动物板内的实测体积，单位 cells/mm3）")

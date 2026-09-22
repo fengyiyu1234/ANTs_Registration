@@ -2602,3 +2602,94 @@ python -m stats.plot_bars --config stats/configs/tsc_regions_sox9_L56.yaml --pre
   config 已经指到新目录，直接跑即可。
 - 重跑一遍 `stats/qc_samples.py` / `qc_depth.py`，六只现在的细胞数变了（总量掉了约 20%）。
 - s10 的 L1 过高是几何问题不是坐标问题，仍然要等 730 通道的相对深度方案。
+
+---
+
+## 2026-09-19：全链路质控工具 —— 按脑区看 brain_detector 的每一级检测框
+
+起因：0918_09 这批统计出来之后，"实验组细胞数量变少、和文献相反"的说法要先确认是不是
+检测某一步的问题。现有的 `qc/view_region_cells.py` 只画 `cell_registration.csv`，一个细胞
+一个点 —— 那是链路的**最后一步**，回答得了"这个细胞归区对不对"，回答不了"这个细胞是怎么
+被数出来的"。而 brain_detector 自己的 `src/utils/visualize.py` 能把三级框都画出来，却是
+**按 tile** 走的，不知道脑区，问不了"皮层浅层的 Sox9 判读和深层一样吗"。
+
+**做了什么**（都在 `../Registration_toolkit`，未提交）：
+
+| 文件 | 作用 |
+|---|---|
+| `qc/detection_boxes.py` | 新增。GUI-free：读检测各级输出、坐标换算、栅格化、对账 |
+| `qc/view_detection_qc.py` | 新增。napari 界面 + `--funnel` / `--summary` / `--snapshot` |
+| `configs/detection_qc.example.yaml` | 新增。字段和 `region_qc.yaml` 兼容，多 `detection_*` 几项 |
+| `tests/test_detection_qc_smoke.py` | 新增。8 个 headless 自测 |
+| `qc/region_cells.py` | 改一处：`VerdictStore` 接受自定义判定词表 |
+| `README.md` / `qc/README.md` | 补文档 |
+
+```bash
+conda activate antsreg
+cp configs/detection_qc.example.yaml configs/detection_qc.yaml   # 改 run_dir / detection_dir / out_dir
+python qc/view_detection_qc.py --funnel      # 先跑这个：数字，不读图
+python qc/view_detection_qc.py --snapshot    # 每个 site 一张 PNG
+python qc/view_detection_qc.py               # napari 逐个看、逐个判定
+python tests/test_detection_qc_smoke.py
+```
+
+图层命名照 `visualize.py`，所以两边的读图习惯是通的：
+
+| 图层 | 来自 | 一行是什么 |
+|---|---|---|
+| `[s2] <ch>` | `2_global_2d_raw/{ch}_2d_global.csv` | 一个 2D 框在一层上 |
+| `[s3] <ch>` | `3_channel_3d/{ch}_3d_tracked.csv` | z-link 去重后的一个细胞 |
+| `[coloc] GFP+Sox9` | `4_colocalization/coloc_result.csv` | 共定位判定后的最终类别 |
+| `region cells` | `cell_registration/*/cell_registration.csv` | 统计真正数的那一批 |
+
+**关键决定**：
+- **默认读 s2（`2_global_2d_raw`）而不是逐 tile 的 s1。** s2/s3/s4 已经在全局坐标里，和
+  `cell_registration.csv` 的 0-2 列同系，省掉一次 tile 偏移换算，也就少一个能出错的地方。
+  没有 `2_global_2d_raw/` 时才回退到 `1_tile_2d_filtered/`（stage 3 自己读的就是它），
+  那时才用 `TileGrid` 还原 `global_x = x + tile_x0`、`global_z = z − tile_z0`。
+- **抄 `visualize.py` 而不是 import brain_detector。** 和 `qc/crop_geometry.TileGrid` 同一个
+  理由：这个仓库依赖 `registration_ants`，不依赖 brain_detector，两台机器装的东西不一样。
+  颜色、class 解析（含丢掉 `GFP_3` 拆出来的伪 marker `3`）、栅格化都各自标了出处。
+- **所有读盘分块。** `2_global_2d_raw` 是一个框一层一行，整脑几千万行；看图时先把所有
+  site 的窗口算出来、一次扫盘只留落在窗口里的行，对账时一行都不留。峰值内存和文件大小无关。
+- **判定词表和归区质控分开**（`ok` / `over_merge` / `under_merge` / `sox9_wrong` /
+  `not_cell`），`VerdictStore` 因此加了 `vocab=` 参数。`verdicts.csv` 格式不变，但两套
+  **不要共用同一个 `out_dir`**。
+
+**`--funnel` 是这个工具真正的用处**：不读一张图，两趟扫盘，回答"类别比例是在哪一级变的"。
+每一级在所选脑区里各多少个、每一级的 Sox9+ 占比、以及 z-link 压缩比（一个细胞平均跨几层，
+两组差很多就是 `iou_thresh` / `max_cell_z_span` 对某个通道不合适）。逐个看图是用来解释
+漏斗里那个跳变的，不是用来发现它的。
+
+里面最要紧的是 **s4 → cell_registration 逐行对账**。这是整条链路上唯一一处**应该精确相等**
+的接缝：`run_inference.py` 写质心用 `cx = (x1+x2)/2`、`cy = (y1+y2)/2`、`z` 原样，
+`cell_points.py` 把这三个数原样抄进细胞表 0-2 列（reposition 也不动它们）。对不上就是丢了行、
+或者两份文件不是同一次跑出来的。
+
+**遇到的问题**：
+- **框坐标一开始存成 float32，自测立刻炸出 ~1.6% 的假不匹配。** 拼接后的 x 能到 ~2e4 像素，
+  float32 在那个量级的分辨率约 2e-3，正好卡在对账用的小数点后 3 位上。已改成 float64 并在
+  代码里写了原因 —— 这是唯一一处靠精确相等下结论的检查，降精度等于把它废掉。
+- `detection_dir` 打错原本只产生一堆"这一级看不到"的警告，和"检测什么都没产出"长得一样。
+  加了顶层目录 + 至少一个阶段目录的前置硬检查。
+- PNG 标题原来写的中文，matplotlib 默认字体没有 CJK 字形会变方块，改成英文（Qt 面板不受影响）。
+
+**验证**：新自测 8 项全过（含 s1 偏移反解、栅格化只画轮廓不画实心、漏斗压缩比、对账在"丢行"
+和"整体平移"两种坏法下都能报出来）。原有 `test_region_qc_smoke.py` / `test_qc_crops_smoke.py` /
+`test_tool_inputs_smoke.py` 全部回归通过；真实 s12t `DeMBA_0915` 上跑
+`view_region_cells.py --summary` 输出与改动前一致。
+
+**要注意的**：
+- 检测结果目录和全分辨率 tile 都不在这台 Linux 上（在 Y: 那台），所以这个工具**要在那台机器
+  上跑**。这边只能跑自测。
+- **框只有在 `source: tiles` 下才对得上单个细胞**（框本来就画在 0.65 µm 网格上）；
+  `source: volume` 的 2.6×2.6×32 µm 网格上一个细胞不到一个体素，只适合 `--funnel`。
+- 漏斗里四级用的是 `labels_in_sample` 回查框中心（统一口径），细胞表那一行用的是它自己第 9 列
+  （和统计一致）。两者差几个百分点正常，差很多要先查配准。
+
+**下一步**：
+- 六个样本各跑一次 `--funnel`，把 Sox9+ 占比按级别排出来。**如果占比在 s4 之前就已经分组分离，
+  是检测问题；三级都一样、只有细胞表分离，才是配准归区问题。** 这是目前唯一能把 0918_09 那个
+  "浅层 Sox9+ 占比 33% → 24%" 定位到具体某一步的办法。
+- 同时看 z-link 压缩比有没有分组差异 —— 那会直接改变细胞数。
+- s18 是重定位过的 run，碎片上画出来的脑区边界是合拢后的位置（session 会警告），选 site 时避开。
