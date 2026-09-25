@@ -2693,3 +2693,52 @@ python tests/test_detection_qc_smoke.py
   "浅层 Sox9+ 占比 33% → 24%" 定位到具体某一步的办法。
 - 同时看 z-link 压缩比有没有分组差异 —— 那会直接改变细胞数。
 - s18 是重定位过的 run，碎片上画出来的脑区边界是合拢后的位置（session 会警告），选 site 时避开。
+
+---
+
+## 2026-09-25：2D 矢状切片手工 mask 编辑器（记录 09-23 实现）
+
+依据 `mask_2d.md`，给普通免疫荧光矢状切片增加了单张 2D mask 编辑入口。
+
+**做了什么**：
+- 新增 `scripts/paint_section2d.py`。从现有 sections2d YAML 按 section name 读取 image、
+  channel/panel_colors、z_projection、pixel_size_um 和图谱 ontology；图像仍由
+  `section_io.load_registration_image()` 读取，画布及输出始终是原图的 (Y, X)。
+  napari 中有原图、可编辑 brain tissue、exclude/damage 和多标签 guide regions；
+  支持自动组织轮廓预填、候选预览后确认替换、画笔/多边形擦除、区域画笔号新增、
+  ontology 搜索与赋值、移除赋值、区域重编号、保存及恢复。
+- 新增 `src/registration_ants/section_masks.py`，把自动初稿映射、三层尺寸校验、
+  `tissue_final = edited_tissue AND NOT damage`、面积/连通域报告及 TIFF/JSON
+  保存恢复放在可独立调用的函数里。输出同原图宽高的单页二维
+  `*_tissue.tif`、`*_damage.tif`、`*_regions.tif`，另存
+  `*_tissue_edited.tif` 以便恢复 damage 覆盖下的原组织层，以及
+  `*_regions.regions.json` 记录图像、通道、分辨率、ontology 哈希和区域赋值。
+  恢复时核对原图、尺寸、通道、投影及 ontology；未赋值的已绘制画笔号不能导出。
+- 相邻 `../Registration_toolkit/paint_mask.py` 和
+  `configs/paint_mask.example.yaml` 增加 `mode: section2d` 入口，
+  使用 `sections_config`、`section_name`、`output_dir` 调用新编辑器；
+  原 `guide` / `labels` 分支保持原运行路径。主仓库 `README.md` 补了运行方法。
+
+```bash
+conda activate antsreg
+python scripts/paint_section2d.py configs/my_sections.yaml m1_sec03 --output-dir /path/to/masks
+# 或在 Registration_toolkit/configs/paint_mask.yaml 设 mode: section2d 后：
+python ../Registration_toolkit/paint_mask.py
+```
+
+**关键语义**：配准现有的 `sections[].tissue_mask` / `damage_mask` 可直接读取导出的
+组织和排除 TIFF。没有画 damage 时，GUI 生成的可粘贴配置片段省略该字段。
+区域标签独立保存并能恢复，但当前 `section2d.process_section()` **没有读取或使用**
+区域 TIFF/ontology 赋值；画了嗅球、皮层也暂时不会改变 ML 搜索、Affine 或 SyN。
+本次没有实现 `guide_regions_mask` 消费端，也没有用真实切片定区域约束权重。
+
+**验证**：`tests/test_section_masks.py` 的 3 项 unittest 通过：逐像素保存恢复、
+空/错尺寸/未赋值校验，以及自动初稿导回配准工作网格后与原 Otsu mask 逐像素相同。
+`paint_mask.py --selftest` 的原 `guide` / `labels` 自测全过；
+在 xvfb 虚拟显示下完成了 GUI 启动、ontology 赋值、保存和重新打开的合成图测试。
+尚未拿真实有碎片/损伤的切片对照 `qc.png` 做人工验收。
+
+**下一步**：先用 5–10 张真实切片核对自动轮廓、手工去碎片及原图坐标，
+把 TIFF 接入 `sections` 后比较 `qc.png`、候选平面与尺度。
+若区域标签要参与配准，需要另做图谱候选平面的二维 annotation 配对、
+区域评分/变换约束及合成与真实样本验证；现阶段不能把区域标签文件写进配置并期待生效。
