@@ -2742,3 +2742,17 @@ python ../Registration_toolkit/paint_mask.py
 把 TIFF 接入 `sections` 后比较 `qc.png`、候选平面与尺度。
 若区域标签要参与配准，需要另做图谱候选平面的二维 annotation 配对、
 区域评分/变换约束及合成与真实样本验证；现阶段不能把区域标签文件写进配置并期待生效。
+
+---
+
+## 2026-09-25（续）：2D mask 编辑器迁移到 Registration_toolkit
+
+按仓库职责将 GUI 及会话逻辑整体迁到相邻
+`../Registration_toolkit/`：`paint_section2d.py`、
+`section_masks.py` 和 `tests/test_section_masks.py`。
+本仓库删除原先 `scripts/`、`src/registration_ants/`、`tests/` 中的对应文件；
+`section2d.py`、`section_io.py` 及现有 tissue/damage 消费端不变。
+`paint_mask.py` 的 `section2d` 模式现在直接导入同仓库编辑器，
+不再定位本仓库的脚本。原 TIFF/JSON 输出格式保持兼容。
+两个 README 已更新运行路径。迁移后的 3 项 mask 测试和
+`paint_mask.py --selftest` 均通过；区域标签配准消费端仍未实现。
