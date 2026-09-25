@@ -256,3 +256,31 @@ badly *and* drags both its neighbours down with it.
 - `test_new_features_smoke.py` — smoke tests for miscellaneous newer pipeline features.
 
 Full details for any script/module are in its own docstring.
+
+
+## 2D section mask editor
+
+Use the same sections2d YAML and section name as the registration command:
+
+```bash
+conda activate antsreg
+python scripts/paint_section2d.py configs/my_sections.yaml m1_sec03 --output-dir /path/to/masks
+```
+
+The napari editor loads the registration channel with
+`registration_ants.section_io.load_registration_image()`. It prefills the
+editable **brain tissue** layer using the registration Otsu path. Paint or
+erase tissue, mark local defects in **exclude / damage**, and create numbered
+**guide regions** with ontology assignments. **Preview automatic tissue**
+shows a candidate without replacing edits; **Adopt candidate** asks before
+replacing them. Saving writes full-size, single-page YX TIFFs and a JSON
+session record. Reopening the same command restores all three editable layers
+and assignments. The extra `*_tissue_edited.tif` keeps the tissue pixels
+under damage marks for exact editing recovery.
+
+Copy the printed `tissue_mask` and `damage_mask` paths into the corresponding
+`sections` entry. Those two TIFFs are consumed by the current 2D
+registration pipeline. The `*_regions.tif` and `*.regions.json` files are
+saved and restored, but region guidance is **not yet used** during plane search,
+Affine, or SyN. Do not expect painting olfactory bulb or cortex regions to
+change the registration result yet.

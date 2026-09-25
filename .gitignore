@@ -21,3 +21,4 @@ stats/configs/*.yaml
 *_local.yaml
 # startup-failure breadcrumb from run_pipeline.sh (see its header)
 run_pipeline.error.log
+*.md
