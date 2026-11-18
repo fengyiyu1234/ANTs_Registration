@@ -451,7 +451,20 @@ def run_pipeline(config_path):
     # Load the raw stack once, at its own native (anisotropic) resolution --
     # reused below both for the full resample and, if crop_for_registration
     # is set, for the cropped one, instead of decoding the TIFF twice.
-    raw_img = io_utils.load_tiff_stack_as_ants(sample["raw_tiff"], tuple(sample["voxel_size_um"]))
+    load_ds = int(sample.get("load_downsample_xy", 1))
+    if load_ds > 1:
+        if reposition_plan is not None:
+            raise ValueError("sample.load_downsample_xy cannot be combined with sample.reposition_plan "
+                             "(the plan is drawn on the full raw grid)")
+        if reg_cfg.get("crop_for_registration"):
+            raise ValueError("sample.load_downsample_xy cannot be combined with "
+                             "registration.crop_for_registration (crop indices are raw-grid voxels)")
+        raw_img = io_utils.load_tiff_stack_downsampled_xy(
+            sample["raw_tiff"], tuple(sample["voxel_size_um"]), load_ds)
+        logger.info("Loaded %s block-averaged %dx in xy: shape=%s spacing=%s",
+                    sample["raw_tiff"], load_ds, raw_img.shape, raw_img.spacing)
+    else:
+        raw_img = io_utils.load_tiff_stack_as_ants(sample["raw_tiff"], tuple(sample["voxel_size_um"]))
     # Before the resample, not after: the plan's offsets are microns on the raw
     # grid, and a flap has to be closed while the sections it was drawn on are
     # still the sections in the array.
@@ -754,6 +767,7 @@ def run_pipeline(config_path):
             cells_cfg["cell_centroids_dir"], output_dir, tuple(cells_cfg["voxel_size_um"]),
             sample_fine, reg, atlas_structures=reg.get("atlas_structures"), prefix=cells_cfg["prefix"],
             reposition_plan=reposition_plan, reposition_fragments=reposition_fragments,
+            offset_px=cells_cfg.get("offset_px"),
         )
         logger.info("Cell regions assigned for %d class(es): %s", len(classes), classes)
     else:

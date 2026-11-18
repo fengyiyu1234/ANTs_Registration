@@ -77,7 +77,7 @@ def _physical_to_index(img, physical_xyz):
 
 def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fine_img, reg,
                          atlas_structures=None, prefix='ob_', reposition_plan=None,
-                         reposition_fragments=None):
+                         reposition_fragments=None, offset_px=None):
     """Process every <prefix><class>.csv under cell_centroids_dir: convert
     original-pixel-space centroids to physical microns, transform through
     `reg` into atlas space, look up the atlas region at each cell, and write
@@ -113,9 +113,19 @@ def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fi
     the region assignment are computed from the moved position, because the
     grid registration ran on is the repositioned one.
 
+    offset_px: optional (dx, dy, dz) in the same raw pixel units as the CSV,
+    added to every centroid before anything else (reposition included). For
+    a registration image stitched from a different channel/XML than the one
+    the cell coordinates are in: the shift that takes a cell's coordinate to
+    where the same point sits in raw_tiff's frame (scaled to cell pixels).
+    Columns 0-2 keep the unshifted source values.
+
     Returns the list of class names processed.
     """
     voxel_size_um = np.array(voxel_size_um, dtype=float)
+    offset = np.zeros(3) if offset_px is None else np.asarray(offset_px, dtype=float)
+    if offset.shape != (3,):
+        raise ValueError(f"offset_px must be [dx, dy, dz], got {offset_px!r}")
     atlas_annotation = reg['atlas_annotation']
     atlas_arr = atlas_annotation.numpy()
     atlas_shape = np.array(atlas_arr.shape)
@@ -136,10 +146,10 @@ def assign_cell_regions(cell_centroids_dir, output_dir, voxel_size_um, sample_fi
             continue
 
         raw_xyz = np.ascontiguousarray(df_src[['cx', 'cy', 'z']].values, dtype=float)
-        moved_xyz = raw_xyz
+        moved_xyz = raw_xyz + offset
         if reposition_plan is not None and reposition_fragments is not None:
             cx, cy, cz, moved = reposition.apply_to_cells(
-                raw_xyz[:, 0], raw_xyz[:, 1], raw_xyz[:, 2],
+                moved_xyz[:, 0], moved_xyz[:, 1], moved_xyz[:, 2],
                 reposition_fragments, reposition_plan, voxel_size_um)
             moved_xyz = np.column_stack([cx, cy, cz])
             logger.info("Class %s: repositioned %d of %d cell(s) with the fragments they sit on.",

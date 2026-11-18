@@ -360,5 +360,8 @@ def load_config(path):
         if not Path(cells_cfg["cell_centroids_dir"]).is_dir():
             raise FileNotFoundError(f"cells.cell_centroids_dir not found: {cells_cfg['cell_centroids_dir']}")
         cells_cfg.setdefault("prefix", "ob_")
+        offset = cells_cfg.get("offset_px")
+        if offset is not None and len(offset) != 3:
+            raise ValueError("cells.offset_px must be [dx, dy, dz] in cell (raw) pixel units")
 
     return config

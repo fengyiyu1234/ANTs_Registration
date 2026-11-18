@@ -68,6 +68,33 @@ def load_tiff_stack_as_ants(raw_path, voxel_size_xyz, preserve_labels=False):
     return ants.from_numpy(np.ascontiguousarray(arr_xyz), spacing=(sx, sy, sz))
 
 
+def load_tiff_stack_downsampled_xy(raw_path, voxel_size_xyz, factor):
+    """Intensity TIFF stack -> float32 ANTs image, block-averaged factor x
+    factor in xy while reading, one z page at a time.
+
+    For big stitched stacks (10+ GB uint16) where load_tiff_stack_as_ants +
+    resample_to_isotropic peak at ~15x the file size. Peak here is the
+    downsampled float32 volume plus one page. Trailing rows/columns that don't
+    fill a whole block are dropped. Origin stays 0 like every image in this
+    codebase, so the block centres sit (factor-1)/2 raw voxels off their true
+    position (3.9 um for factor 4 at 2.6 um) -- negligible next to the 20 um
+    registration grid, but not zero.
+    """
+    factor = int(factor)
+    if factor <= 1:
+        return load_tiff_stack_as_ants(raw_path, voxel_size_xyz)
+    with tifffile.TiffFile(str(raw_path)) as tif:
+        series = tif.series[0]
+        nz, ny, nx = series.shape
+        h, w = (ny // factor) * factor, (nx // factor) * factor
+        out = np.empty((w // factor, h // factor, nz), dtype=np.float32)   # (x, y, z)
+        for z, page in enumerate(series.pages):
+            plane = page.asarray()[:h, :w].astype(np.float32)
+            out[:, :, z] = plane.reshape(h // factor, factor, w // factor, factor).mean(axis=(1, 3)).T
+    sx, sy, sz = voxel_size_xyz
+    return ants.from_numpy(out, spacing=(sx * factor, sy * factor, sz))
+
+
 def load_nifti_stack_as_ants(raw_path, voxel_size_xyz, preserve_labels=False):
     """Read a NIfTI volume and wrap it as an ANTs image with correct spacing,
     discarding the file's own header spacing/direction/origin.
