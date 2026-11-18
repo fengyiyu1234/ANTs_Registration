@@ -2756,3 +2756,84 @@ python ../Registration_toolkit/paint_mask.py
 不再定位本仓库的脚本。原 TIFF/JSON 输出格式保持兼容。
 两个 README 已更新运行路径。迁移后的 3 项 mask 测试和
 `paint_mask.py --selftest` 均通过；区域标签配准消费端仍未实现。
+
+---
+
+## 2026-11-18：TSC + WT 23 个样本的快速批量配准（DeMBA P5，soma 图）；本机试跑耗时记录
+
+起因：要把所有 TSC（FF 8 个、FW 8 个）和 WT 对照（7 个）先粗配一遍（原本为 presentation，后来取消），
+之后再挑效果差的样本精配。样本信息来自 brain_detector 的 config 和日志（11-17 分组那条）。
+
+### 做法（用户确认过的决定）
+
+- 图谱：DeMBA P5（`atlas/DeMBA/`，CCFv3 20 µm 网格 (563,400,570)），`configs/atlas_presets_local.yaml` 新建，`resolution_um: 20`。
+- 配准用 **soma 通道**拼接图 `X:/Fengyi/stitched_imgs/soma/<样本>_RFP_xy4x.tif`（t4/t10/t70 是 GFP），2.6×2.6×8 µm。
+  不用 nucleus（Olig2/Sox9）图：用户目测效果不好。
+- **不用手绘 mask**：旧 6 个 TSC 的 mask 画在旧 TeraStitcher 图上（2.6×2.6×32），新拼接的 tile 位置和画布都变了，套不上。
+  只用 `auto_brain_mask`。TSC18 有碎片也先不做 reposition。
+- SyN 参数和旧 TSC 一致：`syn_sampling 4`、`reg_iterations [100,100,40,25]`、`fine_target_um 20`。
+- 输出：`X:/Fengyi/registration_ants/<样本>/DeMBA_P5/`（Y: DeepDesign 盘已满）。
+- 方向：x = 中线→外侧，y = 嗅球→尾侧，固定；z 每个样本看缩略图定。
+  背侧先拍 → `orientation [1,3,2]`、`slicing [[285,510],null,[35,356]]`（右半脑）；
+  腹侧先拍 → `[-1,3,-2]`、`[[285,514],null,[44,365]]`（左半脑，绕 AP 轴转 180°，不是镜像）。
+  腹侧先拍：**TSC10、TSC_FW8、ET10**（后两个用户确认），其余 17 个有图的都是背侧先拍；t70/ET1/ERH 的 soma 图当时还没拼完。
+  判断依据：截面上富细胞皮层圆拱在哪一端；背侧端第一层是"皮层椭圆 + 后方小脑/丘的小块"。
+
+### 代码
+
+- `cell_points.assign_cell_regions(offset_px=...)` / `cells.offset_px`：细胞坐标在 `stitching_reference_channel`
+  （Olig2，老 TSC 是 Sox9）坐标系，soma 图用的是 RFP/GFP 自己的 `xml_merging.xml`，两者差一个平移。
+  按两份 XML 逐 tile 位置差的中位数算（xy 最多 24 原始 px ≈ 16 µm，z 最多 4 层），在变换前加到细胞坐标上；
+  csv 第 0-2 列仍是原始坐标。逐 tile 相对中位数的离散（p90 2–19 px）没修正。
+- `io_utils.load_tiff_stack_downsampled_xy` + `sample.load_downsample_xy`：逐页读 BigTIFF，xy 块平均降采样后再进 float32。
+  原读法（整卷 imread → float32 → transpose → 高斯）峰值约为文件大小的 **15 倍**（6.7 GB 的 FF6 到 101 GB，15 分钟没出第 1 步）。
+  降 4 倍到 10.4 µm 后再走原来的高斯 + 20 µm 重采样，信息量与原路径基本相同；块中心有 (4−1)/2×2.6 = 3.9 µm 偏移（原点仍是 0），
+  相对 20 µm 网格可忽略。不能与 `reposition_plan` / `crop_for_registration` 同时用（两者都写在原始网格上），会直接报错。
+- 新脚本：`scripts/batch_samples.py`（样本表、路径换算、offset 计算）、`make_batch_configs.py`（生成 `configs/batch/*.yaml`
+  和 toolkit 的 `local_config/single_sample.<样本>.yaml`）、`orientation_review.py`（缩略图 + Excel 标注表
+  `X:/Fengyi/registration_ants/orientation_review/`）、`run_batch.py`（并发跑、跳过未就绪/已有结果）、`batch_qc.py`（叠图 + 各区细胞数）。
+- `.gitignore`：`configs/**/*.yaml`（子目录里的样本 config 也不追踪），example 不变。
+
+### 耗时（本机，Windows，56 线程 / 378 GB，数据走 SMB 读 X:，两样本同时跑，各 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=9`）
+
+| 步骤 | TSC_FW11 | TSC_FF11 |
+|---|---|---|
+| soma tif 大小 | 2.9 GB (468×2252×1375) | 4.9 GB (564×3129×1386) |
+| [1/6] 读图（降 4x）+ 20 µm 重采样 | 3:07 | 3:40 |
+| [2/6] N4 + 归一化 | 0:18 | 0:27 |
+| [3/6] 配准 | **3:26:58** | **3:29:27** |
+| [4/6] 变换（in_atlas、labels_in_sample） | 1:09 | 1:30 |
+| [6/6] 细胞分区 | 1:27（9.3 万个） | 1:34（18 万个） |
+| 合计 | **3:33** | **3:37** |
+
+配准细分（FW11 / FF11，秒）：仿射探测 31 / 33；Affine 88 / 139；SyN 12220 / 12310。
+SyN 四层（shrink 8/4/2/1，atlas 网格 249×572×321 @20 µm）：
+- L1 88 / 94 s，L2 532 / 687 s（前两层都提前收敛）
+- L3 2352 / 2357 s（约 50 s/次，40 次）
+- **L4 9246 / 9170 s（约 370 s/次，25 次跑满，收敛指标 1e-4 量级，不会提前停）**
+
+最后一层占 SyN 的 75%、整个样本的 72%。耗时由 atlas 网格决定，和样本大小关系不大（两个样本几乎一样）。
+读图在降采样后只占 3 分钟左右（5 个任务同时读 SMB 时每个约 20–30 MB/s）。内存：降采样后每个任务只有几 GB。
+
+**本机全量估计**：剩 18 个（+ t70/ET1/ERH 共 21 个）× ~3.5 h。线程数增加后的加速比没测过。按 4 并发 × 14 线程估约 16–20 h。
+**HPC 的考虑**：数据本来就在 /rsstu，读图更快；array 一样本一任务可以全部并行，墙钟约等于单样本 3.5 h（看排队）；
+需要在 HPC 装 antsreg 环境（antspyx 0.6.3）、路径从 X:/Y: 换回 /rsstu（`batch_samples.to_local` 的反向）。
+省时选项：去掉 SyN 最后一层（`[100,100,40]`）→ 单样本估计 <1 h，精度变为 40 µm 级。
+
+### 结果（QC：`<输出>/qc/overlay.png`、`cells_by_region.csv`；或 toolkit `single_sample_vis.py local_config/single_sample.<样本>.yaml`）
+
+- TSC_FW11：9.3 万细胞，577 个区，1.4% 落在图谱外。TSC_FF11：18 万细胞，616 个区，2.9% 落在图谱外。
+- 外轮廓、皮层分层、海马、纹状体、胼胝体对得好。共同问题：中线侧有一条 ~40–60 µm 的组织未被图谱覆盖；
+  FW11 嗅球缺失，图谱嗅球标签落在空白处；撕裂/缺组织处标签盖在空白上（无细胞，不影响计数）。
+
+### 遇到的问题
+
+- 第一次批量启动时 FF6 的 run.log 被锁（被杀的试跑进程刚退出），`run_batch.py` 自身崩了，但已启动的子进程照常跑完。
+- 被杀的任务在 SMB 上要几秒才真正退出（taskkill 报 "no running instance" 但进程还在列表里）。
+
+### 下一步
+
+- 决定本机还是 HPC 跑剩下的样本（用户评估中）；用 `batch_qc.py` + toolkit 查看器挑出需要画 mask 的样本。
+- 预计有问题：TSC18（碎片，需要 reposition 时要先解决与 `load_downsample_xy` 的冲突）、TSC12q/12t（裂口）、三个腹侧先拍样本要重点看。
+- t70/ET1/ERH 的 soma 图拼完后：重跑 `orientation_review.py`、标方向、重跑 `make_batch_configs.py`。
+- 代码改动和新脚本尚未提交。
