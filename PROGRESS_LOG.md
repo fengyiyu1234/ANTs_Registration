@@ -2789,12 +2789,25 @@ python ../Registration_toolkit/paint_mask.py
   原读法（整卷 imread → float32 → transpose → 高斯）峰值约为文件大小的 **15 倍**（6.7 GB 的 FF6 到 101 GB，15 分钟没出第 1 步）。
   降 4 倍到 10.4 µm 后再走原来的高斯 + 20 µm 重采样，信息量与原路径基本相同；块中心有 (4−1)/2×2.6 = 3.9 µm 偏移（原点仍是 0），
   相对 20 µm 网格可忽略。不能与 `reposition_plan` / `crop_for_registration` 同时用（两者都写在原始网格上），会直接报错。
-- 新脚本：`scripts/batch_samples.py`（样本表、路径换算、offset 计算）、`make_batch_configs.py`（生成 `configs/batch/*.yaml`
-  和 toolkit 的 `local_config/single_sample.<样本>.yaml`）、`orientation_review.py`（缩略图 + Excel 标注表
-  `X:/Fengyi/registration_ants/orientation_review/`）、`run_batch.py`（并发跑、跳过未就绪/已有结果）、`batch_qc.py`（叠图 + 各区细胞数）。
+- 新脚本：`local_scripts/batch_samples.py`（样本表、路径换算、offset 计算）、`local_scripts/make_batch_configs.py`（生成 `configs/batch/*.yaml`
+  和 toolkit 的 `local_config/single_sample.<样本>.yaml`）、`local_scripts/orientation_review.py`（缩略图 + Excel 标注表
+  `X:/Fengyi/registration_ants/orientation_review/`）、`local_scripts/run_batch.py`（并发跑、跳过未就绪/已有结果）、`local_scripts/batch_qc.py`（叠图 + 各区细胞数）。
 - `.gitignore`：`configs/**/*.yaml`（子目录里的样本 config 也不追踪），example 不变。
 
-### 耗时（本机，Windows，56 线程 / 378 GB，数据走 SMB 读 X:，两样本同时跑，各 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=9`）
+### 耗时（本机，两样本同时跑，各 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=9`）
+
+本机配置：
+- CPU：2 × Intel Xeon Gold 6132 @ 2.60 GHz（共 28 物理核 / 56 线程）；内存 379 GB。
+- 系统：Windows 10 Education 10.0.19045；conda 环境 `F:\miniconda3\envs\antsreg`
+  （python 3.11.18、antspyx 0.6.3、numpy 2.3.5、tifffile 2026.3.3）。
+- 存储：输入图像、检测结果、输出都在 HPC 存储上，经 SMB 挂载访问：
+  - X: = `\\oitrspprd.hpc.ncsu.edu\rsstu\users\t\tekaeser\Chlamydia`
+  - Y: = `\\oitrspprd.hpc.ncsu.edu\rsstu\users\a\agrinba\DeepDesign`
+  - atlas 和代码在 Y:，拼接图和配准输出在 X:。
+- 网络：Intel I210 网卡，**1 Gbps**，理论上限约 110 MB/s。
+  5 个任务同时读图时每个约 20–30 MB/s，合计已接近跑满。
+  所以读一张 15 GB 的 soma 图最快也要 2–3 分钟，多个任务并发读只会更慢。
+  配准阶段不读网络盘，不受这个限制。
 
 | 步骤 | TSC_FW11 | TSC_FF11 |
 |---|---|---|
@@ -2828,12 +2841,104 @@ SyN 四层（shrink 8/4/2/1，atlas 网格 249×572×321 @20 µm）：
 
 ### 遇到的问题
 
-- 第一次批量启动时 FF6 的 run.log 被锁（被杀的试跑进程刚退出），`run_batch.py` 自身崩了，但已启动的子进程照常跑完。
+- 第一次批量启动时 FF6 的 run.log 被锁（被杀的试跑进程刚退出），`local_scripts/run_batch.py` 自身崩了，但已启动的子进程照常跑完。
 - 被杀的任务在 SMB 上要几秒才真正退出（taskkill 报 "no running instance" 但进程还在列表里）。
 
 ### 下一步
 
-- 决定本机还是 HPC 跑剩下的样本（用户评估中）；用 `batch_qc.py` + toolkit 查看器挑出需要画 mask 的样本。
+- 决定本机还是 HPC 跑剩下的样本（用户评估中）；用 `local_scripts/batch_qc.py` + toolkit 查看器挑出需要画 mask 的样本。
 - 预计有问题：TSC18（碎片，需要 reposition 时要先解决与 `load_downsample_xy` 的冲突）、TSC12q/12t（裂口）、三个腹侧先拍样本要重点看。
-- t70/ET1/ERH 的 soma 图拼完后：重跑 `orientation_review.py`、标方向、重跑 `make_batch_configs.py`。
+- t70/ET1/ERH 的 soma 图拼完后：重跑 `local_scripts/orientation_review.py`、标方向、重跑 `local_scripts/make_batch_configs.py`。
 - 代码改动和新脚本尚未提交。
+
+## 2026-11-18（续）：HPC 上建 antsreg 环境 + 提交全部样本的批量配准
+
+### 环境
+
+- 位置：`/rsstu/users/a/agrinba/DeepDesign/Fengyi/miniconda3/envs/antsreg`（约 2 GB，和 brain_detector 同一个 miniconda）。
+  作业里：`source .../Fengyi/miniconda3/etc/profile.d/conda.sh; conda activate .../miniconda3/envs/antsreg`。
+  - 不放 `/share/lsmsmart/fyu7`：scratch 盘，原来那里的 `miniconda3/envs/brain_detector` 只剩 1.3 MB，像是被清过。
+  - 不放 `/usr/local/usrapps`（要 PI 申请）、home（配额小）。
+  - DeepDesign 盘已用 98%（剩约 870 GB）：配准输出、Slurm 日志全部写 Chlamydia。
+- 建法：`miniconda3/bin/conda create -p <路径> -c conda-forge --override-channels python=3.11.18 pip`
+  （conda 26 **不自带 pip**，要显式写上），再 `pip install -r requirements.lock.txt` + `pip install -e .`。
+- `requirements.txt` / `requirements.lock.txt` 补了 `openpyxl==3.1.5`（+ `et_xmlfile==2.0.0`）：
+  `batch_samples.read_review_annotations` 读方向表要用，原 lock 漏了。
+- 验证：python 3.11.18 / antspyx 0.6.3 / numpy 2.3.5 / tifffile 2026.3.3，与本机一致；
+  `tests/` 下 7 个 smoke 脚本直接用 python 运行全部通过（用 pytest 跑会有 9 个 "fixture not found"，
+  是脚本里带参数的辅助函数叫 `test_*`，不是环境问题）。
+
+### 代码
+
+- `local_scripts/batch_samples.py`：按 `os.name` 选路径形式（Windows：X:/Y:；HPC：/rsstu），`to_local` 双向。
+  HPC 生成的 config 放 `configs/batch_hpc/`（与 Windows 的 `configs/batch/` 分开，因为两边共用这个仓库目录）。
+- `local_scripts/make_batch_configs.py`：HPC 版 config 在 `atlas:` 块里直接写 Linux 图谱路径（`atlas_presets_local.yaml` 里是 Windows 路径）；
+  toolkit 查看器 config 无论在哪跑都写 Windows 路径。
+- `run_batch.py --claim-next`：按 `SAMPLES` 顺序（TSC 在前）领第一个没人领、也没有结果的样本，跑完退出。
+  领取记录 `Chlamydia/Fengyi/registration_ants/_claims/<样本>/`（`who.txt`、`status.txt`）；不会自动释放，重跑要删 claim 目录。
+- `local_scripts/register_batch.slurm`：16 核 / 32 GB / 12 h，`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=16`；
+  日志 `Chlamydia/Fengyi/registration_ants/_slurm_logs/`。分区在提交命令里给。
+
+### 方向（t70 / ET1 / ERH，soma 图今天拼完）
+
+画了缩略图，我判断三个都是**背侧先拍**（与默认一致）：第一层是小皮层椭圆，小脑叶片在约 20–40% 深处，
+49% 截面圆拱在上、海马弧在上半部，末层是腹侧/脑干碎块；与 t4（背侧）几乎一样，与 ET10（腹侧）相反。
+方向表的用户列没有填，表备份为 `orientation_review.backup_20261118.xlsx`。
+
+### 提交
+
+- BME：`sbatch --partition=gpu_partners --account=lsmsmart_gpu --qos=p_bme_gpu --gres=gpu:l40s:1 --array=1-21%4`（job 1971666）。
+  p_bme_gpu 每人最多 4 张 L40S，且纯 CPU 作业不收，所以每个任务挂一张卡、只用 CPU。提交时 L40S 全部被占（Resources）。
+- compute：`sbatch --partition=compute --account=lsmsmart_cpu --array=1-21%8`（job 1971669），提交时 Priority 排队。
+- 21 个样本（TSC 14 个优先，再 WT 7 个）；TSC_FW11 / TSC_FF11 已有结果自动跳过。
+- 跑完后：`local_scripts/batch_qc.py` + toolkit 查看器挑出需要画 mask 的样本；剩余排队任务 `scancel`。
+- 19:30 首批开跑（BME gpu44/gpu46）：TSC_FF9 读图 + 20 µm 重采样只用 24 s（本机走 SMB 约 3 min）。
+- **TSC_FF6 的 `DeMBA_P5/run.log` 被 Windows 端锁住**（11-18 下午被杀的试跑进程留下的 SMB 锁）：
+  HPC 上 cat / mv 都报 Permission denied，任务 1971666_1 直接失败。整个目录改名成
+  `TSC_FF6/DeMBA_P5.locked_windows_trial`（目录改名可以），删掉 FF6 的 claim，让下一个任务重新领。
+  回本机后关掉残留进程（或重启），再删这个目录。
+
+### 批量脚本移出 git（用户要求）
+
+`batch_samples.py`、`make_batch_configs.py`、`orientation_review.py`、`run_batch.py`、`batch_qc.py`、`register_batch.slurm`
+都是这次批量的一次性脚本，移到 `local_scripts/`（.gitignore，和 brain_detector 的 `local_scripts/` 同一个约定），
+前五个从 git 跟踪里去掉（`git rm --cached`，文件保留）。
+排队中的任务（提交时脚本里写的是 `scripts/run_batch.py`）靠临时软链接 `scripts/run_batch.py -> ../local_scripts/run_batch.py`
+继续工作，该链接也在 .gitignore；**这批跑完后删掉它**。之后新提交用 `sbatch ... local_scripts/register_batch.slurm`。
+
+### HPC 实测耗时
+
+- TSC_FF19（BME gpu37，AMD Turin，16 线程）：**全程 42 min**（读图 25 s、配准 40:43、变换 16 s、细胞分区 38 s）。
+  参数与本机相同，SyN 四层完整：L3 约 9.4 s/次 × 40，L4 约 75 s/次 × 25 跑满（本机 50 / 370 s）。比本机（9 线程 Skylake）快约 5 倍。
+- 20:18 时 BME 4 个 + compute 3 个在跑；按每个约 45–60 min 估计，21 个当晚可以跑完。
+
+### 全部完成（23:15）+ batch_qc
+
+21 个样本全部成功（BME 42–59 min，compute 70–94 min），`local_scripts/batch_qc.py` 已对 21 个跑完，
+输出 `<样本>/DeMBA_P5/qc/overlay.png`、`cells_by_region.csv`。图谱外细胞比例：
+
+| 样本 | 细胞 | 图谱外 | | 样本 | 细胞 | 图谱外 |
+|---|---|---|---|---|---|---|
+| TSC_FF6 | 24.3 万 | 2.2% | | TSC_FW7 | 12.0 万 | 1.1% |
+| TSC_FF8 | 24.7 万 | 2.4% | | TSC_FW8 | 15.1 万 | 2.0% |
+| TSC_FF9 | 18.1 万 | 2.2% | | **TSC18** | 17.6 万 | **5.0%** |
+| TSC_FF19 | 23.7 万 | 1.9% | | **TSC10** | 23.0 万 | **12.5%** |
+| TSC8 | 23.2 万 | 1.5% | | TSC11 | 33.8 万 | 2.1% |
+| TSC12q | 24.8 万 | 1.2% | | t70 | 77.4 万 | 1.5% |
+| **TSC12t** | 17.8 万 | **4.9%** | | t4 | 43.7 万 | 2.2% |
+| TSC_FW2 | 20.9 万 | 2.4% | | t10 | 45.7 万 | 2.3% |
+| TSC_FW6 | 16.6 万 | 2.7% | | ET10 | 64.7 万 | 1.4% |
+| | | | | ETail | 60.7 万 | 4.0% |
+| | | | | ET1 | 60.6 万 | 3.2% |
+| | | | | **ERH** | 59.2 万 | **7.1%** |
+
+看过的叠图：
+- **TSC10：配准失败**。内侧（中线侧）一大块带完整外缘亮边的组织完全没有图谱覆盖，图谱被挤到外侧半边。
+  要么方向（腹侧先拍，来自旧 s10 config）在新拼接图上不对，要么样本带了越中线的组织；需要先核对方向，再考虑 mask。
+- ERH：主体（皮层、海马、纹状体）对得好；图谱外的主要是脱落的嗅球块和腹侧/脑干碎块，z≈140 层小脑标签盖在空白上。需要 mask。
+- TSC18：主体对得好，内侧一块碎片没标签（已知碎片问题）。
+- TSC12t：主体对得好，中线侧一条和裂口处没覆盖（已知裂口）。
+- 蓝色区域（auto brain mask 无标签）包含凸包补出来的背景，所以图上蓝色面积比真实缺口大；百分比按细胞算，不受影响。
+
+收尾：compute 的 job 1971669 还有 16 个任务排队（排上即 "nothing left to claim" 退出），可 `scancel 1971669`；
+之后删临时软链接 `scripts/run_batch.py`；本机关掉残留进程后删 `TSC_FF6/DeMBA_P5.locked_windows_trial`。

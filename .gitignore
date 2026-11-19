@@ -22,3 +22,10 @@ stats/configs/**/*.yaml
 # startup-failure breadcrumb from run_pipeline.sh (see its header)
 run_pipeline.error.log
 *.md
+
+# one-off batch helpers (sample tables, config generators, Slurm scripts, QC) -- local only,
+# same convention as brain_detector/local_scripts/.
+local_scripts/
+# temporary symlink to local_scripts/run_batch.py for Slurm tasks queued before the move
+# (2026-11-18 batch); delete it once that batch is done.
+scripts/run_batch.py

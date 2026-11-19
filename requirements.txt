@@ -9,6 +9,7 @@ nibabel
 pystripe
 pandas
 pyyaml
+openpyxl   # scripts/batch_samples.py reads the orientation review sheet
 
 # The interactive annotation/QC tools now live in ../GT_tool_for_registration,
 # but they still run in this same antsreg env: they import registration_ants
